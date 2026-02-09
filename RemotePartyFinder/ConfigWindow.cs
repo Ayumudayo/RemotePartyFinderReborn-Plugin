@@ -16,7 +16,7 @@ public class ConfigWindow : Window, IDisposable
     private string _uploadUrlTempString = string.Empty;
     private string _uploadUrlError = string.Empty;
 
-    public ConfigWindow(Plugin plugin) : base("Remote Party Finder")
+    public ConfigWindow(Plugin plugin) : base("Remote Party Finder Reborn")
     {
         _configuration = plugin.Configuration;
         Flags = ImGuiWindowFlags.AlwaysAutoResize;

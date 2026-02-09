@@ -1,4 +1,5 @@
 ﻿using Dalamud.IoC;
+using Dalamud.Game.Command;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
@@ -23,8 +24,11 @@ public class Plugin : IDalamudPlugin {
     [PluginService]
     internal IGameGui GameGui { get; private init; }
 
+    [PluginService]
+    internal ICommandManager CommandManager { get; private init; }
+
     public Configuration Configuration { get; init; }
-    public readonly WindowSystem WindowSystem = new("Remote Party Finder");
+    public readonly WindowSystem WindowSystem = new("Remote Party Finder Reborn");
     private ConfigWindow ConfigWindow { get; init; }
 
     private Gatherer Gatherer { get; }
@@ -42,6 +46,10 @@ public class Plugin : IDalamudPlugin {
         WindowSystem.AddWindow(ConfigWindow);
         PluginInterface.UiBuilder.Draw += DrawUI;
         PluginInterface.UiBuilder.OpenConfigUi += ToggleConfigUI;
+
+        CommandManager.AddHandler("/rpr", new CommandInfo(OnCommand) {
+            HelpMessage = "Open the configuration window."
+        });
     }
 
     public void Dispose() {
@@ -51,6 +59,11 @@ public class Plugin : IDalamudPlugin {
         this.FFLogsCollector.Dispose();
         WindowSystem.RemoveAllWindows();
         ConfigWindow.Dispose();
+        CommandManager.RemoveHandler("/rpr");
+    }
+
+    private void OnCommand(string command, string args) {
+        ToggleConfigUI();
     }
 
     public void DrawUI() => WindowSystem.Draw();

@@ -33,6 +33,8 @@ internal class PlayerCollector : IDisposable {
     
     // FFXIVClientStructs Character 구조체의 ContentId 오프셋 (0x2358)
     private const int ContentIdOffset = 0x2358;
+    // FFXIVClientStructs Character 구조체의 AccountId 오프셋 (0x2350)
+    private const int AccountIdOffset = 0x2350;
 
     internal PlayerCollector(Plugin plugin) {
         this.Plugin = plugin;
@@ -66,6 +68,7 @@ internal class PlayerCollector : IDisposable {
             
             // ContentId 읽기 (직접 메모리 접근)
             var contentId = (ulong)Marshal.ReadInt64(obj.Address + ContentIdOffset);
+            var accountId = (ulong)Marshal.ReadInt64(obj.Address + AccountIdOffset);
             var homeWorld = (ushort)playerCharacter.HomeWorld.RowId;
             var name = obj.Name.TextValue;
             
@@ -81,6 +84,7 @@ internal class PlayerCollector : IDisposable {
                 ContentId = contentId,
                 Name = name,
                 HomeWorld = homeWorld,
+                AccountId = accountId,
             });
             
             // 수집 캐시에 추가
@@ -181,4 +185,5 @@ internal class UploadablePlayer {
     public ulong ContentId { get; set; }
     public string Name { get; set; } = string.Empty;
     public ushort HomeWorld { get; set; }
+    public ulong AccountId { get; set; }
 }
