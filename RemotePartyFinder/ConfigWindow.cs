@@ -19,7 +19,7 @@ public class ConfigWindow : Window, IDisposable
     public ConfigWindow(Plugin plugin) : base("Remote Party Finder")
     {
         _configuration = plugin.Configuration;
-        Flags = ImGuiWindowFlags.NoCollapse | ImGuiWindowFlags.AlwaysAutoResize;
+        Flags = ImGuiWindowFlags.AlwaysAutoResize;
 
         Size = new Vector2(500, 0);
     }
@@ -55,25 +55,103 @@ public class ConfigWindow : Window, IDisposable
 
     private void DrawSettingsTab()
     {
-        var isAdvanced = _configuration.AdvancedSettingsEnabled;
-        ImGui.TextWrapped(
-            "This section is for advanced users to configure which services to send party finder data to. " +
-            "Only enable if you know what you are doing.");
-        
-        ImGui.Spacing();
-        
-        if (ImGui.Checkbox("Enable Advanced Settings", ref isAdvanced))
+        // FFLogs API Settings (접기 가능)
+        if (ImGui.CollapsingHeader("FFLogs API Settings", ImGuiTreeNodeFlags.DefaultOpen))
         {
-            _configuration.AdvancedSettingsEnabled = isAdvanced;
-            _configuration.Save();
+            ImGui.Indent();
+            
+            var clientId = _configuration.FFLogsClientId;
+            if (ImGui.InputText("Client ID", ref clientId, 100))
+            {
+                _configuration.FFLogsClientId = clientId;
+                _configuration.Save();
+            }
+
+            var clientSecret = _configuration.FFLogsClientSecret;
+            if (ImGui.InputText("Client Secret", ref clientSecret, 100, ImGuiInputTextFlags.Password))
+            {
+                _configuration.FFLogsClientSecret = clientSecret;
+                _configuration.Save();
+            }
+
+            if (ImGui.CollapsingHeader("How to get a client ID and a client secret:"))
+            {
+            ImGui.AlignTextToFramePadding();
+            ImGui.Bullet();
+            ImGui.Text("Open https://www.fflogs.com/api/clients/ or");
+            ImGui.SameLine();
+            if (ImGui.Button("Click here##APIClientLink"))
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "https://www.fflogs.com/api/clients/",
+                    UseShellExecute = true
+                });
+            }
+
+            ImGui.AlignTextToFramePadding();
+            ImGui.Bullet();
+            ImGui.Text("Create a new client");
+
+            ImGui.AlignTextToFramePadding();
+            ImGui.Bullet();
+            ImGui.Text("Choose any name, for example: \"Plugin\"");
+            ImGui.SameLine();
+            if (ImGui.Button("Copy##APIClientCopyName"))
+            {
+                CopyToClipboard("Plugin");
+            }
+
+            ImGui.AlignTextToFramePadding();
+            ImGui.Bullet();
+            ImGui.Text("Enter any URL, for example: \"https://www.example.com\"");
+            ImGui.SameLine();
+            if (ImGui.Button("Copy##APIClientCopyURL"))
+            {
+                CopyToClipboard("https://www.example.com");
+            }
+
+            ImGui.AlignTextToFramePadding();
+            ImGui.Bullet();
+            ImGui.Text("Do NOT check the Public Client option");
+
+            ImGui.AlignTextToFramePadding();
+            ImGui.Bullet();
+            ImGui.Text("Paste both client ID and secret above");
+            }
+            
+            ImGui.Unindent();
         }
 
-        if (!isAdvanced) return;
-
+        ImGui.Spacing();
         ImGui.Separator();
         ImGui.Spacing();
-        
-        ImGui.Text("Upload URLs");
+
+        // Advanced Settings (접기 가능)
+        if (ImGui.CollapsingHeader("Advanced Settings"))
+        {
+            ImGui.Indent();
+            
+            ImGui.TextWrapped(
+                "This section is for advanced users to configure which services to send party finder data to. " +
+                "Only enable if you know what you are doing.");
+            
+            ImGui.Spacing();
+            
+            var isAdvanced = _configuration.AdvancedSettingsEnabled;
+            if (ImGui.Checkbox("Enable Advanced Settings", ref isAdvanced))
+            {
+                _configuration.AdvancedSettingsEnabled = isAdvanced;
+                _configuration.Save();
+            }
+
+            if (!isAdvanced) {
+                ImGui.Unindent();
+                return;
+            }
+
+            ImGui.Separator();
+            ImGui.Spacing();
         
         using (ImRaii.Table((ImU8String)"uploadUrls", 3, ImGuiTableFlags.SizingFixedFit | ImGuiTableFlags.Borders))
         {
@@ -150,10 +228,10 @@ public class ConfigWindow : Window, IDisposable
             ResetToDefault();
         }
 
-        if (!string.IsNullOrEmpty(_uploadUrlError))
-        {
             ImGui.SameLine();
             ImGui.TextColored(new Vector4(1, 0, 0, 1), _uploadUrlError);
+            
+            ImGui.Unindent();
         }
     }
 
@@ -248,4 +326,22 @@ public class ConfigWindow : Window, IDisposable
     private static bool ValidUrl(string url)
         => Uri.TryCreate(url, UriKind.Absolute, out var uriResult)
            && (uriResult.Scheme == Uri.UriSchemeHttps || uriResult.Scheme == Uri.UriSchemeHttp);
+
+    private static void DrawHelp(string text)
+    {
+        ImGui.SameLine();
+        ImGuiComponents.HelpMarker(text);
+    }
+
+    private static void CopyToClipboard(string text)
+    {
+        try
+        {
+            ImGui.SetClipboardText(text);
+        }
+        catch (Exception ex)
+        {
+            // Ignore
+        }
+    }
 }

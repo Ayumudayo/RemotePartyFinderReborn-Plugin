@@ -30,12 +30,14 @@ public class Plugin : IDalamudPlugin {
     private Gatherer Gatherer { get; }
     private PlayerCollector PlayerCollector { get; }
     private PartyDetailCollector PartyDetailCollector { get; }
+    private FFLogsCollector FFLogsCollector { get; }
 
     public Plugin() {
         Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         this.Gatherer = new Gatherer(this);
         this.PlayerCollector = new PlayerCollector(this);
         this.PartyDetailCollector = new PartyDetailCollector(this);
+        this.FFLogsCollector = new FFLogsCollector(this);
         ConfigWindow = new ConfigWindow(this);
         WindowSystem.AddWindow(ConfigWindow);
         PluginInterface.UiBuilder.Draw += DrawUI;
@@ -46,6 +48,7 @@ public class Plugin : IDalamudPlugin {
         this.Gatherer.Dispose();
         this.PlayerCollector.Dispose();
         this.PartyDetailCollector.Dispose();
+        this.FFLogsCollector.Dispose();
         WindowSystem.RemoveAllWindows();
         ConfigWindow.Dispose();
     }

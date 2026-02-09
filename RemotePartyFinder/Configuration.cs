@@ -15,6 +15,18 @@ public class Configuration : IPluginConfiguration {
     
     public ImmutableList<UploadUrl> UploadUrls = DefaultUploadUrls();
 
+    // FFLogs API Settings
+    public string FFLogsClientId { get; set; } = string.Empty;
+    public string FFLogsClientSecret { get; set; } = string.Empty;
+    
+    // UI Collapse States (not saved, just runtime state)
+    [NonSerialized]
+    public bool CollapseFFLogsSettings = false;
+    [NonSerialized]
+    public bool CollapseAdvancedSettings = false;
+    [NonSerialized]
+    public bool CollapseDebugSettings = false;
+
     public static ImmutableList<UploadUrl> DefaultUploadUrls() => [
         new("http://127.0.0.1:8000") { IsDefault = true }
     ];
