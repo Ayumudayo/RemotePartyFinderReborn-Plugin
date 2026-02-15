@@ -70,6 +70,7 @@ internal class PlayerCollector : IDisposable {
             var contentId = (ulong)Marshal.ReadInt64(obj.Address + ContentIdOffset);
             var accountId = (ulong)Marshal.ReadInt64(obj.Address + AccountIdOffset);
             var homeWorld = (ushort)playerCharacter.HomeWorld.RowId;
+            var currentWorld = (ushort)playerCharacter.CurrentWorld.RowId;
             var name = obj.Name.TextValue;
             
             // 유효성 검사
@@ -84,6 +85,7 @@ internal class PlayerCollector : IDisposable {
                 ContentId = contentId,
                 Name = name,
                 HomeWorld = homeWorld,
+                CurrentWorld = currentWorld,
                 AccountId = accountId,
             });
             
@@ -185,5 +187,7 @@ internal class UploadablePlayer {
     public ulong ContentId { get; set; }
     public string Name { get; set; } = string.Empty;
     public ushort HomeWorld { get; set; }
+    [JsonProperty(DefaultValueHandling = DefaultValueHandling.Include)]
+    public ushort CurrentWorld { get; set; }
     public ulong AccountId { get; set; }
 }
