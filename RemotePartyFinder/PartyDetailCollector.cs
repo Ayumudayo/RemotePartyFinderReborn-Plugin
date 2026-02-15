@@ -3,28 +3,22 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
-using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Serialization;
-using FFXIVClientStructs.FFXIV.Component.GUI;
 
 namespace RemotePartyFinder;
 
 /// <summary>
-/// AgentLookingForGroup.Detailed에서 파티 멤버 ContentId를 수집합니다.
-/// 사용자가 파티 모집글을 클릭하면 트리거됩니다.
+/// AgentLookingForGroup.Detailed에서 PF 디테일 정보를 수집합니다.
 /// </summary>
 internal class PartyDetailCollector : IDisposable {
     private Plugin Plugin { get; }
     private HttpClient Client { get; } = new();
-    private System.Diagnostics.Stopwatch ScanTimer { get; } = new(); // 성능 최적화용 타이머
+    private System.Diagnostics.Stopwatch ScanTimer { get; } = new();
     private bool wasAddonOpen = false;
-    // 이미 업로드한 리스팅을 캐시하여 중복 업로드 방지
-    private Dictionary<uint, DateTime> UploadedDetails { get; } = new();
-    private const double CacheExpirationMinutes = 0.05; // 3초 (디버깅용)
 
     internal PartyDetailCollector(Plugin plugin) {
         this.Plugin = plugin;
@@ -37,15 +31,13 @@ internal class PartyDetailCollector : IDisposable {
     }
 
     private unsafe void OnUpdate(IFramework framework) {
-        // 성능 최적화: 200ms마다 체크 (UI 감지에 무리 없는 수준)
+        // 성능 최적화: 200ms마다 체크
         if (this.ScanTimer.ElapsedMilliseconds < 200) return;
         this.ScanTimer.Restart();
 
         // UI 창(Addon)이 열려있는지 확인
-        // GetAddonByName returns 0 if addon is not loaded/visible
         nint addonPtr = this.Plugin.GameGui.GetAddonByName("LookingForGroupDetail", 1);
         if (addonPtr == 0) {
-            // 창이 닫혔으면 플래그 리셋
             this.wasAddonOpen = false;
             return;
         }
@@ -58,42 +50,24 @@ internal class PartyDetailCollector : IDisposable {
         // 창이 방금 열렸음 - 처리 시작
         this.wasAddonOpen = true;
 
-        // AgentLookingForGroup 확인
         var agent = AgentLookingForGroup.Instance();
         if (agent == null) return;
 
-        // Detailed 데이터가 있는지 확인 (LastViewedListing)
         ref var detailed = ref agent->LastViewedListing;
         if (detailed.ListingId == 0) return;
 
-        // DEBUG: 감지 확인
-        Plugin.Log.Debug($"PartyDetailCollector: Found ListingId {detailed.ListingId} Leader {agent->LastLeader}");
-
-        var now = DateTime.UtcNow;
-
-        // 캐시 확인은 이제 불필요 - 이 지점에 도달했다면 창이 방금 열린 것이므로 항상 전송
-
-        Plugin.Log.Info($"PartyDetailCollector: Processing ListingId {detailed.ListingId} Leader {agent->LastLeader}");
-
-        // 멤버 ContentId 수집 (슬롯 순서 보존을 위해 빈 슬롯도 0으로 포함)
-        var memberContentIds = new List<ulong>();
-        for (var i = 0; i < detailed.TotalSlots && i < 48; i++) {
-            var contentId = detailed.MemberContentIds[i];
-            memberContentIds.Add(contentId); // 빈 슬롯도 0으로 추가하여 인덱스 보존
-        }
-
-        // 리더 정보
         var leaderContentId = detailed.LeaderContentId;
         var homeWorld = detailed.HomeWorld;
         var leaderName = agent->LastLeader.ToString();
 
-        // DEBUG: 리더 정보 확인
-        Plugin.Log.Debug($"PartyDetailCollector: Leader {leaderContentId} Name {leaderName} World {homeWorld}");
-
         // 유효성 검사
         if (leaderContentId == 0 || homeWorld == 0 || homeWorld >= 1000) return;
 
-        // 업로드 데이터 구성
+        var memberContentIds = new List<ulong>();
+        for (var i = 0; i < detailed.TotalSlots && i < 48; i++) {
+            memberContentIds.Add(detailed.MemberContentIds[i]);
+        }
+
         var uploadData = new UploadablePartyDetail {
             ListingId = detailed.ListingId,
             LeaderContentId = leaderContentId,
@@ -101,20 +75,10 @@ internal class PartyDetailCollector : IDisposable {
             HomeWorld = homeWorld,
             MemberContentIds = memberContentIds,
         };
-    
 
-        this.UploadedDetails[detailed.ListingId] = now;
+        Plugin.Log.Debug(
+            $"PartyDetailCollector: Uploading detail listing={uploadData.ListingId} leader={uploadData.LeaderContentId} world={uploadData.HomeWorld} members={uploadData.MemberContentIds.Count}");
 
-        // 오래된 캐시 정리
-        var expiredKeys = this.UploadedDetails
-            .Where(kvp => (now - kvp.Value).TotalMinutes > CacheExpirationMinutes * 2)
-            .Select(kvp => kvp.Key)
-            .ToList();
-        foreach (var key in expiredKeys) {
-            this.UploadedDetails.Remove(key);
-        }
-
-        // 서버에 업로드
         UploadDetailAsync(uploadData);
     }
 
@@ -139,7 +103,7 @@ internal class PartyDetailCollector : IDisposable {
                     }
 
                     var detailUrl = baseUrl + "/contribute/detail";
-                    
+
                     try {
                         var resp = await this.Client.PostAsync(detailUrl, new StringContent(json) {
                             Headers = { ContentType = MediaTypeHeaderValue.Parse("application/json") },
