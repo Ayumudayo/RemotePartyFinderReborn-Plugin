@@ -17,7 +17,7 @@ internal class PartyDetailCollector : IDisposable {
     private Plugin Plugin { get; }
     private HttpClient Client { get; } = new();
     private System.Diagnostics.Stopwatch ScanTimer { get; } = new();
-    private bool wasAddonOpen = false;
+    private uint lastUploadedListingId = 0;
 
     internal PartyDetailCollector(Plugin plugin) {
         this.Plugin = plugin;
@@ -37,23 +37,16 @@ internal class PartyDetailCollector : IDisposable {
         // UI 창(Addon)이 열려있는지 확인
         nint addonPtr = this.Plugin.GameGui.GetAddonByName("LookingForGroupDetail", 1);
         if (addonPtr == 0) {
-            this.wasAddonOpen = false;
+            this.lastUploadedListingId = 0;
             return;
         }
-
-        // 창이 이미 열려있고 이번 세션에서 처리 완료했으면 아무것도 안 함
-        if (this.wasAddonOpen) {
-            return;
-        }
-
-        // 창이 방금 열렸음 - 처리 시작
-        this.wasAddonOpen = true;
 
         var agent = AgentLookingForGroup.Instance();
         if (agent == null) return;
 
         ref var detailed = ref agent->LastViewedListing;
         if (detailed.ListingId == 0) return;
+        if (detailed.ListingId == this.lastUploadedListingId) return;
 
         var leaderContentId = detailed.LeaderContentId;
         var homeWorld = detailed.HomeWorld;
@@ -62,9 +55,22 @@ internal class PartyDetailCollector : IDisposable {
         // 유효성 검사
         if (leaderContentId == 0 || homeWorld == 0 || homeWorld >= 1000) return;
 
-        var memberContentIds = new List<ulong>();
-        for (var i = 0; i < detailed.TotalSlots && i < 48; i++) {
+        var effectiveParties = Math.Max(1, (int)detailed.NumberOfParties);
+        var declaredSlots = Math.Max((int)detailed.TotalSlots, effectiveParties * 8);
+        var totalSlots = Math.Clamp(declaredSlots, 0, 48);
+        if (totalSlots <= 0) return;
+
+        var memberContentIds = new List<ulong>(totalSlots);
+        var memberJobs = new List<byte>(totalSlots);
+
+        for (var i = 0; i < totalSlots; i++) {
             memberContentIds.Add(detailed.MemberContentIds[i]);
+            memberJobs.Add(detailed.Jobs[i]);
+        }
+
+        var nonZeroMembers = memberContentIds.Count(contentId => contentId != 0);
+        if (nonZeroMembers == 0) {
+            return;
         }
 
         var uploadData = new UploadablePartyDetail {
@@ -73,12 +79,14 @@ internal class PartyDetailCollector : IDisposable {
             LeaderName = leaderName,
             HomeWorld = homeWorld,
             MemberContentIds = memberContentIds,
+            MemberJobs = memberJobs,
         };
 
         Plugin.Log.Debug(
-            $"PartyDetailCollector: Uploading detail listing={uploadData.ListingId} leader={uploadData.LeaderContentId} world={uploadData.HomeWorld} members={uploadData.MemberContentIds.Count}");
+            $"PartyDetailCollector: Uploading detail listing={uploadData.ListingId} leader={uploadData.LeaderContentId} world={uploadData.HomeWorld} members={uploadData.MemberContentIds.Count} non_zero_members={nonZeroMembers} parties={effectiveParties}");
 
         UploadDetailAsync(uploadData);
+        this.lastUploadedListingId = detailed.ListingId;
     }
 
     private void UploadDetailAsync(UploadablePartyDetail detail) {
@@ -148,4 +156,5 @@ internal class UploadablePartyDetail {
     public string LeaderName { get; set; } = string.Empty;
     public ushort HomeWorld { get; set; }
     public List<ulong> MemberContentIds { get; set; } = new();
+    public List<byte> MemberJobs { get; set; } = new();
 }
