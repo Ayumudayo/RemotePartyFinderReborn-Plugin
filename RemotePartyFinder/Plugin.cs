@@ -28,7 +28,7 @@ public class Plugin : IDalamudPlugin {
     internal ICommandManager CommandManager { get; private init; }
 
     public Configuration Configuration { get; init; }
-    public readonly WindowSystem WindowSystem = new("Remote Party Finder Reborn");
+    public readonly WindowSystem WindowSystem = new("Report Partry Finder Reborn");
     private ConfigWindow ConfigWindow { get; init; }
 
     private Gatherer Gatherer { get; }

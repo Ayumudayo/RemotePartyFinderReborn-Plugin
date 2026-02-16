@@ -1,4 +1,4 @@
-# Remote Party Finder Reborn - Dalamud Plugin
+# Report Partry Finder Reborn - Dalamud Plugin
 
 A Dalamud plugin that collects Party Finder listings from FFXIV and synchronizes them to a remote server.
 
