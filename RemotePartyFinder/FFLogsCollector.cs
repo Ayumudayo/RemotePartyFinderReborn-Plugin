@@ -16,6 +16,7 @@ public class FFLogsCollector : IDisposable
     private Plugin Plugin { get; }
     private FFLogsClient FFLogsClient { get; }
     private HttpClient HttpClient { get; } = new();
+    private Dictionary<string, ParseResult> PendingSubmitResults { get; } = new();
     private bool IsRunning { get; set; }
     private System.Threading.CancellationTokenSource Cts { get; set; } = new();
 
@@ -112,16 +113,92 @@ public class FFLogsCollector : IDisposable
         return new List<ParseJobCandidateServer>();
     }
 
+    private static string ParseResultKey(ParseResult result)
+        => $"{result.ContentId}:{result.ZoneId}:{result.DifficultyId}:{result.Partition}";
+
+    private List<ParseResult> BuildSubmitBatch(List<ParseResult> freshResults)
+    {
+        foreach (var result in freshResults)
+        {
+            this.PendingSubmitResults[ParseResultKey(result)] = result;
+        }
+
+        if (this.PendingSubmitResults.Count == 0)
+        {
+            return new List<ParseResult>();
+        }
+
+        var batch = this.PendingSubmitResults.Values.ToList();
+        this.PendingSubmitResults.Clear();
+        return batch;
+    }
+
+    private void RequeueSubmitBatch(IEnumerable<ParseResult> failedBatch)
+    {
+        foreach (var result in failedBatch)
+        {
+            this.PendingSubmitResults[ParseResultKey(result)] = result;
+        }
+    }
+
+    private int WorkerBaseDelayMs
+        => Math.Clamp(Plugin.Configuration.FFLogsWorkerBaseDelayMs, 1000, 120000);
+
+    private int WorkerIdleDelayMs
+        => Math.Clamp(Plugin.Configuration.FFLogsWorkerIdleDelayMs, 1000, 300000);
+
+    private int WorkerJitterMs
+        => Math.Clamp(Plugin.Configuration.FFLogsWorkerJitterMs, 0, 30000);
+
+    private int WorkerMaxBackoffDelayMs
+        => Math.Clamp(
+            Plugin.Configuration.FFLogsWorkerMaxBackoffDelayMs,
+            WorkerBaseDelayMs,
+            600000);
+
+    private static int JitteredDelayMs(int baseDelayMs, int jitterMs = 1000)
+    {
+        if (baseDelayMs < 0)
+            baseDelayMs = 0;
+        if (jitterMs < 0)
+            jitterMs = 0;
+
+        return baseDelayMs + Random.Shared.Next(0, jitterMs + 1);
+    }
+
+    private Task DelayWithJitterAsync(int baseDelayMs, int jitterMs = 1000)
+        => Task.Delay(JitteredDelayMs(baseDelayMs, jitterMs), Cts.Token);
+
+    private async Task<int> DelayWithBackoffAsync(int consecutiveFailures)
+    {
+        var nextFailures = Math.Min(consecutiveFailures + 1, 16);
+        var exponent = Math.Min(nextFailures - 1, 4);
+        var backoffDelay = Math.Min(WorkerMaxBackoffDelayMs, WorkerBaseDelayMs * (1 << exponent));
+        await DelayWithJitterAsync(backoffDelay, WorkerJitterMs);
+        return nextFailures;
+    }
+ 
     private async Task WorkerLoop()
     {
+        var consecutiveFailures = 0;
         while (!Cts.Token.IsCancellationRequested)
         {
             try
             {
+                var hadTransientFailure = false;
+
+                if (!Plugin.Configuration.EnableFFLogsWorker)
+                {
+                    consecutiveFailures = 0;
+                    await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
+                    continue;
+                }
+
                 if (string.IsNullOrEmpty(Plugin.Configuration.FFLogsClientId) || 
                     string.IsNullOrEmpty(Plugin.Configuration.FFLogsClientSecret))
                 {
-                    await Task.Delay(5000, Cts.Token);
+                    consecutiveFailures = 0;
+                    await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
                     continue;
                 }
 
@@ -129,7 +206,8 @@ public class FFLogsCollector : IDisposable
                 var uploadUrl = Plugin.Configuration.UploadUrls.FirstOrDefault(u => u.IsEnabled);
                 if (uploadUrl == null)
                 {
-                    await Task.Delay(5000, Cts.Token);
+                    consecutiveFailures = 0;
+                    await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
                     continue;
                 }
 
@@ -138,7 +216,8 @@ public class FFLogsCollector : IDisposable
                 {
                     if ((DateTime.UtcNow - uploadUrl.LastFailureTime).TotalMinutes < Plugin.Configuration.CircuitBreakerBreakDurationMinutes)
                     {
-                        await Task.Delay(5000, Cts.Token);
+                        consecutiveFailures = 0;
+                        await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
                         continue;
                     }
                 }
@@ -152,7 +231,7 @@ public class FFLogsCollector : IDisposable
 
                 // 1. Request Work
                 var workUrl = $"{baseUrl}/contribute/fflogs/jobs";
-                List<ParseJob>? jobs = null;
+                List<ParseJob> jobs = null;
                 
                 try 
                 {
@@ -169,6 +248,7 @@ public class FFLogsCollector : IDisposable
                          // Log only if not 404 to avoid spam on old servers
                         if (response.StatusCode != System.Net.HttpStatusCode.NotFound)
                         {
+                            hadTransientFailure = true;
                             uploadUrl.FailureCount++;
                             uploadUrl.LastFailureTime = DateTime.UtcNow;
                         }
@@ -176,6 +256,7 @@ public class FFLogsCollector : IDisposable
                 }
                 catch (Exception ex)
                 {
+                    hadTransientFailure = true;
                     uploadUrl.FailureCount++;
                     uploadUrl.LastFailureTime = DateTime.UtcNow;
                     Plugin.Log.Debug($"Error requesting work: {ex.Message}");
@@ -183,8 +264,15 @@ public class FFLogsCollector : IDisposable
 
                 if (jobs == null || jobs.Count == 0)
                 {
-                    // No work, sleep
-                    await Task.Delay(10000, Cts.Token);
+                    if (hadTransientFailure)
+                    {
+                        consecutiveFailures = await DelayWithBackoffAsync(consecutiveFailures);
+                    }
+                    else
+                    {
+                        consecutiveFailures = 0;
+                        await DelayWithJitterAsync(WorkerIdleDelayMs, WorkerJitterMs);
+                    }
                     continue;
                 }
 
@@ -255,7 +343,7 @@ public class FFLogsCollector : IDisposable
 
                         var bestIdx = -1;
                         var bestScore = long.MinValue;
-                        FFLogsClient.CharacterFetchedData? bestData = null;
+                        FFLogsClient.CharacterFetchedData bestData = null;
 
                         for (var i = 0; i < candidates.Count; i++)
                         {
@@ -283,6 +371,8 @@ public class FFLogsCollector : IDisposable
                         {
                             ContentId = job.ContentId,
                             ZoneId = zoneId,
+                            DifficultyId = group.Key.DifficultyId,
+                            Partition = group.Key.Partition,
                             IsHidden = bestData.Hidden,
                             IsEstimated = job.CandidateServers != null && job.CandidateServers.Count > 0,
                             MatchedServer = matched.Server,
@@ -369,27 +459,47 @@ public class FFLogsCollector : IDisposable
                     await Task.Delay(1000, Cts.Token);
                 }
 
-                    // 3. Submit Results
-                    if (results.Count > 0)
+                    // 3. Submit Results (retry-safe)
+                    var submitBatch = BuildSubmitBatch(results);
+                    if (submitBatch.Count > 0)
                     {
-                    var submitUrl = $"{baseUrl}/contribute/fflogs/results";
-                    var jsonContent = JsonConvert.SerializeObject(results);
-                     var submitResp = await HttpClient.PostAsync(submitUrl, new StringContent(jsonContent) {
-                        Headers = { ContentType = MediaTypeHeaderValue.Parse("application/json") }
-                    }, Cts.Token);
+                        var submitUrl = $"{baseUrl}/contribute/fflogs/results";
+                        var jsonContent = JsonConvert.SerializeObject(submitBatch);
+                        try
+                        {
+                            var submitResp = await HttpClient.PostAsync(submitUrl, new StringContent(jsonContent)
+                            {
+                                Headers = { ContentType = MediaTypeHeaderValue.Parse("application/json") }
+                            }, Cts.Token);
 
-                    if (submitResp.IsSuccessStatusCode)
+                            if (submitResp.IsSuccessStatusCode)
+                            {
+                                Plugin.Log.Info($"Uploaded {submitBatch.Count} parse results.");
+                            }
+                            else
+                            {
+                                hadTransientFailure = true;
+                                RequeueSubmitBatch(submitBatch);
+                                Plugin.Log.Error($"Failed to upload results: {submitResp.StatusCode} (requeued {submitBatch.Count})");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            hadTransientFailure = true;
+                            RequeueSubmitBatch(submitBatch);
+                            Plugin.Log.Error($"Failed to upload results (exception): {ex.Message} (requeued {submitBatch.Count})");
+                        }
+                    }
+
+                    if (hadTransientFailure)
                     {
-                         Plugin.Log.Info($"Uploaded {results.Count} parse results.");
+                        consecutiveFailures = await DelayWithBackoffAsync(consecutiveFailures);
                     }
                     else
                     {
-                         Plugin.Log.Error($"Failed to upload results: {submitResp.StatusCode}");
+                        consecutiveFailures = 0;
+                        await DelayWithJitterAsync(WorkerIdleDelayMs, WorkerJitterMs);
                     }
-                    }
-
-                    // Prevent tight-loop polling even when work exists
-                    await Task.Delay(10000, Cts.Token);
 
             }
             catch (TaskCanceledException)
@@ -399,7 +509,7 @@ public class FFLogsCollector : IDisposable
             catch (Exception ex)
             {
                 Plugin.Log.Error($"FFLogsCollector Loop Error: {ex.Message}");
-                await Task.Delay(5000, Cts.Token);
+                consecutiveFailures = await DelayWithBackoffAsync(consecutiveFailures);
             }
         }
     }
@@ -435,6 +545,8 @@ public class ParseResult
 {
     public ulong ContentId { get; set; }
     public uint ZoneId { get; set; }
+    public int DifficultyId { get; set; }
+    public int Partition { get; set; }
     public Dictionary<int, double> Encounters { get; set; } = new();
     public Dictionary<int, double> BossPercentages { get; set; } = new();
     public bool IsHidden { get; set; }

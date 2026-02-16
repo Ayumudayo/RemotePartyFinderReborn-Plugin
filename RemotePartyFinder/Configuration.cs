@@ -18,6 +18,11 @@ public class Configuration : IPluginConfiguration {
     // FFLogs API Settings
     public string FFLogsClientId { get; set; } = string.Empty;
     public string FFLogsClientSecret { get; set; } = string.Empty;
+    public bool EnableFFLogsWorker { get; set; } = true;
+    public int FFLogsWorkerBaseDelayMs { get; set; } = 5000;
+    public int FFLogsWorkerIdleDelayMs { get; set; } = 10000;
+    public int FFLogsWorkerMaxBackoffDelayMs { get; set; } = 60000;
+    public int FFLogsWorkerJitterMs { get; set; } = 2000;
     
     // UI Collapse States (not saved, just runtime state)
     [NonSerialized]

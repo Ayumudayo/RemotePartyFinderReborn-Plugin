@@ -16,7 +16,7 @@ public class FFLogsClient : IDisposable
 {
     private readonly Configuration _configuration;
     private readonly HttpClient _httpClient;
-    private string? _accessToken;
+    private string _accessToken = string.Empty;
     private DateTime _tokenExpiration;
 
     private DateTime _lastGraphQlErrorLog = DateTime.MinValue;
@@ -78,10 +78,10 @@ public class FFLogsClient : IDisposable
         }
     }
 
-    public Task<JObject?> QueryAsync(string query)
+    public Task<JObject> QueryAsync(string query)
         => QueryAsync(query, CancellationToken.None);
 
-    public async Task<JObject?> QueryAsync(string query, CancellationToken cancellationToken)
+    public async Task<JObject> QueryAsync(string query, CancellationToken cancellationToken)
     {
         if (!await EnsureTokenAsync())
         {

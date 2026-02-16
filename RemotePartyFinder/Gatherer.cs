@@ -15,9 +15,10 @@ namespace RemotePartyFinder;
 internal class Gatherer : IDisposable {
     private Plugin Plugin { get; }
 
-    private ConcurrentDictionary<int, List<IPartyFinderListing>> Batches { get; } = new();
+    private ConcurrentDictionary<int, ConcurrentQueue<IPartyFinderListing>> Batches { get; } = new();
     private Stopwatch UploadTimer { get; } = new();
     private HttpClient Client { get; } = new();
+    private volatile bool _isUploading;
 
     internal Gatherer(Plugin plugin) {
         this.Plugin = plugin;
@@ -34,11 +35,8 @@ internal class Gatherer : IDisposable {
     }
 
     private void OnListing(IPartyFinderListing listing, IPartyFinderListingEventArgs args) {
-        if (!this.Batches.ContainsKey(args.BatchNumber)) {
-            this.Batches[args.BatchNumber] = [];
-        }
-
-        this.Batches[args.BatchNumber].Add(listing);
+        var queue = this.Batches.GetOrAdd(args.BatchNumber, _ => new ConcurrentQueue<IPartyFinderListing>());
+        queue.Enqueue(listing);
     }
 
     private void OnUpdate(IFramework framework1) {
@@ -46,14 +44,35 @@ internal class Gatherer : IDisposable {
             return;
         }
 
+        if (this._isUploading) {
+            return;
+        }
+
         this.UploadTimer.Restart();
 
-        foreach (var (batch, listings) in this.Batches.ToList()) {
-            this.Batches.Remove(batch, out _);
-            Task.Run(async () => {
-                var uploadable = listings
-                    .Select(listing => new UploadableListing(listing))
-                    .ToList();
+        this._isUploading = true;
+        this.UploadPendingBatchesAsync();
+    }
+
+    private void UploadPendingBatchesAsync() {
+        Task.Run(async () => {
+            try {
+                var uploadable = new List<UploadableListing>();
+
+                foreach (var (batch, _) in this.Batches.ToList()) {
+                    if (!this.Batches.TryRemove(batch, out var queue) || queue == null) {
+                        continue;
+                    }
+
+                    while (queue.TryDequeue(out var listing)) {
+                        uploadable.Add(new UploadableListing(listing));
+                    }
+                }
+
+                if (uploadable.Count == 0) {
+                    return;
+                }
+
                 var json = JsonConvert.SerializeObject(uploadable);
 
                 foreach (var uploadUrl in Plugin.Configuration.UploadUrls.Where(uploadUrl => uploadUrl.IsEnabled))
@@ -80,7 +99,7 @@ internal class Gatherer : IDisposable {
                         var resp = await this.Client.PostAsync(targetUrl, new StringContent(json) {
                             Headers = { ContentType = MediaTypeHeaderValue.Parse("application/json") },
                         });
-                        
+
                         // 성공 여부 확인
                         if (resp.IsSuccessStatusCode) {
                             uploadUrl.FailureCount = 0;
@@ -88,16 +107,17 @@ internal class Gatherer : IDisposable {
                             uploadUrl.FailureCount++;
                             uploadUrl.LastFailureTime = DateTime.UtcNow;
                         }
-                        
-                        var output = await resp.Content.ReadAsStringAsync();
-                        Plugin.Log.Info($"{targetUrl}: {resp.StatusCode}\n{output}");
+
+                        Plugin.Log.Debug($"Gatherer: {targetUrl}: {resp.StatusCode} ({uploadable.Count} listings)");
                     } catch (Exception ex) {
                         uploadUrl.FailureCount++;
                         uploadUrl.LastFailureTime = DateTime.UtcNow;
                         Plugin.Log.Error($"Gatherer upload error to {targetUrl}: {ex.Message}");
                     }
                 }
-            });
-        }
+            } finally {
+                this._isUploading = false;
+            }
+        });
     }
 }

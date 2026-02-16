@@ -74,6 +74,13 @@ public class ConfigWindow : Window, IDisposable
                 _configuration.Save();
             }
 
+            var enableWorker = _configuration.EnableFFLogsWorker;
+            if (ImGui.Checkbox("Enable FFLogs background worker", ref enableWorker))
+            {
+                _configuration.EnableFFLogsWorker = enableWorker;
+                _configuration.Save();
+            }
+
             if (ImGui.CollapsingHeader("How to get a client ID and a client secret:"))
             {
             ImGui.AlignTextToFramePadding();
@@ -266,6 +273,57 @@ public class ConfigWindow : Window, IDisposable
         ImGui.Separator();
         ImGui.Spacing();
 
+        ImGui.TextColored(new Vector4(0.4f, 1.0f, 0.4f, 1.0f), "[FFLogs Worker Timing]");
+        ImGui.Spacing();
+
+        var workerBaseDelay = _configuration.FFLogsWorkerBaseDelayMs;
+        if (ImGui.SliderInt("Base Delay", ref workerBaseDelay, 1000, 30000, "%d ms"))
+        {
+            _configuration.FFLogsWorkerBaseDelayMs = workerBaseDelay;
+            _configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Base delay used for disabled/misconfigured states and exponential backoff base.");
+        }
+
+        var workerIdleDelay = _configuration.FFLogsWorkerIdleDelayMs;
+        if (ImGui.SliderInt("Idle Delay", ref workerIdleDelay, 1000, 60000, "%d ms"))
+        {
+            _configuration.FFLogsWorkerIdleDelayMs = workerIdleDelay;
+            _configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Polling delay when there is no work or after successful processing.");
+        }
+
+        var workerMaxBackoffDelay = _configuration.FFLogsWorkerMaxBackoffDelayMs;
+        if (ImGui.SliderInt("Max Backoff", ref workerMaxBackoffDelay, 5000, 180000, "%d ms"))
+        {
+            _configuration.FFLogsWorkerMaxBackoffDelayMs = workerMaxBackoffDelay;
+            _configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Upper bound for retry backoff after repeated transient failures.");
+        }
+
+        var workerJitter = _configuration.FFLogsWorkerJitterMs;
+        if (ImGui.SliderInt("Delay Jitter", ref workerJitter, 0, 10000, "%d ms"))
+        {
+            _configuration.FFLogsWorkerJitterMs = workerJitter;
+            _configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Random jitter added to worker delays to reduce synchronized polling spikes.");
+        }
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
         ImGui.Text("Endpoint Status:");
 
         if (ImGui.BeginTable("cbStatusTable", 4, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable))
@@ -339,7 +397,7 @@ public class ConfigWindow : Window, IDisposable
         {
             ImGui.SetClipboardText(text);
         }
-        catch (Exception ex)
+        catch (Exception)
         {
             // Ignore
         }
