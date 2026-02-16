@@ -2,7 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
-using System.Net.Http.Headers;
 using System.Threading.Tasks;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
@@ -105,15 +104,25 @@ internal class PartyDetailCollector : IDisposable {
                     var detailUrl = baseUrl + "/contribute/detail";
 
                     try {
-                        var resp = await this.Client.PostAsync(detailUrl, new StringContent(json) {
-                            Headers = { ContentType = MediaTypeHeaderValue.Parse("application/json") },
-                        });
+                        using var request = IngestRequestFactory.CreatePostJsonRequest(
+                            this.Plugin.Configuration,
+                            detailUrl,
+                            "/contribute/detail",
+                            json
+                        );
+                        var resp = await this.Client.SendAsync(request);
 
                         if (resp.IsSuccessStatusCode) {
                             uploadUrl.FailureCount = 0;
                         } else {
                             uploadUrl.FailureCount++;
                             uploadUrl.LastFailureTime = DateTime.UtcNow;
+                            if ((int)resp.StatusCode == 429) {
+                                var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(resp);
+                                if (retryAfter.HasValue) {
+                                    Plugin.Log.Warning($"PartyDetailCollector: rate limited by {detailUrl}, retry_after={retryAfter.Value}s");
+                                }
+                            }
                         }
 
                         var output = await resp.Content.ReadAsStringAsync();

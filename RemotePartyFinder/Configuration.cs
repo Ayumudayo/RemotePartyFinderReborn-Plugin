@@ -23,6 +23,10 @@ public class Configuration : IPluginConfiguration {
     public int FFLogsWorkerIdleDelayMs { get; set; } = 10000;
     public int FFLogsWorkerMaxBackoffDelayMs { get; set; } = 60000;
     public int FFLogsWorkerJitterMs { get; set; } = 2000;
+
+    // Ingest security metadata
+    public string IngestClientId { get; set; } = string.Empty;
+    public string IngestSharedSecret { get; set; } = "rpf-reborn-public-ingest-v1";
     
     // UI Collapse States (not saved, just runtime state)
     [NonSerialized]

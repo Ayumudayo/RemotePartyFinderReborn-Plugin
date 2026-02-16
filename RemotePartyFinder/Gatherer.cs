@@ -4,7 +4,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Net.Http;
-using System.Net.Http.Headers;
 using System.Threading.Tasks;
 using Dalamud.Game.Gui.PartyFinder.Types;
 using Dalamud.Plugin.Services;
@@ -96,9 +95,13 @@ internal class Gatherer : IDisposable {
                     var targetUrl = baseUrl + "/contribute/multiple";
 
                     try {
-                        var resp = await this.Client.PostAsync(targetUrl, new StringContent(json) {
-                            Headers = { ContentType = MediaTypeHeaderValue.Parse("application/json") },
-                        });
+                        using var request = IngestRequestFactory.CreatePostJsonRequest(
+                            this.Plugin.Configuration,
+                            targetUrl,
+                            "/contribute/multiple",
+                            json
+                        );
+                        var resp = await this.Client.SendAsync(request);
 
                         // 성공 여부 확인
                         if (resp.IsSuccessStatusCode) {
@@ -106,6 +109,12 @@ internal class Gatherer : IDisposable {
                         } else {
                             uploadUrl.FailureCount++;
                             uploadUrl.LastFailureTime = DateTime.UtcNow;
+                            if ((int)resp.StatusCode == 429) {
+                                var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(resp);
+                                if (retryAfter.HasValue) {
+                                    Plugin.Log.Warning($"Gatherer: rate limited by {targetUrl}, retry_after={retryAfter.Value}s");
+                                }
+                            }
                         }
 
                         Plugin.Log.Debug($"Gatherer: {targetUrl}: {resp.StatusCode} ({uploadable.Count} listings)");

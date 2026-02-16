@@ -2,8 +2,6 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
-using System.Net.Http.Headers;
-using System.Text;
 using System.Threading.Tasks;
 using Dalamud.Plugin.Services;
 using Newtonsoft.Json;
@@ -235,7 +233,12 @@ public class FFLogsCollector : IDisposable
                 
                 try 
                 {
-                    var response = await HttpClient.GetAsync(workUrl, Cts.Token);
+                    using var workRequest = IngestRequestFactory.CreateGetRequest(
+                        Plugin.Configuration,
+                        workUrl,
+                        "/contribute/fflogs/jobs"
+                    );
+                    var response = await HttpClient.SendAsync(workRequest, Cts.Token);
                     if (response.IsSuccessStatusCode)
                     {
                         var json = await response.Content.ReadAsStringAsync(Cts.Token);
@@ -251,6 +254,14 @@ public class FFLogsCollector : IDisposable
                             hadTransientFailure = true;
                             uploadUrl.FailureCount++;
                             uploadUrl.LastFailureTime = DateTime.UtcNow;
+                            if ((int)response.StatusCode == 429)
+                            {
+                                var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);
+                                if (retryAfter.HasValue)
+                                {
+                                    Plugin.Log.Warning($"FFLogsCollector: jobs endpoint rate limited, retry_after={retryAfter.Value}s");
+                                }
+                            }
                         }
                     }
                 }
@@ -376,6 +387,7 @@ public class FFLogsCollector : IDisposable
                             IsHidden = bestData.Hidden,
                             IsEstimated = job.CandidateServers != null && job.CandidateServers.Count > 0,
                             MatchedServer = matched.Server,
+                            LeaseToken = job.LeaseToken,
                         };
 
                         if (!pr.IsHidden)
@@ -467,10 +479,13 @@ public class FFLogsCollector : IDisposable
                         var jsonContent = JsonConvert.SerializeObject(submitBatch);
                         try
                         {
-                            var submitResp = await HttpClient.PostAsync(submitUrl, new StringContent(jsonContent)
-                            {
-                                Headers = { ContentType = MediaTypeHeaderValue.Parse("application/json") }
-                            }, Cts.Token);
+                            using var submitRequest = IngestRequestFactory.CreatePostJsonRequest(
+                                Plugin.Configuration,
+                                submitUrl,
+                                "/contribute/fflogs/results",
+                                jsonContent
+                            );
+                            var submitResp = await HttpClient.SendAsync(submitRequest, Cts.Token);
 
                             if (submitResp.IsSuccessStatusCode)
                             {
@@ -480,6 +495,14 @@ public class FFLogsCollector : IDisposable
                             {
                                 hadTransientFailure = true;
                                 RequeueSubmitBatch(submitBatch);
+                                if ((int)submitResp.StatusCode == 429)
+                                {
+                                    var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(submitResp);
+                                    if (retryAfter.HasValue)
+                                    {
+                                        Plugin.Log.Warning($"FFLogsCollector: results endpoint rate limited, retry_after={retryAfter.Value}s");
+                                    }
+                                }
                                 Plugin.Log.Error($"Failed to upload results: {submitResp.StatusCode} (requeued {submitBatch.Count})");
                             }
                         }
@@ -529,6 +552,7 @@ public class ParseJob
     public int Partition { get; set; }
     public uint EncounterId { get; set; }
     public uint? SecondaryEncounterId { get; set; }
+    public string LeaseToken { get; set; } = "";
 }
 
 [Serializable]
@@ -552,4 +576,5 @@ public class ParseResult
     public bool IsHidden { get; set; }
     public bool IsEstimated { get; set; }
     public string MatchedServer { get; set; } = "";
+    public string LeaseToken { get; set; } = "";
 }
