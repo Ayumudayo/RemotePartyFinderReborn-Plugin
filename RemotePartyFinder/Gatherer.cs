@@ -1,9 +1,10 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Net.Http;
+using System.Threading;
 using System.Threading.Tasks;
 using Dalamud.Game.Gui.PartyFinder.Types;
 using Dalamud.Plugin.Services;
@@ -17,7 +18,14 @@ internal class Gatherer : IDisposable {
     private ConcurrentDictionary<int, ConcurrentQueue<IPartyFinderListing>> Batches { get; } = new();
     private Stopwatch UploadTimer { get; } = new();
     private HttpClient Client { get; } = new();
+    private ConcurrentDictionary<uint, DateTime> LastUploadedListingAtUtc { get; } = new();
     private volatile bool _isUploading;
+    private long _lastSuccessfulUploadAtUtcTicks;
+    private long _lastSuccessfulUploadAckVersion;
+
+    internal long LastSuccessfulUploadAckVersion => Interlocked.Read(ref this._lastSuccessfulUploadAckVersion);
+    internal DateTime LastSuccessfulUploadAtUtc => new(Interlocked.Read(ref this._lastSuccessfulUploadAtUtcTicks), DateTimeKind.Utc);
+    internal int UploadedListingIndexCount => this.LastUploadedListingAtUtc.Count;
 
     internal Gatherer(Plugin plugin) {
         this.Plugin = plugin;
@@ -31,6 +39,14 @@ internal class Gatherer : IDisposable {
     public void Dispose() {
         this.Plugin.Framework.Update -= this.OnUpdate;
         this.Plugin.PartyFinderGui.ReceiveListing -= this.OnListing;
+    }
+
+    internal bool WasListingUploadedAfter(uint listingId, DateTime observedAtUtc) {
+        if (!this.LastUploadedListingAtUtc.TryGetValue(listingId, out var uploadedAtUtc)) {
+            return false;
+        }
+
+        return uploadedAtUtc >= observedAtUtc.AddMilliseconds(-250);
     }
 
     private void OnListing(IPartyFinderListing listing, IPartyFinderListingEventArgs args) {
@@ -73,6 +89,8 @@ internal class Gatherer : IDisposable {
                 }
 
                 var json = JsonConvert.SerializeObject(uploadable);
+                var uploadedListingIds = uploadable.Select(x => x.Id).Distinct().ToArray();
+                var anySuccess = false;
 
                 foreach (var uploadUrl in Plugin.Configuration.UploadUrls.Where(uploadUrl => uploadUrl.IsEnabled))
                 {
@@ -105,6 +123,7 @@ internal class Gatherer : IDisposable {
 
                         // 성공 여부 확인
                         if (resp.IsSuccessStatusCode) {
+                            anySuccess = true;
                             uploadUrl.FailureCount = 0;
                         } else {
                             uploadUrl.FailureCount++;
@@ -124,9 +143,29 @@ internal class Gatherer : IDisposable {
                         Plugin.Log.Error($"Gatherer upload error to {targetUrl}: {ex.Message}");
                     }
                 }
+
+                if (anySuccess) {
+                    var now = DateTime.UtcNow;
+                    foreach (var listingId in uploadedListingIds) {
+                        this.LastUploadedListingAtUtc[listingId] = now;
+                    }
+
+                    Interlocked.Exchange(ref this._lastSuccessfulUploadAtUtcTicks, now.Ticks);
+                    Interlocked.Increment(ref this._lastSuccessfulUploadAckVersion);
+                    PruneUploadIndex(now);
+                }
             } finally {
                 this._isUploading = false;
             }
         });
+    }
+
+    private void PruneUploadIndex(DateTime now) {
+        var cutoff = now.AddMinutes(-30);
+        foreach (var entry in this.LastUploadedListingAtUtc) {
+            if (entry.Value < cutoff) {
+                this.LastUploadedListingAtUtc.TryRemove(entry.Key, out _);
+            }
+        }
     }
 }

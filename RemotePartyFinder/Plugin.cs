@@ -31,9 +31,10 @@ public class Plugin : IDalamudPlugin {
     public readonly WindowSystem WindowSystem = new("Remote Party Finder Reborn");
     private ConfigWindow ConfigWindow { get; init; }
 
-    private Gatherer Gatherer { get; }
+    internal Gatherer Gatherer { get; }
     private PlayerCollector PlayerCollector { get; }
-    private PartyDetailCollector PartyDetailCollector { get; }
+    internal PartyDetailCollector PartyDetailCollector { get; }
+    internal DebugPfScanner DebugPfScanner { get; }
     private FFLogsCollector FFLogsCollector { get; }
 
     public Plugin() {
@@ -41,6 +42,7 @@ public class Plugin : IDalamudPlugin {
         this.Gatherer = new Gatherer(this);
         this.PlayerCollector = new PlayerCollector(this);
         this.PartyDetailCollector = new PartyDetailCollector(this);
+        this.DebugPfScanner = new DebugPfScanner(this, this.PartyDetailCollector, this.Gatherer);
         this.FFLogsCollector = new FFLogsCollector(this);
         ConfigWindow = new ConfigWindow(this);
         WindowSystem.AddWindow(ConfigWindow);
@@ -56,6 +58,7 @@ public class Plugin : IDalamudPlugin {
         this.Gatherer.Dispose();
         this.PlayerCollector.Dispose();
         this.PartyDetailCollector.Dispose();
+        this.DebugPfScanner.Dispose();
         this.FFLogsCollector.Dispose();
         WindowSystem.RemoveAllWindows();
         ConfigWindow.Dispose();

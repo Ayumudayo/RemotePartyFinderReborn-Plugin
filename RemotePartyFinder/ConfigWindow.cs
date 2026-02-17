@@ -1,5 +1,4 @@
-﻿using System;
-using System.Collections.Generic;
+using System;
 using System.Linq;
 using System.Numerics;
 using System.Threading.Tasks;
@@ -12,12 +11,14 @@ namespace RemotePartyFinder;
 
 public class ConfigWindow : Window, IDisposable
 {
+    private readonly Plugin _plugin;
     private readonly Configuration _configuration;
     private string _uploadUrlTempString = string.Empty;
     private string _uploadUrlError = string.Empty;
 
     public ConfigWindow(Plugin plugin) : base("Remote Party Finder Reborn")
     {
+        _plugin = plugin;
         _configuration = plugin.Configuration;
         Flags = ImGuiWindowFlags.AlwaysAutoResize;
 
@@ -318,6 +319,115 @@ public class ConfigWindow : Window, IDisposable
         if (ImGui.IsItemHovered())
         {
             ImGui.SetTooltip("Random jitter added to worker delays to reduce synchronized polling spikes.");
+        }
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        ImGui.TextColored(new Vector4(0.4f, 1.0f, 0.4f, 1.0f), "[PF Detail Auto Scanner (Debug)]");
+        ImGui.Spacing();
+
+        var enableScanner = _configuration.EnableAutoDetailScanDebug;
+        if (ImGui.Checkbox("Enable Auto Detail Scanner", ref enableScanner))
+        {
+            _configuration.EnableAutoDetailScanDebug = enableScanner;
+            if (!enableScanner)
+            {
+                _plugin.DebugPfScanner.ResetSession();
+            }
+            _configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Debug mode: automatically opens PF listing details one-by-one to accelerate detail collection.");
+        }
+
+        ImGui.TextWrapped("Scanner bootstrap: each run forces a PF listings refresh and starts from page 1 data.");
+
+        var currentPageOnly = _configuration.AutoDetailScanCurrentPageOnly;
+        if (ImGui.Checkbox("Current Page Only", ref currentPageOnly))
+        {
+            _configuration.AutoDetailScanCurrentPageOnly = currentPageOnly;
+            _plugin.DebugPfScanner.ResetSession();
+            _configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Enabled: only scan listings received from the current page. Disabled: also scan listing IDs cached by the game across pages.");
+        }
+
+        var actionInterval = _configuration.AutoDetailScanActionIntervalMs;
+        if (ImGui.SliderInt("Action Interval", ref actionInterval, 100, 2000, "%d ms"))
+        {
+            _configuration.AutoDetailScanActionIntervalMs = actionInterval;
+            _configuration.Save();
+        }
+
+        var detailTimeout = _configuration.AutoDetailScanDetailTimeoutMs;
+        if (ImGui.SliderInt("Detail Timeout", ref detailTimeout, 500, 10000, "%d ms"))
+        {
+            _configuration.AutoDetailScanDetailTimeoutMs = detailTimeout;
+            _configuration.Save();
+        }
+
+        var minDwell = _configuration.AutoDetailScanMinDwellMs;
+        if (ImGui.SliderInt("Min Detail Dwell", ref minDwell, 100, 3000, "%d ms"))
+        {
+            _configuration.AutoDetailScanMinDwellMs = minDwell;
+            _configuration.Save();
+        }
+
+        var postCooldown = _configuration.AutoDetailScanPostListingCooldownMs;
+        if (ImGui.SliderInt("Post Listing Cooldown", ref postCooldown, 50, 3000, "%d ms"))
+        {
+            _configuration.AutoDetailScanPostListingCooldownMs = postCooldown;
+            _configuration.Save();
+        }
+
+        var refreshInterval = _configuration.AutoDetailScanRefreshIntervalMs;
+        if (ImGui.SliderInt("Refresh Interval", ref refreshInterval, 1000, 30000, "%d ms"))
+        {
+            _configuration.AutoDetailScanRefreshIntervalMs = refreshInterval;
+            _configuration.Save();
+        }
+
+        var dedupTtl = _configuration.AutoDetailScanDedupTtlSeconds;
+        if (ImGui.SliderInt("Dedup TTL", ref dedupTtl, 30, 3600, "%d s"))
+        {
+            _configuration.AutoDetailScanDedupTtlSeconds = dedupTtl;
+            _configuration.Save();
+        }
+
+        var maxFailures = _configuration.AutoDetailScanMaxConsecutiveFailures;
+        if (ImGui.SliderInt("Max Consecutive Failures", ref maxFailures, 1, 20, "%d"))
+        {
+            _configuration.AutoDetailScanMaxConsecutiveFailures = maxFailures;
+            _configuration.Save();
+        }
+
+        var maxPerRun = _configuration.AutoDetailScanMaxPerRun;
+        if (ImGui.SliderInt("Max Listings Per Run (0=unlimited)", ref maxPerRun, 0, 500, "%d"))
+        {
+            _configuration.AutoDetailScanMaxPerRun = maxPerRun;
+            _configuration.Save();
+        }
+
+        ImGui.TextUnformatted($"State: {_plugin.DebugPfScanner.StateName}");
+        ImGui.TextUnformatted($"Target Listing: {_plugin.DebugPfScanner.CurrentTargetListingId}");
+        ImGui.TextUnformatted($"Visible Cache: {_plugin.DebugPfScanner.VisibleListingCount} / Pending: {_plugin.DebugPfScanner.PendingCount}");
+        ImGui.TextUnformatted($"Processed: {_plugin.DebugPfScanner.ProcessedCount} / Consecutive Failures: {_plugin.DebugPfScanner.ConsecutiveFailures}");
+        ImGui.TextUnformatted($"Last Attempt: listing={_plugin.DebugPfScanner.LastAttemptListingId} success={_plugin.DebugPfScanner.LastAttemptSuccess} reason={_plugin.DebugPfScanner.LastAttemptReason}");
+        ImGui.TextUnformatted($"Gatherer Ack Version: {_plugin.Gatherer.LastSuccessfulUploadAckVersion} (indexed: {_plugin.Gatherer.UploadedListingIndexCount})");
+        ImGui.TextUnformatted($"Gatherer Last Success UTC: {_plugin.Gatherer.LastSuccessfulUploadAtUtc:HH:mm:ss}");
+        ImGui.TextUnformatted($"Detail Ack Version: {_plugin.PartyDetailCollector.LastSuccessfulUploadAckVersion} listing={_plugin.PartyDetailCollector.LastSuccessfulUploadListingId}");
+        ImGui.TextUnformatted($"Detail Last Success UTC: {_plugin.PartyDetailCollector.LastSuccessfulUploadAtUtc:HH:mm:ss}");
+        ImGui.TextUnformatted($"Detail Missing Ack Version: {_plugin.PartyDetailCollector.LastTerminalUploadAckVersion} listing={_plugin.PartyDetailCollector.LastTerminalUploadListingId}");
+        ImGui.TextUnformatted($"Detail Pending Queue: {_plugin.PartyDetailCollector.PendingQueueCount}");
+
+        if (ImGui.Button("Reset Scanner Session"))
+        {
+            _plugin.DebugPfScanner.ResetSession();
         }
 
         ImGui.Spacing();
