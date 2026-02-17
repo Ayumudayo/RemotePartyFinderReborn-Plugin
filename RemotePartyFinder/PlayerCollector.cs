@@ -13,67 +13,75 @@ using Newtonsoft.Json.Serialization;
 
 namespace RemotePartyFinder;
 
-/// <summary>
-/// ObjectTable을 주기적으로 스캔하여 플레이어 정보를 수집합니다.
-/// 로컬 SQLite DB를 통해 중복/미전송 상태를 관리합니다.
-/// </summary>
-internal class PlayerCollector : IDisposable {
-    private Plugin Plugin { get; }
-    private PlayerLocalDatabase Database { get; }
-    private HttpClient Client { get; } = new();
-    private Stopwatch ScanTimer { get; } = new();
-    private volatile bool _isUploading;
-
+internal sealed class PlayerCollector : IDisposable {
     private const int ScanIntervalSeconds = 5;
-
-    // FFXIVClientStructs Character 구조체의 ContentId 오프셋 (0x2358)
     private const int ContentIdOffset = 0x2358;
-    // FFXIVClientStructs Character 구조체의 AccountId 오프셋 (0x2350)
     private const int AccountIdOffset = 0x2350;
 
+    private readonly Plugin _plugin;
+    private readonly PlayerLocalDatabase _database;
+    private readonly HttpClient _httpClient = new();
+    private readonly Stopwatch _scanTimer = new();
+
+    private volatile bool _uploadInProgress;
+
     internal PlayerCollector(Plugin plugin) {
-        this.Plugin = plugin;
-        this.Database = new PlayerLocalDatabase(plugin);
-        this.ScanTimer.Start();
-        this.Plugin.Framework.Update += this.OnUpdate;
+        _plugin = plugin;
+        _database = new PlayerLocalDatabase(plugin);
+        _scanTimer.Start();
+        _plugin.Framework.Update += OnUpdate;
     }
 
     public void Dispose() {
-        this.Plugin.Framework.Update -= this.OnUpdate;
-        this.Database.Dispose();
+        _plugin.Framework.Update -= OnUpdate;
+        _database.Dispose();
     }
 
     private void OnUpdate(IFramework framework) {
-        if (this.ScanTimer.Elapsed < TimeSpan.FromSeconds(ScanIntervalSeconds)) {
-            return;
-        }
-        this.ScanTimer.Restart();
-
-        if (this._isUploading) {
+        if (_scanTimer.Elapsed < TimeSpan.FromSeconds(ScanIntervalSeconds)) {
             return;
         }
 
-        var observedPlayers = new List<UploadablePlayer>();
-        foreach (var obj in this.Plugin.ObjectTable) {
-            if (obj.ObjectKind != ObjectKind.Player) {
+        _scanTimer.Restart();
+        if (_uploadInProgress) {
+            return;
+        }
+
+        var observedPlayers = CollectObservedPlayers();
+        if (observedPlayers.Count > 0) {
+            _database.UpsertObservedPlayers(observedPlayers);
+        }
+
+        if (_database.PendingCount <= 0) {
+            return;
+        }
+
+        _uploadInProgress = true;
+        _ = UploadPendingBatchAsync();
+    }
+
+    private List<UploadablePlayer> CollectObservedPlayers() {
+        var players = new List<UploadablePlayer>();
+        foreach (var gameObject in _plugin.ObjectTable) {
+            if (gameObject.ObjectKind != ObjectKind.Player) {
                 continue;
             }
 
-            if (obj is not IPlayerCharacter playerCharacter) {
+            if (gameObject is not IPlayerCharacter character) {
                 continue;
             }
 
-            var contentId = (ulong)Marshal.ReadInt64(obj.Address + ContentIdOffset);
-            var accountId = (ulong)Marshal.ReadInt64(obj.Address + AccountIdOffset);
-            var homeWorld = (ushort)playerCharacter.HomeWorld.RowId;
-            var currentWorld = (ushort)playerCharacter.CurrentWorld.RowId;
-            var name = obj.Name.TextValue;
+            var contentId = (ulong)Marshal.ReadInt64(gameObject.Address + ContentIdOffset);
+            var accountId = (ulong)Marshal.ReadInt64(gameObject.Address + AccountIdOffset);
+            var homeWorld = (ushort)character.HomeWorld.RowId;
+            var currentWorld = (ushort)character.CurrentWorld.RowId;
+            var name = gameObject.Name.TextValue;
 
             if (contentId == 0 || homeWorld == 0 || homeWorld >= 1000 || string.IsNullOrEmpty(name)) {
                 continue;
             }
 
-            observedPlayers.Add(new UploadablePlayer {
+            players.Add(new UploadablePlayer {
                 ContentId = contentId,
                 Name = name,
                 HomeWorld = homeWorld,
@@ -82,95 +90,100 @@ internal class PlayerCollector : IDisposable {
             });
         }
 
-        if (observedPlayers.Count > 0) {
-            this.Database.UpsertObservedPlayers(observedPlayers);
-        }
-
-        if (this.Database.PendingCount > 0) {
-            this._isUploading = true;
-            UploadFromDatabaseAsync();
-        }
+        return players;
     }
 
-    private void UploadFromDatabaseAsync() {
-        Task.Run(async () => {
+    private Task UploadPendingBatchAsync() {
+        return Task.Run(async () => {
             try {
-                var batch = this.Database.TakePendingBatch();
+                var batch = _database.TakePendingBatch();
                 if (batch.Count == 0) {
                     return;
                 }
 
-                var json = JsonConvert.SerializeObject(batch);
-                var success = false;
+                var jsonPayload = JsonConvert.SerializeObject(batch);
+                var anySuccess = false;
 
-                foreach (var uploadUrl in this.Plugin.Configuration.UploadUrls.Where(u => u.IsEnabled)) {
-                    if (uploadUrl.FailureCount >= this.Plugin.Configuration.CircuitBreakerFailureThreshold) {
-                        if ((DateTime.UtcNow - uploadUrl.LastFailureTime).TotalMinutes < this.Plugin.Configuration.CircuitBreakerBreakDurationMinutes) {
-                            continue;
-                        }
+                foreach (var uploadTarget in _plugin.Configuration.UploadUrls.Where(static candidate => candidate.IsEnabled)) {
+                    if (IsCircuitOpen(uploadTarget)) {
+                        continue;
                     }
 
-                    var baseUrl = uploadUrl.Url.TrimEnd('/');
-                    if (baseUrl.EndsWith("/contribute/multiple", StringComparison.OrdinalIgnoreCase)) {
-                        baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute/multiple".Length);
-                    } else if (baseUrl.EndsWith("/contribute", StringComparison.OrdinalIgnoreCase)) {
-                        baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute".Length);
-                    }
-
-                    var playersUrl = baseUrl + "/contribute/players";
-
+                    var endpointUrl = BuildPlayersEndpoint(uploadTarget.Url);
                     try {
                         using var request = IngestRequestFactory.CreatePostJsonRequest(
-                            this.Plugin.Configuration,
-                            playersUrl,
+                            _plugin.Configuration,
+                            endpointUrl,
                             "/contribute/players",
-                            json
+                            jsonPayload
                         );
-                        var resp = await this.Client.SendAsync(request);
+                        var response = await _httpClient.SendAsync(request);
 
-                        if (resp.IsSuccessStatusCode) {
-                            success = true;
-                            uploadUrl.FailureCount = 0;
+                        if (response.IsSuccessStatusCode) {
+                            anySuccess = true;
+                            uploadTarget.FailureCount = 0;
                         } else {
-                            uploadUrl.FailureCount++;
-                            uploadUrl.LastFailureTime = DateTime.UtcNow;
-                            if ((int)resp.StatusCode == 429) {
-                                var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(resp);
+                            uploadTarget.FailureCount++;
+                            uploadTarget.LastFailureTime = DateTime.UtcNow;
+                            if ((int)response.StatusCode == 429) {
+                                var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);
                                 if (retryAfter.HasValue) {
-                                    Plugin.Log.Warning($"PlayerCollector: server rate limited {playersUrl}, retry_after={retryAfter.Value}s");
+                                    Plugin.Log.Warning($"PlayerCollector: server rate limited {endpointUrl}, retry_after={retryAfter.Value}s");
                                 }
                             }
                         }
 
-                        Plugin.Log.Debug($"PlayerCollector: {playersUrl}: {resp.StatusCode} ({batch.Count} players)");
-                    } catch (Exception ex) {
-                        uploadUrl.FailureCount++;
-                        uploadUrl.LastFailureTime = DateTime.UtcNow;
-                        Plugin.Log.Error($"PlayerCollector upload error to {playersUrl}: {ex.Message}");
+                        Plugin.Log.Debug($"PlayerCollector: {endpointUrl}: {response.StatusCode} ({batch.Count} players)");
+                    } catch (Exception exception) {
+                        uploadTarget.FailureCount++;
+                        uploadTarget.LastFailureTime = DateTime.UtcNow;
+                        Plugin.Log.Error($"PlayerCollector upload error to {endpointUrl}: {exception.Message}");
                     }
                 }
 
-                if (success) {
-                    this.Database.MarkBatchUploaded(batch);
+                if (anySuccess) {
+                    _database.MarkBatchUploaded(batch);
                 } else {
-                    Plugin.Log.Warning($"PlayerCollector: Upload failed, {batch.Count} players remain pending. Total pending: {this.Database.PendingCount}");
+                    Plugin.Log.Warning($"PlayerCollector: Upload failed, {batch.Count} players remain pending. Total pending: {_database.PendingCount}");
                 }
-            } catch (Exception e) {
-                Plugin.Log.Error($"PlayerCollector upload error: {e.Message}");
+            } catch (Exception exception) {
+                Plugin.Log.Error($"PlayerCollector upload error: {exception.Message}");
             } finally {
-                this._isUploading = false;
+                _uploadInProgress = false;
             }
         });
+    }
+
+    private bool IsCircuitOpen(UploadUrl uploadTarget) {
+        if (uploadTarget.FailureCount < _plugin.Configuration.CircuitBreakerFailureThreshold) {
+            return false;
+        }
+
+        var elapsedSinceFailure = DateTime.UtcNow - uploadTarget.LastFailureTime;
+        return elapsedSinceFailure.TotalMinutes < _plugin.Configuration.CircuitBreakerBreakDurationMinutes;
+    }
+
+    private static string BuildPlayersEndpoint(string configuredUrl) {
+        var baseUrl = configuredUrl.TrimEnd('/');
+        if (baseUrl.EndsWith("/contribute/multiple", StringComparison.OrdinalIgnoreCase)) {
+            baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute/multiple".Length);
+        } else if (baseUrl.EndsWith("/contribute", StringComparison.OrdinalIgnoreCase)) {
+            baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute".Length);
+        }
+
+        return baseUrl + "/contribute/players";
     }
 }
 
 [Serializable]
 [JsonObject(NamingStrategyType = typeof(SnakeCaseNamingStrategy))]
-internal class UploadablePlayer {
+internal sealed class UploadablePlayer {
     public ulong ContentId { get; set; }
     public string Name { get; set; } = string.Empty;
     public ushort HomeWorld { get; set; }
+
     [JsonProperty(DefaultValueHandling = DefaultValueHandling.Include)]
     public ushort CurrentWorld { get; set; }
+
     public ulong AccountId { get; set; }
 }

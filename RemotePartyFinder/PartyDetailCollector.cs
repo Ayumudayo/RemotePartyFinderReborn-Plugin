@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Net.Http;
 using System.Threading;
@@ -12,290 +13,307 @@ using Newtonsoft.Json.Serialization;
 
 namespace RemotePartyFinder;
 
-/// <summary>
-/// AgentLookingForGroup.Detailed에서 PF 디테일 정보를 수집합니다.
-/// </summary>
-internal class PartyDetailCollector : IDisposable {
-    private Plugin Plugin { get; }
-    private HttpClient Client { get; } = new();
-    private System.Diagnostics.Stopwatch ScanTimer { get; } = new();
-    private System.Diagnostics.Stopwatch UploadTimer { get; } = new();
-    private ConcurrentDictionary<uint, QueuedDetailPayload> PendingDetails { get; } = new();
-
-    private uint lastQueuedListingId = 0;
-    private ulong lastQueuedFingerprint = 0;
-    private DateTime lastQueuedAtUtc = DateTime.MinValue;
-
-    private volatile uint lastSuccessfulUploadListingId = 0;
-    private long lastSuccessfulUploadAtUtcTicks = 0;
-    private long lastSuccessfulUploadAckVersion = 0;
-
-    private volatile uint lastTerminalUploadListingId = 0;
-    private long lastTerminalUploadAtUtcTicks = 0;
-    private long lastTerminalUploadAckVersion = 0;
-
-    private volatile bool isUploadWorkerBusy;
-
-    private static readonly TimeSpan RetrySameFingerprintInterval = TimeSpan.FromSeconds(2);
+internal sealed class PartyDetailCollector : IDisposable {
+    private static readonly TimeSpan ScanInterval = TimeSpan.FromMilliseconds(200);
+    private static readonly TimeSpan RequeueSameFingerprintDelay = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan UploadPumpInterval = TimeSpan.FromMilliseconds(150);
-    private const int MaxQueueRetryCount = 12;
+    private const int MaxRetryCount = 12;
 
-    internal uint LastUploadedListingId => this.lastQueuedListingId;
-    internal uint LastSuccessfulUploadListingId => this.lastSuccessfulUploadListingId;
-    internal DateTime LastSuccessfulUploadAtUtc => new(Interlocked.Read(ref this.lastSuccessfulUploadAtUtcTicks), DateTimeKind.Utc);
-    internal long LastSuccessfulUploadAckVersion => Interlocked.Read(ref this.lastSuccessfulUploadAckVersion);
-    internal uint LastTerminalUploadListingId => this.lastTerminalUploadListingId;
-    internal DateTime LastTerminalUploadAtUtc => new(Interlocked.Read(ref this.lastTerminalUploadAtUtcTicks), DateTimeKind.Utc);
-    internal long LastTerminalUploadAckVersion => Interlocked.Read(ref this.lastTerminalUploadAckVersion);
-    internal int PendingQueueCount => this.PendingDetails.Count;
+    private readonly Plugin _plugin;
+    private readonly HttpClient _httpClient = new();
+    private readonly Stopwatch _scanTimer = new();
+    private readonly Stopwatch _uploadPumpTimer = new();
+    private readonly ConcurrentDictionary<uint, PendingDetailEntry> _pendingDetails = new();
+
+    private uint _lastQueuedListingId;
+    private ulong _lastQueuedFingerprint;
+    private DateTime _lastQueuedAtUtc = DateTime.MinValue;
+
+    private volatile uint _lastSuccessfulUploadListingId;
+    private long _lastSuccessfulUploadAtUtcTicks;
+    private long _lastSuccessfulUploadAckVersion;
+
+    private volatile uint _lastTerminalUploadListingId;
+    private long _lastTerminalUploadAtUtcTicks;
+    private long _lastTerminalUploadAckVersion;
+
+    private volatile bool _uploadWorkerBusy;
+
+    internal uint LastUploadedListingId => _lastQueuedListingId;
+    internal uint LastSuccessfulUploadListingId => _lastSuccessfulUploadListingId;
+    internal DateTime LastSuccessfulUploadAtUtc => new(Interlocked.Read(ref _lastSuccessfulUploadAtUtcTicks), DateTimeKind.Utc);
+    internal long LastSuccessfulUploadAckVersion => Interlocked.Read(ref _lastSuccessfulUploadAckVersion);
+    internal uint LastTerminalUploadListingId => _lastTerminalUploadListingId;
+    internal DateTime LastTerminalUploadAtUtc => new(Interlocked.Read(ref _lastTerminalUploadAtUtcTicks), DateTimeKind.Utc);
+    internal long LastTerminalUploadAckVersion => Interlocked.Read(ref _lastTerminalUploadAckVersion);
+    internal int PendingQueueCount => _pendingDetails.Count;
 
     internal PartyDetailCollector(Plugin plugin) {
-        this.Plugin = plugin;
-        this.ScanTimer.Start();
-        this.UploadTimer.Start();
-        this.Plugin.Framework.Update += this.OnUpdate;
+        _plugin = plugin;
+        _scanTimer.Start();
+        _uploadPumpTimer.Start();
+        _plugin.Framework.Update += OnUpdate;
     }
 
     public void Dispose() {
-        this.Plugin.Framework.Update -= this.OnUpdate;
+        _plugin.Framework.Update -= OnUpdate;
     }
 
     private unsafe void OnUpdate(IFramework framework) {
-        // 성능 최적화: 200ms마다 체크
-        if (this.ScanTimer.ElapsedMilliseconds < 200) return;
-        this.ScanTimer.Restart();
+        if (_scanTimer.Elapsed < ScanInterval) {
+            return;
+        }
 
-        this.PumpUploadQueue();
+        _scanTimer.Restart();
+        PumpUploadQueue();
 
-        // UI 창(Addon)이 열려있는지 확인
-        nint addonPtr = this.Plugin.GameGui.GetAddonByName("LookingForGroupDetail", 1);
+        var addonPtr = _plugin.GameGui.GetAddonByName("LookingForGroupDetail", 1);
         if (addonPtr == 0) {
-            this.lastQueuedListingId = 0;
-            this.lastQueuedFingerprint = 0;
+            _lastQueuedListingId = 0;
+            _lastQueuedFingerprint = 0;
             return;
         }
 
-        var agent = AgentLookingForGroup.Instance();
-        if (agent == null) return;
-
-        ref var detailed = ref agent->LastViewedListing;
-        if (detailed.ListingId == 0) return;
-
-        var leaderContentId = detailed.LeaderContentId;
-        var homeWorld = detailed.HomeWorld;
-        var leaderName = agent->LastLeader.ToString();
-
-        // 유효성 검사
-        if (leaderContentId == 0 || homeWorld == 0 || homeWorld >= 1000) return;
-
-        var effectiveParties = Math.Max(1, (int)detailed.NumberOfParties);
-        var declaredSlots = Math.Max((int)detailed.TotalSlots, effectiveParties * 8);
-        var totalSlots = Math.Clamp(declaredSlots, 0, 48);
-        if (totalSlots <= 0) return;
-
-        var memberContentIds = new List<ulong>(totalSlots);
-        var memberJobs = new List<byte>(totalSlots);
-
-        for (var i = 0; i < totalSlots; i++) {
-            memberContentIds.Add(detailed.MemberContentIds[i]);
-            memberJobs.Add(detailed.Jobs[i]);
-        }
-
-        var nonZeroMembers = memberContentIds.Count(contentId => contentId != 0);
-        if (nonZeroMembers == 0) {
+        var lookingForGroupAgent = AgentLookingForGroup.Instance();
+        if (lookingForGroupAgent == null) {
             return;
         }
 
-        var fingerprint = ComputeMemberFingerprint(memberContentIds, memberJobs);
-        if (detailed.ListingId == this.lastQueuedListingId
-            && fingerprint == this.lastQueuedFingerprint
-            && DateTime.UtcNow - this.lastQueuedAtUtc < RetrySameFingerprintInterval) {
+        ref var viewedListing = ref lookingForGroupAgent->LastViewedListing;
+        if (viewedListing.ListingId == 0) {
             return;
         }
 
-        var uploadData = new UploadablePartyDetail {
-            ListingId = detailed.ListingId,
+        var leaderContentId = viewedListing.LeaderContentId;
+        var homeWorld = viewedListing.HomeWorld;
+        if (leaderContentId == 0 || homeWorld == 0 || homeWorld >= 1000) {
+            return;
+        }
+
+        var effectiveParties = Math.Max(1, (int)viewedListing.NumberOfParties);
+        var declaredSlots = Math.Max((int)viewedListing.TotalSlots, effectiveParties * 8);
+        var slotCount = Math.Clamp(declaredSlots, 0, 48);
+        if (slotCount <= 0) {
+            return;
+        }
+
+        var memberContentIds = new List<ulong>(slotCount);
+        var memberJobs = new List<byte>(slotCount);
+        var nonZeroMemberCount = 0;
+
+        for (var slotIndex = 0; slotIndex < slotCount; slotIndex++) {
+            var memberContentId = viewedListing.MemberContentIds[slotIndex];
+            memberContentIds.Add(memberContentId);
+            memberJobs.Add(viewedListing.Jobs[slotIndex]);
+            if (memberContentId != 0) {
+                nonZeroMemberCount++;
+            }
+        }
+
+        if (nonZeroMemberCount == 0) {
+            return;
+        }
+
+        var payload = new UploadablePartyDetail {
+            ListingId = viewedListing.ListingId,
             LeaderContentId = leaderContentId,
-            LeaderName = leaderName,
+            LeaderName = lookingForGroupAgent->LastLeader.ToString(),
             HomeWorld = homeWorld,
             MemberContentIds = memberContentIds,
             MemberJobs = memberJobs,
         };
 
-        Plugin.Log.Debug(
-            $"PartyDetailCollector: Uploading detail listing={uploadData.ListingId} leader={uploadData.LeaderContentId} world={uploadData.HomeWorld} members={uploadData.MemberContentIds.Count} non_zero_members={nonZeroMembers} parties={effectiveParties} fingerprint={fingerprint}");
+        var fingerprint = ComputeFingerprint(memberContentIds, memberJobs);
 
-        this.EnqueueDetail(uploadData, fingerprint);
-        this.lastQueuedListingId = detailed.ListingId;
-        this.lastQueuedFingerprint = fingerprint;
-        this.lastQueuedAtUtc = DateTime.UtcNow;
+        var now = DateTime.UtcNow;
+        if (payload.ListingId == _lastQueuedListingId
+            && fingerprint == _lastQueuedFingerprint
+            && now - _lastQueuedAtUtc < RequeueSameFingerprintDelay) {
+            return;
+        }
+
+        Plugin.Log.Debug(
+            $"PartyDetailCollector: Uploading detail listing={payload.ListingId} leader={payload.LeaderContentId} world={payload.HomeWorld} members={payload.MemberContentIds.Count} non_zero_members={nonZeroMemberCount} parties={effectiveParties} fingerprint={fingerprint}");
+
+        Enqueue(payload, fingerprint, now);
+        _lastQueuedListingId = payload.ListingId;
+        _lastQueuedFingerprint = fingerprint;
+        _lastQueuedAtUtc = now;
     }
 
-    private void EnqueueDetail(UploadablePartyDetail detail, ulong fingerprint) {
-        var queuedAt = DateTime.UtcNow;
-        var payload = new QueuedDetailPayload(
-            detail,
+    private void Enqueue(UploadablePartyDetail payload, ulong fingerprint, DateTime nowUtc) {
+        var queued = new PendingDetailEntry(
+            payload,
             fingerprint,
-            queuedAt,
+            nowUtc,
             0,
-            queuedAt
+            nowUtc
         );
 
-        this.PendingDetails.AddOrUpdate(
-            detail.ListingId,
-            _ => payload,
-            (_, existing) => existing.Fingerprint == fingerprint ? existing : payload
+        _pendingDetails.AddOrUpdate(
+            payload.ListingId,
+            _ => queued,
+            (_, existing) => existing.Fingerprint == fingerprint ? existing : queued
         );
     }
 
     private void PumpUploadQueue() {
-        if (this.isUploadWorkerBusy) {
+        if (_uploadWorkerBusy) {
             return;
         }
 
-        if (this.UploadTimer.Elapsed < UploadPumpInterval) {
+        if (_uploadPumpTimer.Elapsed < UploadPumpInterval) {
             return;
         }
 
         var now = DateTime.UtcNow;
-        var nextPayload = this.PendingDetails.Values
-            .Where(payload => payload.NextAttemptAtUtc <= now)
-            .OrderBy(payload => payload.NextAttemptAtUtc)
-            .ThenBy(payload => payload.QueuedAtUtc)
+        var next = _pendingDetails.Values
+            .Where(candidate => candidate.NextAttemptAtUtc <= now)
+            .OrderBy(candidate => candidate.NextAttemptAtUtc)
+            .ThenBy(candidate => candidate.QueuedAtUtc)
             .FirstOrDefault();
 
-        if (nextPayload == null) {
+        if (next == null) {
             return;
         }
 
-        this.isUploadWorkerBusy = true;
-        this.UploadTimer.Restart();
-        this.UploadDetailAsync(nextPayload);
+        _uploadWorkerBusy = true;
+        _uploadPumpTimer.Restart();
+        _ = ProcessQueuedUploadAsync(next);
     }
 
-    private void UploadDetailAsync(QueuedDetailPayload payload) {
-        Task.Run(async () => {
+    private Task ProcessQueuedUploadAsync(PendingDetailEntry pending) {
+        return Task.Run(async () => {
             try {
-                var outcome = await this.TryUploadDetailAsync(payload.Detail);
-                switch (outcome) {
-                    case DetailUploadOutcome.Applied:
-                        this.RemoveQueuedPayloadIfUnchanged(payload);
-                        Interlocked.Exchange(ref this.lastSuccessfulUploadAtUtcTicks, DateTime.UtcNow.Ticks);
-                        this.lastSuccessfulUploadListingId = payload.Detail.ListingId;
-                        Interlocked.Increment(ref this.lastSuccessfulUploadAckVersion);
+                var uploadResult = await TryUploadToAllTargetsAsync(pending.Detail);
+                switch (uploadResult) {
+                    case DetailUploadResult.Applied:
+                        RemoveIfUnchanged(pending);
+                        var successAt = DateTime.UtcNow;
+                        Interlocked.Exchange(ref _lastSuccessfulUploadAtUtcTicks, successAt.Ticks);
+                        _lastSuccessfulUploadListingId = pending.Detail.ListingId;
+                        Interlocked.Increment(ref _lastSuccessfulUploadAckVersion);
                         break;
 
-                    case DetailUploadOutcome.ListingMissing:
-                        this.RemoveQueuedPayloadIfUnchanged(payload);
-                        Interlocked.Exchange(ref this.lastTerminalUploadAtUtcTicks, DateTime.UtcNow.Ticks);
-                        this.lastTerminalUploadListingId = payload.Detail.ListingId;
-                        Interlocked.Increment(ref this.lastTerminalUploadAckVersion);
-                        Plugin.Log.Debug($"PartyDetailCollector: listing {payload.Detail.ListingId} missing on server while applying detail update; dropping queued detail payload.");
+                    case DetailUploadResult.ListingMissing:
+                        RemoveIfUnchanged(pending);
+                        var missingAt = DateTime.UtcNow;
+                        Interlocked.Exchange(ref _lastTerminalUploadAtUtcTicks, missingAt.Ticks);
+                        _lastTerminalUploadListingId = pending.Detail.ListingId;
+                        Interlocked.Increment(ref _lastTerminalUploadAckVersion);
+                        Plugin.Log.Debug($"PartyDetailCollector: listing {pending.Detail.ListingId} missing on server while applying detail update; dropping queued detail payload.");
                         break;
 
                     default:
-                        this.ScheduleRetry(payload);
+                        ScheduleRetry(pending);
                         break;
                 }
-            } catch (Exception e) {
-                Plugin.Log.Error($"PartyDetailCollector upload error: {e.Message}");
-                this.ScheduleRetry(payload);
+            } catch (Exception exception) {
+                Plugin.Log.Error($"PartyDetailCollector upload error: {exception.Message}");
+                ScheduleRetry(pending);
             } finally {
-                this.isUploadWorkerBusy = false;
+                _uploadWorkerBusy = false;
             }
         });
     }
 
-    private async Task<DetailUploadOutcome> TryUploadDetailAsync(UploadablePartyDetail detail) {
-        var json = JsonConvert.SerializeObject(detail);
+    private async Task<DetailUploadResult> TryUploadToAllTargetsAsync(UploadablePartyDetail payload) {
+        var jsonPayload = JsonConvert.SerializeObject(payload);
         var anyApplied = false;
         var anyMissing = false;
 
-        foreach (var uploadUrl in this.Plugin.Configuration.UploadUrls.Where(u => u.IsEnabled)) {
-            // Circuit Breaker
-            if (uploadUrl.FailureCount >= this.Plugin.Configuration.CircuitBreakerFailureThreshold) {
-                if ((DateTime.UtcNow - uploadUrl.LastFailureTime).TotalMinutes < this.Plugin.Configuration.CircuitBreakerBreakDurationMinutes) {
-                    continue;
-                }
+        foreach (var uploadTarget in _plugin.Configuration.UploadUrls.Where(static candidate => candidate.IsEnabled)) {
+            if (IsCircuitOpen(uploadTarget)) {
+                continue;
             }
 
-            var baseUrl = uploadUrl.Url.TrimEnd('/');
-
-            if (baseUrl.EndsWith("/contribute/multiple")) {
-                baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute/multiple".Length);
-            } else if (baseUrl.EndsWith("/contribute")) {
-                baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute".Length);
-            }
-
-            var detailUrl = baseUrl + "/contribute/detail";
-
+            var endpointUrl = BuildDetailEndpoint(uploadTarget.Url);
             try {
                 using var request = IngestRequestFactory.CreatePostJsonRequest(
-                    this.Plugin.Configuration,
-                    detailUrl,
+                    _plugin.Configuration,
+                    endpointUrl,
                     "/contribute/detail",
-                    json
+                    jsonPayload
                 );
-                var resp = await this.Client.SendAsync(request);
-                var output = await resp.Content.ReadAsStringAsync();
+                var response = await _httpClient.SendAsync(request);
+                var body = await response.Content.ReadAsStringAsync();
 
-                if (resp.IsSuccessStatusCode) {
-                    uploadUrl.FailureCount = 0;
+                if (response.IsSuccessStatusCode) {
+                    uploadTarget.FailureCount = 0;
 
-                    if (TryParseDetailResponse(output, out var matchedCount, out var modifiedCount)) {
+                    if (TryParseDetailResponse(body, out var matchedCount, out var modifiedCount)) {
                         if (matchedCount == 0) {
                             anyMissing = true;
                         } else {
                             anyApplied = true;
                         }
 
-                        Plugin.Log.Debug($"PartyDetailCollector: {detailUrl}: {resp.StatusCode} matched={matchedCount} modified={modifiedCount}");
+                        Plugin.Log.Debug($"PartyDetailCollector: {endpointUrl}: {response.StatusCode} matched={matchedCount} modified={modifiedCount}");
                     } else {
-                        // Legacy server fallback ("ok" plain response)
                         anyApplied = true;
-                        Plugin.Log.Debug($"PartyDetailCollector: {detailUrl}: {resp.StatusCode} {output}");
+                        Plugin.Log.Debug($"PartyDetailCollector: {endpointUrl}: {response.StatusCode} {body}");
                     }
                 } else {
-                    uploadUrl.FailureCount++;
-                    uploadUrl.LastFailureTime = DateTime.UtcNow;
-                    if ((int)resp.StatusCode == 429) {
-                        var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(resp);
+                    uploadTarget.FailureCount++;
+                    uploadTarget.LastFailureTime = DateTime.UtcNow;
+                    if ((int)response.StatusCode == 429) {
+                        var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);
                         if (retryAfter.HasValue) {
-                            Plugin.Log.Warning($"PartyDetailCollector: rate limited by {detailUrl}, retry_after={retryAfter.Value}s");
+                            Plugin.Log.Warning($"PartyDetailCollector: rate limited by {endpointUrl}, retry_after={retryAfter.Value}s");
                         }
                     }
 
-                    Plugin.Log.Debug($"PartyDetailCollector: {detailUrl}: {resp.StatusCode} {output}");
+                    Plugin.Log.Debug($"PartyDetailCollector: {endpointUrl}: {response.StatusCode} {body}");
                 }
-            } catch (Exception ex) {
-                uploadUrl.FailureCount++;
-                uploadUrl.LastFailureTime = DateTime.UtcNow;
-                Plugin.Log.Error($"PartyDetailCollector upload error to {detailUrl}: {ex.Message}");
+            } catch (Exception exception) {
+                uploadTarget.FailureCount++;
+                uploadTarget.LastFailureTime = DateTime.UtcNow;
+                Plugin.Log.Error($"PartyDetailCollector upload error to {endpointUrl}: {exception.Message}");
             }
         }
 
         if (anyApplied) {
-            return DetailUploadOutcome.Applied;
+            return DetailUploadResult.Applied;
         }
 
         if (anyMissing) {
-            return DetailUploadOutcome.ListingMissing;
+            return DetailUploadResult.ListingMissing;
         }
 
-        return DetailUploadOutcome.RetryableFailure;
+        return DetailUploadResult.RetryableFailure;
     }
 
-    private static bool TryParseDetailResponse(string responseBody, out long matchedCount, out long modifiedCount) {
+    private bool IsCircuitOpen(UploadUrl uploadTarget) {
+        if (uploadTarget.FailureCount < _plugin.Configuration.CircuitBreakerFailureThreshold) {
+            return false;
+        }
+
+        var elapsedSinceLastFailure = DateTime.UtcNow - uploadTarget.LastFailureTime;
+        return elapsedSinceLastFailure.TotalMinutes < _plugin.Configuration.CircuitBreakerBreakDurationMinutes;
+    }
+
+    private static string BuildDetailEndpoint(string configuredUrl) {
+        var baseUrl = configuredUrl.TrimEnd('/');
+        if (baseUrl.EndsWith("/contribute/multiple")) {
+            baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute/multiple".Length);
+        } else if (baseUrl.EndsWith("/contribute")) {
+            baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute".Length);
+        }
+
+        return baseUrl + "/contribute/detail";
+    }
+
+    private static bool TryParseDetailResponse(string rawBody, out long matchedCount, out long modifiedCount) {
         matchedCount = 0;
         modifiedCount = 0;
 
-        var trimmed = responseBody.Trim();
-        if (!trimmed.StartsWith('{')) {
+        var body = rawBody.Trim();
+        if (!body.StartsWith('{')) {
             return false;
         }
 
         try {
-            var parsed = JsonConvert.DeserializeObject<ContributeDetailResponse>(trimmed);
+            var parsed = JsonConvert.DeserializeObject<ContributeDetailResponse>(body);
             if (parsed == null) {
                 return false;
             }
@@ -308,68 +326,65 @@ internal class PartyDetailCollector : IDisposable {
         }
     }
 
-    private void RemoveQueuedPayloadIfUnchanged(QueuedDetailPayload payload) {
-        if (!this.PendingDetails.TryGetValue(payload.Detail.ListingId, out var existing)) {
+    private void RemoveIfUnchanged(PendingDetailEntry pending) {
+        if (!_pendingDetails.TryGetValue(pending.Detail.ListingId, out var current)) {
             return;
         }
 
-        if (existing.Fingerprint != payload.Fingerprint) {
+        if (current.Fingerprint != pending.Fingerprint) {
             return;
         }
 
-        this.PendingDetails.TryRemove(payload.Detail.ListingId, out _);
+        _pendingDetails.TryRemove(pending.Detail.ListingId, out _);
     }
 
-    private void ScheduleRetry(QueuedDetailPayload payload) {
-        if (!this.PendingDetails.TryGetValue(payload.Detail.ListingId, out var existing)) {
+    private void ScheduleRetry(PendingDetailEntry pending) {
+        if (!_pendingDetails.TryGetValue(pending.Detail.ListingId, out var current)) {
             return;
         }
 
-        if (existing.Fingerprint != payload.Fingerprint) {
+        if (current.Fingerprint != pending.Fingerprint) {
             return;
         }
 
-        if (existing.AttemptCount >= MaxQueueRetryCount) {
-            this.PendingDetails.TryRemove(payload.Detail.ListingId, out _);
-            Plugin.Log.Warning($"PartyDetailCollector: dropping detail payload listing={payload.Detail.ListingId} after {existing.AttemptCount} retries");
+        if (current.AttemptCount >= MaxRetryCount) {
+            _pendingDetails.TryRemove(pending.Detail.ListingId, out _);
+            Plugin.Log.Warning($"PartyDetailCollector: dropping detail payload listing={pending.Detail.ListingId} after {current.AttemptCount} retries");
             return;
         }
 
-        var updatedAttemptCount = existing.AttemptCount + 1;
-        var backoffMs = ComputeRetryBackoffMs(updatedAttemptCount);
-        var nextAttemptUtc = DateTime.UtcNow.AddMilliseconds(backoffMs);
-
-        var updatedPayload = existing with {
-            AttemptCount = updatedAttemptCount,
-            NextAttemptAtUtc = nextAttemptUtc,
+        var nextAttemptCount = current.AttemptCount + 1;
+        var retryDelayMs = ComputeRetryDelayMs(nextAttemptCount);
+        var updated = current with {
+            AttemptCount = nextAttemptCount,
+            NextAttemptAtUtc = DateTime.UtcNow.AddMilliseconds(retryDelayMs),
         };
 
-        this.PendingDetails.TryUpdate(payload.Detail.ListingId, updatedPayload, existing);
+        _pendingDetails.TryUpdate(pending.Detail.ListingId, updated, current);
     }
 
-    private static int ComputeRetryBackoffMs(int attemptCount) {
+    private static int ComputeRetryDelayMs(int attemptCount) {
         var exponent = Math.Min(attemptCount, 5);
         var baseDelay = 1000 * (1 << exponent);
-        var cappedDelay = Math.Min(baseDelay, 15000);
-        var jitter = Random.Shared.Next(50, 250);
-        return cappedDelay + jitter;
+        var boundedDelay = Math.Min(baseDelay, 15000);
+        var jitterMs = Random.Shared.Next(50, 250);
+        return boundedDelay + jitterMs;
     }
 
-    private static ulong ComputeMemberFingerprint(List<ulong> memberContentIds, List<byte> memberJobs) {
+    private static ulong ComputeFingerprint(List<ulong> memberContentIds, List<byte> memberJobs) {
         unchecked {
             var hash = 1469598103934665603UL;
-            hash = Fnv1aMix(hash, (ulong)memberContentIds.Count);
-
+            hash = MixFnv(hash, (ulong)memberContentIds.Count);
             for (var i = 0; i < memberContentIds.Count; i++) {
-                hash = Fnv1aMix(hash, memberContentIds[i]);
-                hash = Fnv1aMix(hash, memberJobs[i]);
+                hash = MixFnv(hash, memberContentIds[i]);
+                hash = MixFnv(hash, memberJobs[i]);
             }
 
             return hash;
         }
     }
 
-    private static ulong Fnv1aMix(ulong hash, ulong value) {
+    private static ulong MixFnv(ulong hash, ulong value) {
         unchecked {
             hash ^= value;
             hash *= 1099511628211UL;
@@ -377,7 +392,7 @@ internal class PartyDetailCollector : IDisposable {
         }
     }
 
-    private sealed record QueuedDetailPayload(
+    private sealed record PendingDetailEntry(
         UploadablePartyDetail Detail,
         ulong Fingerprint,
         DateTime QueuedAtUtc,
@@ -393,7 +408,7 @@ internal class PartyDetailCollector : IDisposable {
         public long ModifiedCount { get; init; }
     }
 
-    private enum DetailUploadOutcome {
+    private enum DetailUploadResult {
         Applied,
         ListingMissing,
         RetryableFailure,
@@ -402,7 +417,7 @@ internal class PartyDetailCollector : IDisposable {
 
 [Serializable]
 [JsonObject(NamingStrategyType = typeof(SnakeCaseNamingStrategy))]
-internal class UploadablePartyDetail {
+internal sealed class UploadablePartyDetail {
     public uint ListingId { get; set; }
     public ulong LeaderContentId { get; set; }
     public string LeaderName { get; set; } = string.Empty;

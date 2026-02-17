@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using Dalamud.Game.Gui.PartyFinder.Types;
@@ -9,9 +9,9 @@ namespace RemotePartyFinder;
 
 [Serializable]
 [JsonObject(NamingStrategyType = typeof(SnakeCaseNamingStrategy))]
-internal class UploadableListing {
+internal sealed class UploadableListing {
     public uint Id { get; }
-    public uint ContentIdLower { get; } // to retain backwards compatibility with old listings (stats), we stick to the lower bits
+    public uint ContentIdLower { get; }
     public byte[] Name { get; }
     public byte[] Description { get; }
     public ushort CreatedWorld { get; }
@@ -34,39 +34,44 @@ internal class UploadableListing {
     public List<UploadableSlot> Slots { get; }
     public List<byte> JobsPresent { get; }
 
-    internal UploadableListing(IPartyFinderListing listing) {
-        this.Id = listing.Id;
-        this.ContentIdLower = (uint)listing.ContentId;
-        this.Name = listing.Name.Encode();
-        this.Description = listing.Description.Encode();
-        this.CreatedWorld = (ushort)listing.World.Value.RowId;
-        this.HomeWorld = (ushort)listing.HomeWorld.Value.RowId;
-        this.CurrentWorld = (ushort)listing.CurrentWorld.Value.RowId;
-        this.Category = listing.Category;
-        this.Duty = listing.RawDuty;
-        this.DutyType = listing.DutyType;
-        this.BeginnersWelcome = listing.BeginnersWelcome;
-        this.SecondsRemaining = listing.SecondsRemaining;
-        this.MinItemLevel = listing.MinimumItemLevel;
-        this.NumParties = listing.Parties;
-        this.SlotsAvailable = listing.SlotsAvailable;
-        this.LastServerRestart = listing.LastPatchHotfixTimestamp;
-        this.Objective = listing.Objective;
-        this.Conditions = listing.Conditions;
-        this.DutyFinderSettings = listing.DutyFinderSettings;
-        this.LootRules = listing.LootRules;
-        this.SearchArea = listing.SearchArea;
-        this.Slots = listing.Slots.Select(slot => new UploadableSlot(slot)).ToList();
-        this.JobsPresent = listing.RawJobsPresent.ToList();
+    internal UploadableListing(IPartyFinderListing source) {
+        Id = source.Id;
+        ContentIdLower = (uint)source.ContentId;
+        Name = source.Name.Encode();
+        Description = source.Description.Encode();
+        CreatedWorld = (ushort)source.World.Value.RowId;
+        HomeWorld = (ushort)source.HomeWorld.Value.RowId;
+        CurrentWorld = (ushort)source.CurrentWorld.Value.RowId;
+        Category = source.Category;
+        Duty = source.RawDuty;
+        DutyType = source.DutyType;
+        BeginnersWelcome = source.BeginnersWelcome;
+        SecondsRemaining = source.SecondsRemaining;
+        MinItemLevel = source.MinimumItemLevel;
+        NumParties = source.Parties;
+        SlotsAvailable = source.SlotsAvailable;
+        LastServerRestart = source.LastPatchHotfixTimestamp;
+        Objective = source.Objective;
+        Conditions = source.Conditions;
+        DutyFinderSettings = source.DutyFinderSettings;
+        LootRules = source.LootRules;
+        SearchArea = source.SearchArea;
+        Slots = source.Slots.Select(static slot => new UploadableSlot(slot)).ToList();
+        JobsPresent = source.RawJobsPresent.ToList();
     }
 }
 
 [Serializable]
 [JsonObject(NamingStrategyType = typeof(SnakeCaseNamingStrategy))]
-internal class UploadableSlot {
-    public uint Accepting { get; } // TODO: JobFlags should : uint
+internal sealed class UploadableSlot {
+    public uint Accepting { get; }
 
-    internal UploadableSlot(PartyFinderSlot slot) {
-        this.Accepting = slot.Accepting.Aggregate((uint)0, (agg, flag) => agg | (uint)flag);
+    internal UploadableSlot(PartyFinderSlot source) {
+        var mask = 0u;
+        foreach (var acceptingFlag in source.Accepting) {
+            mask |= (uint)acceptingFlag;
+        }
+
+        Accepting = mask;
     }
 }

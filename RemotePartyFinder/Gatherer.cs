@@ -12,160 +12,206 @@ using Newtonsoft.Json;
 
 namespace RemotePartyFinder;
 
-internal class Gatherer : IDisposable {
-    private Plugin Plugin { get; }
+internal sealed class Gatherer : IDisposable {
+    private static readonly TimeSpan UploadInterval = TimeSpan.FromSeconds(3);
+    private static readonly TimeSpan UploadedListingIndexTtl = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan UploadedListingGrace = TimeSpan.FromMilliseconds(250);
 
-    private ConcurrentDictionary<int, ConcurrentQueue<IPartyFinderListing>> Batches { get; } = new();
-    private Stopwatch UploadTimer { get; } = new();
-    private HttpClient Client { get; } = new();
-    private ConcurrentDictionary<uint, DateTime> LastUploadedListingAtUtc { get; } = new();
-    private volatile bool _isUploading;
+    private readonly Plugin _plugin;
+    private readonly ConcurrentDictionary<int, ConcurrentQueue<IPartyFinderListing>> _batches = new();
+    private readonly ConcurrentDictionary<uint, DateTime> _lastUploadedListingAtUtc = new();
+    private readonly Stopwatch _uploadTimer = new();
+    private readonly HttpClient _httpClient = new();
+
+    private volatile bool _uploadInProgress;
     private long _lastSuccessfulUploadAtUtcTicks;
     private long _lastSuccessfulUploadAckVersion;
 
     internal long LastSuccessfulUploadAckVersion => Interlocked.Read(ref this._lastSuccessfulUploadAckVersion);
     internal DateTime LastSuccessfulUploadAtUtc => new(Interlocked.Read(ref this._lastSuccessfulUploadAtUtcTicks), DateTimeKind.Utc);
-    internal int UploadedListingIndexCount => this.LastUploadedListingAtUtc.Count;
+    internal int UploadedListingIndexCount => this._lastUploadedListingAtUtc.Count;
 
     internal Gatherer(Plugin plugin) {
-        this.Plugin = plugin;
+        _plugin = plugin;
 
-        this.UploadTimer.Start();
-
-        this.Plugin.PartyFinderGui.ReceiveListing += this.OnListing;
-        this.Plugin.Framework.Update += this.OnUpdate;
+        _uploadTimer.Start();
+        _plugin.PartyFinderGui.ReceiveListing += OnListing;
+        _plugin.Framework.Update += OnUpdate;
     }
 
     public void Dispose() {
-        this.Plugin.Framework.Update -= this.OnUpdate;
-        this.Plugin.PartyFinderGui.ReceiveListing -= this.OnListing;
+        _plugin.Framework.Update -= OnUpdate;
+        _plugin.PartyFinderGui.ReceiveListing -= OnListing;
     }
 
     internal bool WasListingUploadedAfter(uint listingId, DateTime observedAtUtc) {
-        if (!this.LastUploadedListingAtUtc.TryGetValue(listingId, out var uploadedAtUtc)) {
+        if (!_lastUploadedListingAtUtc.TryGetValue(listingId, out var uploadedAtUtc)) {
             return false;
         }
 
-        return uploadedAtUtc >= observedAtUtc.AddMilliseconds(-250);
+        return uploadedAtUtc >= observedAtUtc - UploadedListingGrace;
     }
 
     private void OnListing(IPartyFinderListing listing, IPartyFinderListingEventArgs args) {
-        var queue = this.Batches.GetOrAdd(args.BatchNumber, _ => new ConcurrentQueue<IPartyFinderListing>());
+        var queue = _batches.GetOrAdd(args.BatchNumber, static _ => new ConcurrentQueue<IPartyFinderListing>());
         queue.Enqueue(listing);
     }
 
-    private void OnUpdate(IFramework framework1) {
-        if (this.UploadTimer.Elapsed < TimeSpan.FromSeconds(3)) {
+    private void OnUpdate(IFramework framework) {
+        if (_uploadInProgress) {
             return;
         }
 
-        if (this._isUploading) {
+        if (_uploadTimer.Elapsed < UploadInterval) {
             return;
         }
 
-        this.UploadTimer.Restart();
-
-        this._isUploading = true;
-        this.UploadPendingBatchesAsync();
+        _uploadTimer.Restart();
+        _uploadInProgress = true;
+        _ = ProcessPendingBatchesAsync();
     }
 
-    private void UploadPendingBatchesAsync() {
-        Task.Run(async () => {
+    private Task ProcessPendingBatchesAsync() {
+        return Task.Run(async () => {
             try {
-                var uploadable = new List<UploadableListing>();
-
-                foreach (var (batch, _) in this.Batches.ToList()) {
-                    if (!this.Batches.TryRemove(batch, out var queue) || queue == null) {
-                        continue;
-                    }
-
-                    while (queue.TryDequeue(out var listing)) {
-                        uploadable.Add(new UploadableListing(listing));
-                    }
-                }
-
-                if (uploadable.Count == 0) {
+                var listingsToUpload = DrainBatches();
+                if (listingsToUpload.Count == 0) {
                     return;
                 }
 
-                var json = JsonConvert.SerializeObject(uploadable);
-                var uploadedListingIds = uploadable.Select(x => x.Id).Distinct().ToArray();
-                var anySuccess = false;
+                var payload = JsonConvert.SerializeObject(listingsToUpload);
+                var uploadedListingIds = listingsToUpload.Select(static listing => listing.Id).Distinct().ToArray();
+                var uploadSucceeded = await UploadBatchToEnabledEndpointsAsync(payload, listingsToUpload.Count);
 
-                foreach (var uploadUrl in Plugin.Configuration.UploadUrls.Where(uploadUrl => uploadUrl.IsEnabled))
-                {
-                    // Circuit Breaker: 설정된 횟수 이상 실패 시 설정된 시간(분)만큼 중단
-                    if (uploadUrl.FailureCount >= Plugin.Configuration.CircuitBreakerFailureThreshold) {
-                        if ((DateTime.UtcNow - uploadUrl.LastFailureTime).TotalMinutes < Plugin.Configuration.CircuitBreakerBreakDurationMinutes) {
-                            continue;
-                        }
-                        // 설정된 시간이 지났으면 재시도 허용 (Half-Open)
-                    }
-
-                    var baseUrl = uploadUrl.Url.TrimEnd('/');
-
-                    if (baseUrl.EndsWith("/contribute/multiple")) {
-                        baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute/multiple".Length);
-                    } else if (baseUrl.EndsWith("/contribute")) {
-                        baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute".Length);
-                    }
-
-                    var targetUrl = baseUrl + "/contribute/multiple";
-
-                    try {
-                        using var request = IngestRequestFactory.CreatePostJsonRequest(
-                            this.Plugin.Configuration,
-                            targetUrl,
-                            "/contribute/multiple",
-                            json
-                        );
-                        var resp = await this.Client.SendAsync(request);
-
-                        // 성공 여부 확인
-                        if (resp.IsSuccessStatusCode) {
-                            anySuccess = true;
-                            uploadUrl.FailureCount = 0;
-                        } else {
-                            uploadUrl.FailureCount++;
-                            uploadUrl.LastFailureTime = DateTime.UtcNow;
-                            if ((int)resp.StatusCode == 429) {
-                                var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(resp);
-                                if (retryAfter.HasValue) {
-                                    Plugin.Log.Warning($"Gatherer: rate limited by {targetUrl}, retry_after={retryAfter.Value}s");
-                                }
-                            }
-                        }
-
-                        Plugin.Log.Debug($"Gatherer: {targetUrl}: {resp.StatusCode} ({uploadable.Count} listings)");
-                    } catch (Exception ex) {
-                        uploadUrl.FailureCount++;
-                        uploadUrl.LastFailureTime = DateTime.UtcNow;
-                        Plugin.Log.Error($"Gatherer upload error to {targetUrl}: {ex.Message}");
-                    }
+                if (!uploadSucceeded) {
+                    return;
                 }
 
-                if (anySuccess) {
-                    var now = DateTime.UtcNow;
-                    foreach (var listingId in uploadedListingIds) {
-                        this.LastUploadedListingAtUtc[listingId] = now;
-                    }
-
-                    Interlocked.Exchange(ref this._lastSuccessfulUploadAtUtcTicks, now.Ticks);
-                    Interlocked.Increment(ref this._lastSuccessfulUploadAckVersion);
-                    PruneUploadIndex(now);
+                var now = DateTime.UtcNow;
+                foreach (var listingId in uploadedListingIds) {
+                    _lastUploadedListingAtUtc[listingId] = now;
                 }
+
+                Interlocked.Exchange(ref _lastSuccessfulUploadAtUtcTicks, now.Ticks);
+                Interlocked.Increment(ref _lastSuccessfulUploadAckVersion);
+                PruneUploadIndex(now);
             } finally {
-                this._isUploading = false;
+                _uploadInProgress = false;
             }
         });
     }
 
-    private void PruneUploadIndex(DateTime now) {
-        var cutoff = now.AddMinutes(-30);
-        foreach (var entry in this.LastUploadedListingAtUtc) {
-            if (entry.Value < cutoff) {
-                this.LastUploadedListingAtUtc.TryRemove(entry.Key, out _);
+    private List<UploadableListing> DrainBatches() {
+        var result = new List<UploadableListing>();
+
+        foreach (var (batchId, _) in _batches.ToList()) {
+            if (!_batches.TryRemove(batchId, out var queue) || queue == null) {
+                continue;
+            }
+
+            while (queue.TryDequeue(out var listing)) {
+                result.Add(new UploadableListing(listing));
             }
         }
+
+        return result;
     }
+
+    private async Task<bool> UploadBatchToEnabledEndpointsAsync(string jsonPayload, int listingCount) {
+        var anySuccess = false;
+
+        foreach (var uploadUrl in _plugin.Configuration.UploadUrls.Where(static candidate => candidate.IsEnabled)) {
+            if (IsCircuitOpen(uploadUrl)) {
+                continue;
+            }
+
+            var targetUrl = NormalizeTargetUrl(uploadUrl.Url);
+            var attempt = await TryUploadAsync(targetUrl, jsonPayload);
+
+            if (attempt.Success) {
+                anySuccess = true;
+                uploadUrl.FailureCount = 0;
+            } else {
+                uploadUrl.FailureCount++;
+                uploadUrl.LastFailureTime = DateTime.UtcNow;
+
+                if (!string.IsNullOrEmpty(attempt.ErrorMessage)) {
+                    Plugin.Log.Error($"Gatherer upload error to {targetUrl}: {attempt.ErrorMessage}");
+                }
+
+                if (attempt.RetryAfterSeconds.HasValue) {
+                    Plugin.Log.Warning($"Gatherer: rate limited by {targetUrl}, retry_after={attempt.RetryAfterSeconds.Value}s");
+                }
+            }
+
+            var statusForLog = attempt.StatusCode?.ToString() ?? "Exception";
+            Plugin.Log.Debug($"Gatherer: {targetUrl}: {statusForLog} ({listingCount} listings)");
+        }
+
+        return anySuccess;
+    }
+
+    private bool IsCircuitOpen(UploadUrl uploadUrl) {
+        if (uploadUrl.FailureCount < _plugin.Configuration.CircuitBreakerFailureThreshold) {
+            return false;
+        }
+
+        var elapsedSinceFailure = DateTime.UtcNow - uploadUrl.LastFailureTime;
+        return elapsedSinceFailure.TotalMinutes < _plugin.Configuration.CircuitBreakerBreakDurationMinutes;
+    }
+
+    private string NormalizeTargetUrl(string configuredUrl) {
+        var baseUrl = configuredUrl.TrimEnd('/');
+
+        if (baseUrl.EndsWith("/contribute/multiple")) {
+            baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute/multiple".Length);
+        } else if (baseUrl.EndsWith("/contribute")) {
+            baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute".Length);
+        }
+
+        return baseUrl + "/contribute/multiple";
+    }
+
+    private async Task<UploadAttemptResult> TryUploadAsync(string targetUrl, string jsonPayload) {
+        try {
+            using var request = IngestRequestFactory.CreatePostJsonRequest(
+                _plugin.Configuration,
+                targetUrl,
+                "/contribute/multiple",
+                jsonPayload
+            );
+            var response = await _httpClient.SendAsync(request);
+
+            var retryAfterSeconds = (int)response.StatusCode == 429
+                ? IngestRequestFactory.ReadRetryAfterSeconds(response)
+                : null;
+
+            return new UploadAttemptResult(
+                response.IsSuccessStatusCode,
+                (int)response.StatusCode,
+                retryAfterSeconds,
+                null
+            );
+        } catch (Exception ex) {
+            return new UploadAttemptResult(false, null, null, ex.Message);
+        }
+    }
+
+    private void PruneUploadIndex(DateTime now) {
+        var cutoff = now - UploadedListingIndexTtl;
+        foreach (var (listingId, uploadedAtUtc) in _lastUploadedListingAtUtc) {
+            if (uploadedAtUtc >= cutoff) {
+                continue;
+            }
+
+            _lastUploadedListingAtUtc.TryRemove(listingId, out _);
+        }
+    }
+
+    private readonly record struct UploadAttemptResult(
+        bool Success,
+        int? StatusCode,
+        int? RetryAfterSeconds,
+        string ErrorMessage
+    );
 }
