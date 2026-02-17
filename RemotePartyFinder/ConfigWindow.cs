@@ -439,10 +439,11 @@ public class ConfigWindow : Window, IDisposable
         ImGui.TextUnformatted($"Next Page Capture: {(_plugin.DebugPfScanner.HasNextPageCapture ? "READY" : "MISSING")} armed={_plugin.DebugPfScanner.IsNextPageCaptureArmed}");
         if (_plugin.DebugPfScanner.HasNextPageCapture)
         {
-            ImGui.TextUnformatted($"Captured Event: action={_plugin.DebugPfScanner.CapturedNextPageActionId} kind={_plugin.DebugPfScanner.CapturedNextPageEventKind} values={_plugin.DebugPfScanner.CapturedNextPageValueCount} with_result={_plugin.DebugPfScanner.CapturedNextPageUsesWithResult}");
+            ImGui.TextUnformatted($"Captured Event: action={_plugin.DebugPfScanner.CapturedNextPageActionId} button={_plugin.DebugPfScanner.CapturedNextPageButtonId} kind={_plugin.DebugPfScanner.CapturedNextPageEventKind} values={_plugin.DebugPfScanner.CapturedNextPageValueCount} with_result={_plugin.DebugPfScanner.CapturedNextPageUsesWithResult}");
             ImGui.TextWrapped($"Captured Payload: {_plugin.DebugPfScanner.CapturedNextPageValues}");
         }
         ImGui.TextWrapped($"Last Observed ReceiveEvent: {_plugin.DebugPfScanner.LastObservedReceiveEvent}");
+        ImGui.TextWrapped($"Last Observed Addon ReceiveEvent: {_plugin.DebugPfScanner.LastObservedAddonReceiveEvent}");
 
         if (ImGui.Button("Arm Next Page Capture"))
         {

@@ -25,6 +25,9 @@ public class Plugin : IDalamudPlugin {
     internal IAgentLifecycle AgentLifecycle { get; private init; }
 
     [PluginService]
+    internal IAddonLifecycle AddonLifecycle { get; private init; }
+
+    [PluginService]
     internal IGameGui GameGui { get; private init; }
 
     [PluginService]
