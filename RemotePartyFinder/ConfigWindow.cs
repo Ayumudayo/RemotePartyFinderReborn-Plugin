@@ -354,7 +354,7 @@ public class ConfigWindow : Window, IDisposable
         }
         if (ImGui.IsItemHovered())
         {
-            ImGui.SetTooltip("Enabled: only scan listings received from the current page. Disabled: also scan listing IDs cached by the game across pages.");
+            ImGui.SetTooltip("Enabled: only scan listings on the current page. Disabled: automatically turn pages and continue scanning until the last page.");
         }
 
         var actionInterval = _configuration.AutoDetailScanActionIntervalMs;
@@ -420,6 +420,7 @@ public class ConfigWindow : Window, IDisposable
         ImGui.TextUnformatted($"Last Attempt: listing={_plugin.DebugPfScanner.LastAttemptListingId} success={_plugin.DebugPfScanner.LastAttemptSuccess} reason={_plugin.DebugPfScanner.LastAttemptReason}");
         ImGui.TextUnformatted($"Gatherer Ack Version: {_plugin.Gatherer.LastSuccessfulUploadAckVersion} (indexed: {_plugin.Gatherer.UploadedListingIndexCount})");
         ImGui.TextUnformatted($"Gatherer Last Success UTC: {_plugin.Gatherer.LastSuccessfulUploadAtUtc:HH:mm:ss}");
+        ImGui.TextUnformatted($"Detail Queue Ack Version: {_plugin.PartyDetailCollector.LastQueuedAckVersion} listing={_plugin.PartyDetailCollector.LastUploadedListingId}");
         ImGui.TextUnformatted($"Detail Ack Version: {_plugin.PartyDetailCollector.LastSuccessfulUploadAckVersion} listing={_plugin.PartyDetailCollector.LastSuccessfulUploadListingId}");
         ImGui.TextUnformatted($"Detail Last Success UTC: {_plugin.PartyDetailCollector.LastSuccessfulUploadAtUtc:HH:mm:ss}");
         ImGui.TextUnformatted($"Detail Missing Ack Version: {_plugin.PartyDetailCollector.LastTerminalUploadAckVersion} listing={_plugin.PartyDetailCollector.LastTerminalUploadListingId}");

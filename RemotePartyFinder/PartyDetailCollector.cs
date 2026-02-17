@@ -28,6 +28,7 @@ internal sealed class PartyDetailCollector : IDisposable {
     private uint _lastQueuedListingId;
     private ulong _lastQueuedFingerprint;
     private DateTime _lastQueuedAtUtc = DateTime.MinValue;
+    private long _lastQueuedAckVersion;
 
     private volatile uint _lastSuccessfulUploadListingId;
     private long _lastSuccessfulUploadAtUtcTicks;
@@ -40,6 +41,7 @@ internal sealed class PartyDetailCollector : IDisposable {
     private volatile bool _uploadWorkerBusy;
 
     internal uint LastUploadedListingId => _lastQueuedListingId;
+    internal long LastQueuedAckVersion => Interlocked.Read(ref _lastQueuedAckVersion);
     internal uint LastSuccessfulUploadListingId => _lastSuccessfulUploadListingId;
     internal DateTime LastSuccessfulUploadAtUtc => new(Interlocked.Read(ref _lastSuccessfulUploadAtUtcTicks), DateTimeKind.Utc);
     internal long LastSuccessfulUploadAckVersion => Interlocked.Read(ref _lastSuccessfulUploadAckVersion);
@@ -139,6 +141,7 @@ internal sealed class PartyDetailCollector : IDisposable {
         _lastQueuedListingId = payload.ListingId;
         _lastQueuedFingerprint = fingerprint;
         _lastQueuedAtUtc = now;
+        Interlocked.Increment(ref _lastQueuedAckVersion);
     }
 
     private void Enqueue(UploadablePartyDetail payload, ulong fingerprint, DateTime nowUtc) {

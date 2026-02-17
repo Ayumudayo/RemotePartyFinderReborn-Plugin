@@ -6,11 +6,17 @@ using System.Linq;
 using Dalamud.Game.Gui.PartyFinder.Types;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
+using FFXIVClientStructs.FFXIV.Component.GUI;
 
 namespace RemotePartyFinder;
 
 internal sealed class DebugPfScanner : IDisposable {
     private const int MaxAgentListingSlots = 50;
+    private const int LookingForGroupCurrentPageAtkValueIndex = 14;
+    private const int LookingForGroupTotalPagesAtkValueIndex = 15;
+    private const int LookingForGroupNextPageCallback = 11;
+    private const int MinCollectionTimeoutMs = 1500;
+    private const int CollectionTimeoutExtraBudgetMs = 700;
 
     private readonly Plugin _plugin;
     private readonly PartyDetailCollector _detailCollector;
@@ -31,7 +37,7 @@ internal sealed class DebugPfScanner : IDisposable {
     private DateTime _nextActionAtUtc = DateTime.MinValue;
     private DateTime _nextRefreshAtUtc = DateTime.MinValue;
     private DateTime _stateDeadlineUtc = DateTime.MinValue;
-    private DateTime _detailReadyAtUtc = DateTime.MinValue;
+    private long _waitForQueueAckVersion = -1;
     private long _waitForAckVersion = -1;
     private long _waitForTerminalAckVersion = -1;
     private DetailSnapshot _lastReadySnapshot;
@@ -82,7 +88,7 @@ internal sealed class DebugPfScanner : IDisposable {
         _nextActionAtUtc = DateTime.MinValue;
         _nextRefreshAtUtc = DateTime.MinValue;
         _stateDeadlineUtc = DateTime.MinValue;
-        _detailReadyAtUtc = DateTime.MinValue;
+        _waitForQueueAckVersion = -1;
         _waitForAckVersion = -1;
         _waitForTerminalAckVersion = -1;
         _lastReadySnapshot = default;
@@ -180,7 +186,7 @@ internal sealed class DebugPfScanner : IDisposable {
 
         if (_plugin.Configuration.AutoDetailScanMaxPerRun > 0
             && _processedCount >= _plugin.Configuration.AutoDetailScanMaxPerRun) {
-            SetIdle();
+            CompleteRun("max_per_run");
             return;
         }
 
@@ -189,7 +195,30 @@ internal sealed class DebugPfScanner : IDisposable {
         }
 
         if (!TryTakeNextReadyTarget(out var nextTarget)) {
-            TryRequestListingsUpdate();
+            if (_pending.Count > 0 || !_incoming.IsEmpty) {
+                TryRequestListingsUpdate();
+                _nextActionAtUtc = DateTime.UtcNow.AddMilliseconds(250);
+                _state = ScanState.Cooldown;
+                return;
+            }
+
+            var pageAdvanceResult = TryAdvanceToNextPage();
+            if (pageAdvanceResult == PageAdvanceResult.Advanced) {
+                return;
+            }
+
+            if (pageAdvanceResult == PageAdvanceResult.NotReady) {
+                TryRequestListingsUpdate();
+                _nextActionAtUtc = DateTime.UtcNow.AddMilliseconds(250);
+                _state = ScanState.Cooldown;
+                return;
+            }
+
+            if (_detailCollector.PendingQueueCount == 0) {
+                CompleteRun("pending_drained");
+                return;
+            }
+
             _nextActionAtUtc = DateTime.UtcNow.AddMilliseconds(250);
             _state = ScanState.Cooldown;
             return;
@@ -245,12 +274,13 @@ internal sealed class DebugPfScanner : IDisposable {
         _nextActionAtUtc = DateTime.UtcNow.AddMilliseconds(actionIntervalMs);
 
         if (opened) {
-            var timeoutMs = Math.Clamp(_plugin.Configuration.AutoDetailScanDetailTimeoutMs, 500, 10000);
+            var timeoutMs = GetDetailReadyTimeoutMs();
             _stateDeadlineUtc = DateTime.UtcNow.AddMilliseconds(timeoutMs);
             _readyStableTicks = 0;
             _lastReadySnapshot = default;
-            _waitForAckVersion = -1;
-            _waitForTerminalAckVersion = -1;
+            _waitForQueueAckVersion = _detailCollector.LastQueuedAckVersion;
+            _waitForAckVersion = _detailCollector.LastSuccessfulUploadAckVersion;
+            _waitForTerminalAckVersion = _detailCollector.LastTerminalUploadAckVersion;
             _state = ScanState.WaitDetailReady;
             return;
         }
@@ -298,10 +328,8 @@ internal sealed class DebugPfScanner : IDisposable {
 
             var requiredStableTicks = _target.ContentId == 0 ? 4 : 2;
             if (_readyStableTicks >= requiredStableTicks) {
-                _detailReadyAtUtc = DateTime.UtcNow;
-                _waitForAckVersion = _detailCollector.LastSuccessfulUploadAckVersion;
-                _waitForTerminalAckVersion = _detailCollector.LastTerminalUploadAckVersion;
-                var timeoutMs = Math.Clamp(_plugin.Configuration.AutoDetailScanDetailTimeoutMs, 500, 10000);
+                var minDwellMs = Math.Clamp(_plugin.Configuration.AutoDetailScanMinDwellMs, 100, 5000);
+                var timeoutMs = GetDetailCollectionTimeoutMs(minDwellMs);
                 _stateDeadlineUtc = DateTime.UtcNow.AddMilliseconds(timeoutMs);
                 _state = ScanState.WaitCollected;
                 return;
@@ -330,8 +358,15 @@ internal sealed class DebugPfScanner : IDisposable {
             return;
         }
 
-        var minDwellMs = Math.Clamp(_plugin.Configuration.AutoDetailScanMinDwellMs, 100, 5000);
-        var dwellElapsedMs = (DateTime.UtcNow - _detailReadyAtUtc).TotalMilliseconds;
+        var queueAckVersion = _detailCollector.LastQueuedAckVersion;
+        var hasQueuedAck = queueAckVersion > _waitForQueueAckVersion
+                           && _detailCollector.LastUploadedListingId == _target.ListingId;
+
+        if (hasQueuedAck) {
+            MarkAttempt(true, "queued");
+            return;
+        }
+
         var ackVersion = _detailCollector.LastSuccessfulUploadAckVersion;
         var hasAppliedAck = ackVersion > _waitForAckVersion
                             && _detailCollector.LastSuccessfulUploadListingId == _target.ListingId;
@@ -339,27 +374,17 @@ internal sealed class DebugPfScanner : IDisposable {
         var hasTerminalAck = terminalAckVersion > _waitForTerminalAckVersion
                              && _detailCollector.LastTerminalUploadListingId == _target.ListingId;
 
-        if (dwellElapsedMs >= minDwellMs && hasAppliedAck) {
+        if (hasAppliedAck) {
             MarkAttempt(true, "collected");
             return;
         }
 
-        if (dwellElapsedMs >= minDwellMs && hasTerminalAck) {
+        if (hasTerminalAck) {
             MarkAttempt(true, "listing_missing");
             return;
         }
 
         if (DateTime.UtcNow <= _stateDeadlineUtc) {
-            return;
-        }
-
-        if (hasAppliedAck) {
-            MarkAttempt(true, "collector_delayed");
-            return;
-        }
-
-        if (hasTerminalAck) {
-            MarkAttempt(true, "listing_missing_delayed");
             return;
         }
 
@@ -386,6 +411,7 @@ internal sealed class DebugPfScanner : IDisposable {
         _hasTarget = false;
         _retryTargetAfterCooldown = false;
         _openAttemptsForTarget = 0;
+        _waitForQueueAckVersion = -1;
         _waitForAckVersion = -1;
         _waitForTerminalAckVersion = -1;
         _readyStableTicks = 0;
@@ -401,6 +427,18 @@ internal sealed class DebugPfScanner : IDisposable {
         _hasTarget = false;
         _retryTargetAfterCooldown = false;
         _openAttemptsForTarget = 0;
+    }
+
+    private void CompleteRun(string reason) {
+        Plugin.Log.Debug($"DebugPfScanner: complete reason={reason} processed={_processedCount} failures={_consecutiveFailures}");
+        SetIdle();
+
+        if (!_plugin.Configuration.EnableAutoDetailScanDebug) {
+            return;
+        }
+
+        _plugin.Configuration.EnableAutoDetailScanDebug = false;
+        _plugin.Configuration.Save();
     }
 
     private void DrainIncoming() {
@@ -470,6 +508,66 @@ internal sealed class DebugPfScanner : IDisposable {
         Plugin.Log.Debug($"DebugPfScanner: RequestListingsUpdate -> {ok}");
     }
 
+    private unsafe PageAdvanceResult TryAdvanceToNextPage() {
+        if (_plugin.Configuration.AutoDetailScanCurrentPageOnly) {
+            return PageAdvanceResult.NoMorePages;
+        }
+
+        var addon = _plugin.GameGui.GetAddonByName("LookingForGroup", 1);
+        if (addon.IsNull || !addon.IsVisible || !addon.IsReady) {
+            return PageAdvanceResult.NotReady;
+        }
+
+        var addonPtr = (AtkUnitBase*)addon.Address;
+
+        if (!TryReadPageState(addonPtr, out var currentPage, out var totalPages)) {
+            return PageAdvanceResult.NotReady;
+        }
+
+        if (totalPages <= 1 || currentPage >= totalPages - 1) {
+            return PageAdvanceResult.NoMorePages;
+        }
+
+        var fired = addonPtr->FireCallbackInt(LookingForGroupNextPageCallback);
+        Plugin.Log.Debug($"DebugPfScanner: next page callback fired={fired} page={currentPage + 1}/{totalPages}");
+        if (!fired) {
+            return PageAdvanceResult.NotReady;
+        }
+
+        _latestVisible.Clear();
+        _pending.Clear();
+        _nextRefreshAtUtc = DateTime.MinValue;
+        TryRequestListingsUpdate(force: true);
+
+        var cooldownMs = Math.Clamp(_plugin.Configuration.AutoDetailScanActionIntervalMs + 250, 250, 3000);
+        _nextActionAtUtc = DateTime.UtcNow.AddMilliseconds(cooldownMs);
+        _state = ScanState.Cooldown;
+        return PageAdvanceResult.Advanced;
+    }
+
+    private static unsafe bool TryReadPageState(AtkUnitBase* addon, out int currentPage, out int totalPages) {
+        currentPage = 0;
+        totalPages = 0;
+
+        if (addon->AtkValues == null) {
+            return false;
+        }
+
+        if (addon->AtkValuesCount <= LookingForGroupTotalPagesAtkValueIndex) {
+            return false;
+        }
+
+        var current = addon->AtkValues[LookingForGroupCurrentPageAtkValueIndex].Int;
+        var total = addon->AtkValues[LookingForGroupTotalPagesAtkValueIndex].Int;
+        if (current < 0 || total <= 0 || total > 100) {
+            return false;
+        }
+
+        currentPage = current;
+        totalPages = total;
+        return true;
+    }
+
     private unsafe void MergeAgentListingIds() {
         var agent = AgentLookingForGroup.Instance();
         if (agent == null) {
@@ -505,6 +603,16 @@ internal sealed class DebugPfScanner : IDisposable {
         }
 
         _latestVisible[incoming.ListingId] = incoming;
+    }
+
+    private int GetDetailReadyTimeoutMs() {
+        return Math.Clamp(_plugin.Configuration.AutoDetailScanDetailTimeoutMs, 500, 10000);
+    }
+
+    private int GetDetailCollectionTimeoutMs(int minDwellMs) {
+        var configuredTimeoutMs = GetDetailReadyTimeoutMs();
+        var timeoutFloorFromDwellMs = minDwellMs + CollectionTimeoutExtraBudgetMs;
+        return Math.Clamp(Math.Max(configuredTimeoutMs, timeoutFloorFromDwellMs), MinCollectionTimeoutMs, 10000);
     }
 
     private void StartRunFromFirstPage() {
@@ -562,5 +670,11 @@ internal sealed class DebugPfScanner : IDisposable {
         WaitDetailReady,
         WaitCollected,
         Cooldown,
+    }
+
+    private enum PageAdvanceResult {
+        Advanced,
+        NoMorePages,
+        NotReady,
     }
 }
