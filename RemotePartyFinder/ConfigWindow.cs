@@ -357,6 +357,17 @@ public class ConfigWindow : Window, IDisposable
             ImGui.SetTooltip("Enabled: only scan listings on the current page. Disabled: automatically turn pages and continue scanning until the last page.");
         }
 
+        var nextPageActionId = _configuration.AutoDetailScanNextPageActionId;
+        if (ImGui.InputInt("Next Page Action Id", ref nextPageActionId, 1, 5))
+        {
+            _configuration.AutoDetailScanNextPageActionId = Math.Clamp(nextPageActionId, 0, 1000);
+            _configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("ReceiveEvent first int value used to identify PF Next-page action (observed: 22).");
+        }
+
         var actionInterval = _configuration.AutoDetailScanActionIntervalMs;
         if (ImGui.SliderInt("Action Interval", ref actionInterval, 100, 2000, "%d ms"))
         {
@@ -425,6 +436,28 @@ public class ConfigWindow : Window, IDisposable
         ImGui.TextUnformatted($"Detail Last Success UTC: {_plugin.PartyDetailCollector.LastSuccessfulUploadAtUtc:HH:mm:ss}");
         ImGui.TextUnformatted($"Detail Missing Ack Version: {_plugin.PartyDetailCollector.LastTerminalUploadAckVersion} listing={_plugin.PartyDetailCollector.LastTerminalUploadListingId}");
         ImGui.TextUnformatted($"Detail Pending Queue: {_plugin.PartyDetailCollector.PendingQueueCount}");
+        ImGui.TextUnformatted($"Next Page Capture: {(_plugin.DebugPfScanner.HasNextPageCapture ? "READY" : "MISSING")} armed={_plugin.DebugPfScanner.IsNextPageCaptureArmed}");
+        if (_plugin.DebugPfScanner.HasNextPageCapture)
+        {
+            ImGui.TextUnformatted($"Captured Event: action={_plugin.DebugPfScanner.CapturedNextPageActionId} kind={_plugin.DebugPfScanner.CapturedNextPageEventKind} values={_plugin.DebugPfScanner.CapturedNextPageValueCount} with_result={_plugin.DebugPfScanner.CapturedNextPageUsesWithResult}");
+            ImGui.TextWrapped($"Captured Payload: {_plugin.DebugPfScanner.CapturedNextPageValues}");
+        }
+        ImGui.TextWrapped($"Last Observed ReceiveEvent: {_plugin.DebugPfScanner.LastObservedReceiveEvent}");
+
+        if (ImGui.Button("Arm Next Page Capture"))
+        {
+            _plugin.DebugPfScanner.ArmNextPageCapture();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Arm capture, then manually click PF Next Page once. The scanner will replay the captured event for pagination.");
+        }
+
+        ImGui.SameLine();
+        if (ImGui.Button("Clear Next Page Capture"))
+        {
+            _plugin.DebugPfScanner.ClearNextPageCapture();
+        }
 
         if (ImGui.Button("Reset Scanner Session"))
         {

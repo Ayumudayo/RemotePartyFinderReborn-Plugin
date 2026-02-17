@@ -1,4 +1,4 @@
-﻿using Dalamud.IoC;
+using Dalamud.IoC;
 using Dalamud.Game.Command;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin;
@@ -20,6 +20,9 @@ public class Plugin : IDalamudPlugin {
 
     [PluginService]
     internal IObjectTable ObjectTable { get; private init; }
+
+    [PluginService]
+    internal IAgentLifecycle AgentLifecycle { get; private init; }
 
     [PluginService]
     internal IGameGui GameGui { get; private init; }

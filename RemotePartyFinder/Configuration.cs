@@ -31,6 +31,7 @@ public class Configuration : IPluginConfiguration {
     // Debug scanner: auto-open PF detail windows
     public bool EnableAutoDetailScanDebug { get; set; } = false;
     public bool AutoDetailScanCurrentPageOnly { get; set; } = true;
+    public int AutoDetailScanNextPageActionId { get; set; } = 22;
     public int AutoDetailScanActionIntervalMs { get; set; } = 400;
     public int AutoDetailScanDetailTimeoutMs { get; set; } = 3500;
     public int AutoDetailScanMinDwellMs { get; set; } = 800;
