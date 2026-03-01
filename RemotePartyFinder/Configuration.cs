@@ -42,14 +42,6 @@ public class Configuration : IPluginConfiguration {
     public int AutoDetailScanMaxConsecutiveFailures { get; set; } = 5;
     public int AutoDetailScanMaxPerRun { get; set; } = 0;
     
-    // UI Collapse States (not saved, just runtime state)
-    [NonSerialized]
-    public bool CollapseFFLogsSettings = false;
-    [NonSerialized]
-    public bool CollapseAdvancedSettings = false;
-    [NonSerialized]
-    public bool CollapseDebugSettings = false;
-
     public static ImmutableList<UploadUrl> DefaultUploadUrls() => [
         new("http://127.0.0.1:8000") { IsDefault = true }
     ];

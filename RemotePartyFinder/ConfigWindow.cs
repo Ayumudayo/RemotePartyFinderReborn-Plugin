@@ -442,35 +442,13 @@ public class ConfigWindow : Window, IDisposable
         ImGui.TextUnformatted($"Processed: {_plugin.DebugPfScanner.ProcessedCount} / Consecutive Failures: {_plugin.DebugPfScanner.ConsecutiveFailures}");
         ImGui.TextUnformatted($"Last Attempt: listing={_plugin.DebugPfScanner.LastAttemptListingId} success={_plugin.DebugPfScanner.LastAttemptSuccess} reason={_plugin.DebugPfScanner.LastAttemptReason}");
         ImGui.TextUnformatted($"Gatherer Ack Version: {_plugin.Gatherer.LastSuccessfulUploadAckVersion} (indexed: {_plugin.Gatherer.UploadedListingIndexCount})");
-        ImGui.TextUnformatted($"Gatherer Last Success UTC: {_plugin.Gatherer.LastSuccessfulUploadAtUtc:HH:mm:ss}");
+        ImGui.TextUnformatted($"Gatherer Last Success (Local): {FormatLocalClock(_plugin.Gatherer.LastSuccessfulUploadAtUtc)}");
         ImGui.TextUnformatted($"Detail Queue Ack Version: {_plugin.PartyDetailCollector.LastQueuedAckVersion} listing={_plugin.PartyDetailCollector.LastUploadedListingId}");
         ImGui.TextUnformatted($"Detail Ack Version: {_plugin.PartyDetailCollector.LastSuccessfulUploadAckVersion} listing={_plugin.PartyDetailCollector.LastSuccessfulUploadListingId}");
-        ImGui.TextUnformatted($"Detail Last Success UTC: {_plugin.PartyDetailCollector.LastSuccessfulUploadAtUtc:HH:mm:ss}");
+        ImGui.TextUnformatted($"Detail Last Success (Local): {FormatLocalClock(_plugin.PartyDetailCollector.LastSuccessfulUploadAtUtc)}");
         ImGui.TextUnformatted($"Detail Missing Ack Version: {_plugin.PartyDetailCollector.LastTerminalUploadAckVersion} listing={_plugin.PartyDetailCollector.LastTerminalUploadListingId}");
         ImGui.TextUnformatted($"Detail Pending Queue: {_plugin.PartyDetailCollector.PendingQueueCount}");
-        ImGui.TextUnformatted($"Next Page Button Capture (optional override): {(_plugin.DebugPfScanner.HasNextPageCapture ? "READY" : "MISSING")} armed={_plugin.DebugPfScanner.IsNextPageCaptureArmed}");
-        if (_plugin.DebugPfScanner.HasNextPageCapture)
-        {
-            ImGui.TextUnformatted($"Captured Event: action={_plugin.DebugPfScanner.CapturedNextPageActionId} button={_plugin.DebugPfScanner.CapturedNextPageButtonId} kind={_plugin.DebugPfScanner.CapturedNextPageEventKind} values={_plugin.DebugPfScanner.CapturedNextPageValueCount} with_result={_plugin.DebugPfScanner.CapturedNextPageUsesWithResult}");
-            ImGui.TextWrapped($"Captured Payload: {_plugin.DebugPfScanner.CapturedNextPageValues}");
-        }
-        ImGui.TextWrapped($"Last Observed ReceiveEvent: {_plugin.DebugPfScanner.LastObservedReceiveEvent}");
-        ImGui.TextWrapped($"Last Observed Addon ReceiveEvent: {_plugin.DebugPfScanner.LastObservedAddonReceiveEvent}");
-
-        if (ImGui.Button("Arm Next Page Capture"))
-        {
-            _plugin.DebugPfScanner.ArmNextPageCapture();
-        }
-        if (ImGui.IsItemHovered())
-        {
-            ImGui.SetTooltip("Optional: arm capture and click PF Next once to detect a runtime button id override. Normal scanning no longer requires this step.");
-        }
-
-        ImGui.SameLine();
-        if (ImGui.Button("Clear Next Page Capture"))
-        {
-            _plugin.DebugPfScanner.ClearNextPageCapture();
-        }
+        ImGui.TextUnformatted("Next-page event arm/capture controls removed; scanner now uses automatic agent-event flow.");
 
         if (ImGui.Button("Reset Scanner Session"))
         {
@@ -488,14 +466,14 @@ public class ConfigWindow : Window, IDisposable
         if (ImGui.Button("Upload Pending Players Now"))
         {
             _plugin.TriggerPlayerUploadNow();
-            _playerManualUploadStatus = $"Triggered pending upload at {DateTime.UtcNow:HH:mm:ss} UTC";
+            _playerManualUploadStatus = $"Triggered pending upload at {DateTime.Now:HH:mm:ss} (Local)";
         }
 
         ImGui.SameLine();
         if (ImGui.Button("Requeue All Cached Players + Upload"))
         {
             var requeued = _plugin.TriggerPlayerFullResyncUploadNow();
-            _playerManualUploadStatus = $"Requeued {requeued} cached rows and triggered upload at {DateTime.UtcNow:HH:mm:ss} UTC";
+            _playerManualUploadStatus = $"Requeued {requeued} cached rows and triggered upload at {DateTime.Now:HH:mm:ss} (Local)";
         }
         if (ImGui.IsItemHovered())
         {
@@ -573,10 +551,17 @@ public class ConfigWindow : Window, IDisposable
         => Uri.TryCreate(url, UriKind.Absolute, out var uriResult)
            && (uriResult.Scheme == Uri.UriSchemeHttps || uriResult.Scheme == Uri.UriSchemeHttp);
 
-    private static void DrawHelp(string text)
+    private static string FormatLocalClock(DateTime utcTime)
     {
-        ImGui.SameLine();
-        ImGuiComponents.HelpMarker(text);
+        if (utcTime == DateTime.MinValue)
+        {
+            return "-";
+        }
+
+        var normalizedUtc = utcTime.Kind == DateTimeKind.Unspecified
+            ? DateTime.SpecifyKind(utcTime, DateTimeKind.Utc)
+            : utcTime;
+        return normalizedUtc.ToLocalTime().ToString("HH:mm:ss");
     }
 
     private static void CopyToClipboard(string text)

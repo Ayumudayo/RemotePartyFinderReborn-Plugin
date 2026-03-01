@@ -21,7 +21,6 @@ internal sealed class DebugPfScanner : IDisposable {
     private const int MinCollectionTimeoutMs = 1500;
     private const int CollectionTimeoutExtraBudgetMs = 700;
     private const int MaxCapturedAtkValues = 16;
-    private static readonly TimeSpan CaptureArmTimeout = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan CaptureEventParamWindow = TimeSpan.FromSeconds(3);
     private static readonly AtkEventType[] NextButtonResolveEventTypes = {
         AtkEventType.ButtonClick,
@@ -64,16 +63,10 @@ internal sealed class DebugPfScanner : IDisposable {
     private uint _lastAttemptListingId;
     private bool _wasEnabled;
     private bool _noMorePagesDetected;
-    private bool _captureNextPageEventArmed;
-    private DateTime _captureArmedAtUtc = DateTime.MinValue;
     private bool _isReplayingNextPageEvent;
     private CapturedReceiveEvent? _capturedNextPageEvent;
     private int _capturedNextPageButtonId = -1;
     private DateTime _capturedNextPageEventAtUtc = DateTime.MinValue;
-    private string _lastObservedReceiveEvent = "none";
-    private string _lastObservedAddonReceiveEvent = "none";
-    private int _recentAddonEventParam = -1;
-    private DateTime _recentAddonEventAtUtc = DateTime.MinValue;
     private int _recentAddonButtonEventParam = -1;
     private DateTime _recentAddonButtonEventAtUtc = DateTime.MinValue;
     private DateTime _autoHydrateNextPageButtonIdUntilUtc = DateTime.MinValue;
@@ -103,16 +96,6 @@ internal sealed class DebugPfScanner : IDisposable {
     internal string LastAttemptReason => _lastAttemptReason;
     internal bool LastAttemptSuccess => _lastAttemptSuccess;
     internal uint LastAttemptListingId => _lastAttemptListingId;
-    internal bool IsNextPageCaptureArmed => _captureNextPageEventArmed;
-    internal bool HasNextPageCapture => _capturedNextPageEvent.HasValue;
-    internal ulong CapturedNextPageEventKind => _capturedNextPageEvent?.EventKind ?? 0;
-    internal int CapturedNextPageValueCount => _capturedNextPageEvent?.Values.Length ?? 0;
-    internal int CapturedNextPageActionId => _capturedNextPageEvent.HasValue && TryReadPrimaryActionId(_capturedNextPageEvent.Value.Values, out var actionId) ? actionId : -1;
-    internal int CapturedNextPageButtonId => _capturedNextPageButtonId;
-    internal bool CapturedNextPageUsesWithResult => _capturedNextPageEvent?.UsesWithResult ?? false;
-    internal string CapturedNextPageValues => _capturedNextPageEvent.HasValue ? DescribeValues(_capturedNextPageEvent.Value.Values) : "none";
-    internal string LastObservedReceiveEvent => _lastObservedReceiveEvent;
-    internal string LastObservedAddonReceiveEvent => _lastObservedAddonReceiveEvent;
 
     public void Dispose() {
         _plugin.Framework.Update -= OnUpdate;
@@ -152,42 +135,11 @@ internal sealed class DebugPfScanner : IDisposable {
         _lastAttemptListingId = 0;
         _noMorePagesDetected = false;
         _capturedNextPageEventAtUtc = DateTime.MinValue;
-        _lastObservedAddonReceiveEvent = "none";
-        _recentAddonEventParam = -1;
-        _recentAddonEventAtUtc = DateTime.MinValue;
         _recentAddonButtonEventParam = -1;
         _recentAddonButtonEventAtUtc = DateTime.MinValue;
         _autoHydrateNextPageButtonIdUntilUtc = DateTime.MinValue;
         _autoCaptureNextPageEventUntilUtc = DateTime.MinValue;
         _nextButtonResolveAtUtc = DateTime.MinValue;
-    }
-
-    internal void ArmNextPageCapture() {
-        _captureNextPageEventArmed = true;
-        _captureArmedAtUtc = DateTime.UtcNow;
-        _recentAddonEventParam = -1;
-        _recentAddonEventAtUtc = DateTime.MinValue;
-        _recentAddonButtonEventParam = -1;
-        _recentAddonButtonEventAtUtc = DateTime.MinValue;
-        Plugin.Log.Debug("DebugPfScanner: armed next-page event capture");
-    }
-
-    internal void ClearNextPageCapture() {
-        _captureNextPageEventArmed = false;
-        _captureArmedAtUtc = DateTime.MinValue;
-        _capturedNextPageEvent = null;
-        _capturedNextPageButtonId = -1;
-        _capturedNextPageEventAtUtc = DateTime.MinValue;
-        _lastObservedReceiveEvent = "none";
-        _lastObservedAddonReceiveEvent = "none";
-        _recentAddonEventParam = -1;
-        _recentAddonEventAtUtc = DateTime.MinValue;
-        _recentAddonButtonEventParam = -1;
-        _recentAddonButtonEventAtUtc = DateTime.MinValue;
-        _autoHydrateNextPageButtonIdUntilUtc = DateTime.MinValue;
-        _autoCaptureNextPageEventUntilUtc = DateTime.MinValue;
-        _nextButtonResolveAtUtc = DateTime.MinValue;
-        Plugin.Log.Debug("DebugPfScanner: cleared captured next-page event");
     }
 
     private void OnListing(IPartyFinderListing listing, IPartyFinderListingEventArgs args) {
@@ -209,18 +161,11 @@ internal sealed class DebugPfScanner : IDisposable {
         }
 
         var now = DateTime.UtcNow;
-        var eventParam = receiveEventArgs.EventParam;
-        var hasButtonNodeId = TryExtractButtonNodeIdFromAddonReceiveEvent(receiveEventArgs, out var buttonNodeId, out var addonEventDetail);
-        _lastObservedAddonReceiveEvent = $"atk_type={receiveEventArgs.AtkEventType} event_param={eventParam} {addonEventDetail}";
+        var hasButtonNodeId = TryExtractButtonNodeIdFromAddonReceiveEvent(receiveEventArgs, out var buttonNodeId, out _);
 
         var allowReplayAddonSampling = _isReplayingNextPageEvent && now <= _autoHydrateNextPageButtonIdUntilUtc;
         if (_isReplayingNextPageEvent && !allowReplayAddonSampling) {
             return;
-        }
-
-        if (eventParam > 0 && eventParam <= 1000) {
-            _recentAddonEventParam = eventParam;
-            _recentAddonEventAtUtc = now;
         }
 
         var atkEventType = (int)receiveEventArgs.AtkEventType;
@@ -268,32 +213,21 @@ internal sealed class DebugPfScanner : IDisposable {
         }
 
         var valuesPtr = (AtkValue*)receiveEventArgs.AtkValues;
-        _lastObservedReceiveEvent = $"kind={receiveEventArgs.EventKind} values={receiveEventArgs.ValueCount} [{DescribeValues(valuesPtr, receiveEventArgs.ValueCount)}]";
-
         var autoCaptureArmed = now <= _autoCaptureNextPageEventUntilUtc;
-        if (!_captureNextPageEventArmed && !autoCaptureArmed) {
+        if (!autoCaptureArmed) {
             return;
         }
 
         if (!TryReadPrimaryActionId(valuesPtr, receiveEventArgs.ValueCount, out var actionId)) {
-            if (_captureNextPageEventArmed) {
-                Plugin.Log.Debug($"DebugPfScanner: skipped next-page capture event kind={receiveEventArgs.EventKind} reason=no_primary_action");
-            }
             return;
         }
 
         var expectedActionId = Math.Clamp(_plugin.Configuration.AutoDetailScanNextPageActionId, 0, 1000);
         if (actionId != expectedActionId) {
-            if (_captureNextPageEventArmed) {
-                Plugin.Log.Debug($"DebugPfScanner: ignored capture event action={actionId} expected={expectedActionId} kind={receiveEventArgs.EventKind}");
-            }
             return;
         }
 
         if (!TryCopyCaptureValues(valuesPtr, receiveEventArgs.ValueCount, out var values, out var reason)) {
-            if (_captureNextPageEventArmed) {
-                Plugin.Log.Debug($"DebugPfScanner: skipped next-page capture event kind={receiveEventArgs.EventKind} reason={reason}");
-            }
             return;
         }
 
@@ -307,11 +241,6 @@ internal sealed class DebugPfScanner : IDisposable {
         _capturedNextPageEvent = new CapturedReceiveEvent(receiveEventArgs.EventKind, usesWithResult, values);
         if (capturedButtonId > 0) {
             _capturedNextPageButtonId = capturedButtonId;
-        }
-
-        if (_captureNextPageEventArmed) {
-            _captureNextPageEventArmed = false;
-            _captureArmedAtUtc = DateTime.MinValue;
         }
 
         if (autoCaptureArmed) {
@@ -414,12 +343,6 @@ internal sealed class DebugPfScanner : IDisposable {
         }
 
         _tickGate.Restart();
-
-        if (_captureNextPageEventArmed && DateTime.UtcNow - _captureArmedAtUtc > CaptureArmTimeout) {
-            _captureNextPageEventArmed = false;
-            _captureArmedAtUtc = DateTime.MinValue;
-            Plugin.Log.Debug("DebugPfScanner: next-page capture timed out; arm again and click Next page manually.");
-        }
 
         if (!Enabled) {
             if (_state != ScanState.Idle || _pending.Count > 0 || _processedCount > 0 || _consecutiveFailures > 0) {

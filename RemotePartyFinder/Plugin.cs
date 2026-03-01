@@ -1,5 +1,3 @@
-using System;
-using System.Reflection;
 using Dalamud.IoC;
 using Dalamud.Game.Command;
 using Dalamud.Interface.Windowing;
@@ -46,8 +44,8 @@ public class Plugin : IDalamudPlugin {
     internal DebugPfScanner DebugPfScanner { get; }
     private FFLogsCollector FFLogsCollector { get; }
 
-    internal int PendingPlayerUploadCount => ReadPlayerCollectorIntProperty("PendingCount");
-    internal bool IsPlayerUploadInProgress => ReadPlayerCollectorBoolProperty("IsUploadInProgress");
+    internal int PendingPlayerUploadCount => this.PlayerCollector.PendingCount;
+    internal bool IsPlayerUploadInProgress => this.PlayerCollector.IsUploadInProgress;
 
     public Plugin() {
         ECommonsMain.Init(PluginInterface, this);
@@ -97,82 +95,11 @@ public class Plugin : IDalamudPlugin {
     }
 
     internal void TriggerPlayerUploadNow() {
-        InvokePlayerCollectorVoidMethod("TriggerManualUploadNow");
+        this.PlayerCollector.TriggerManualUploadNow();
     }
 
     internal int TriggerPlayerFullResyncUploadNow() {
-        return InvokePlayerCollectorIntMethod("TriggerManualFullResyncUploadNow");
-    }
-
-    private int ReadPlayerCollectorIntProperty(string propertyName) {
-        try {
-            var property = this.PlayerCollector.GetType().GetProperty(
-                propertyName,
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic
-            );
-            if (property?.GetValue(this.PlayerCollector) is int value) {
-                return value;
-            }
-        } catch (Exception exception) {
-            Log.Warning($"Failed to read PlayerCollector.{propertyName}: {exception.Message}");
-        }
-
-        return 0;
-    }
-
-    private bool ReadPlayerCollectorBoolProperty(string propertyName) {
-        try {
-            var property = this.PlayerCollector.GetType().GetProperty(
-                propertyName,
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic
-            );
-            if (property?.GetValue(this.PlayerCollector) is bool value) {
-                return value;
-            }
-        } catch (Exception exception) {
-            Log.Warning($"Failed to read PlayerCollector.{propertyName}: {exception.Message}");
-        }
-
-        return false;
-    }
-
-    private void InvokePlayerCollectorVoidMethod(string methodName) {
-        try {
-            var method = this.PlayerCollector.GetType().GetMethod(
-                methodName,
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic
-            );
-            if (method == null) {
-                Log.Warning($"PlayerCollector method not found: {methodName}");
-                return;
-            }
-
-            method.Invoke(this.PlayerCollector, null);
-        } catch (Exception exception) {
-            Log.Warning($"Failed to invoke PlayerCollector.{methodName}: {exception.Message}");
-        }
-    }
-
-    private int InvokePlayerCollectorIntMethod(string methodName) {
-        try {
-            var method = this.PlayerCollector.GetType().GetMethod(
-                methodName,
-                BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic
-            );
-            if (method == null) {
-                Log.Warning($"PlayerCollector method not found: {methodName}");
-                return 0;
-            }
-
-            var result = method.Invoke(this.PlayerCollector, null);
-            if (result is int value) {
-                return value;
-            }
-        } catch (Exception exception) {
-            Log.Warning($"Failed to invoke PlayerCollector.{methodName}: {exception.Message}");
-        }
-
-        return 0;
+        return this.PlayerCollector.TriggerManualFullResyncUploadNow();
     }
 
     public void DrawUI() => WindowSystem.Draw();
