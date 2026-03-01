@@ -15,6 +15,7 @@ public class ConfigWindow : Window, IDisposable
     private readonly Configuration _configuration;
     private string _uploadUrlTempString = string.Empty;
     private string _uploadUrlError = string.Empty;
+    private string _playerManualUploadStatus = string.Empty;
 
     public ConfigWindow(Plugin plugin) : base("Remote Party Finder Reborn")
     {
@@ -357,15 +358,26 @@ public class ConfigWindow : Window, IDisposable
             ImGui.SetTooltip("Enabled: only scan listings on the current page. Disabled: automatically turn pages and continue scanning until the last page.");
         }
 
+        var nextPageButtonId = _configuration.AutoDetailScanNextPageButtonId;
+        if (ImGui.InputInt("Next Page Button Id (fallback)", ref nextPageButtonId, 1, 5))
+        {
+            _configuration.AutoDetailScanNextPageButtonId = Math.Clamp(nextPageButtonId, 0, 1000);
+            _configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Optional direct-click fallback button id. Default 0 disables direct click and uses callback/replay path first.");
+        }
+
         var nextPageActionId = _configuration.AutoDetailScanNextPageActionId;
-        if (ImGui.InputInt("Next Page Action Id", ref nextPageActionId, 1, 5))
+        if (ImGui.InputInt("Capture Action Id", ref nextPageActionId, 1, 5))
         {
             _configuration.AutoDetailScanNextPageActionId = Math.Clamp(nextPageActionId, 0, 1000);
             _configuration.Save();
         }
         if (ImGui.IsItemHovered())
         {
-            ImGui.SetTooltip("ReceiveEvent first int value used to identify PF Next-page action (observed: 22).");
+            ImGui.SetTooltip("ReceiveEvent first int value used only for optional Next-page capture filtering (observed: 22).");
         }
 
         var actionInterval = _configuration.AutoDetailScanActionIntervalMs;
@@ -436,7 +448,7 @@ public class ConfigWindow : Window, IDisposable
         ImGui.TextUnformatted($"Detail Last Success UTC: {_plugin.PartyDetailCollector.LastSuccessfulUploadAtUtc:HH:mm:ss}");
         ImGui.TextUnformatted($"Detail Missing Ack Version: {_plugin.PartyDetailCollector.LastTerminalUploadAckVersion} listing={_plugin.PartyDetailCollector.LastTerminalUploadListingId}");
         ImGui.TextUnformatted($"Detail Pending Queue: {_plugin.PartyDetailCollector.PendingQueueCount}");
-        ImGui.TextUnformatted($"Next Page Capture: {(_plugin.DebugPfScanner.HasNextPageCapture ? "READY" : "MISSING")} armed={_plugin.DebugPfScanner.IsNextPageCaptureArmed}");
+        ImGui.TextUnformatted($"Next Page Button Capture (optional override): {(_plugin.DebugPfScanner.HasNextPageCapture ? "READY" : "MISSING")} armed={_plugin.DebugPfScanner.IsNextPageCaptureArmed}");
         if (_plugin.DebugPfScanner.HasNextPageCapture)
         {
             ImGui.TextUnformatted($"Captured Event: action={_plugin.DebugPfScanner.CapturedNextPageActionId} button={_plugin.DebugPfScanner.CapturedNextPageButtonId} kind={_plugin.DebugPfScanner.CapturedNextPageEventKind} values={_plugin.DebugPfScanner.CapturedNextPageValueCount} with_result={_plugin.DebugPfScanner.CapturedNextPageUsesWithResult}");
@@ -451,7 +463,7 @@ public class ConfigWindow : Window, IDisposable
         }
         if (ImGui.IsItemHovered())
         {
-            ImGui.SetTooltip("Arm capture, then manually click PF Next Page once. The scanner will replay the captured event for pagination.");
+            ImGui.SetTooltip("Optional: arm capture and click PF Next once to detect a runtime button id override. Normal scanning no longer requires this step.");
         }
 
         ImGui.SameLine();
@@ -463,6 +475,37 @@ public class ConfigWindow : Window, IDisposable
         if (ImGui.Button("Reset Scanner Session"))
         {
             _plugin.DebugPfScanner.ResetSession();
+        }
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
+        ImGui.TextColored(new Vector4(0.4f, 1.0f, 0.4f, 1.0f), "[Player Cache Manual Sync]");
+        ImGui.TextUnformatted($"Pending Player Cache Rows: {_plugin.PendingPlayerUploadCount}");
+        ImGui.TextUnformatted($"Player Upload Worker: {(_plugin.IsPlayerUploadInProgress ? "BUSY" : "IDLE")}");
+
+        if (ImGui.Button("Upload Pending Players Now"))
+        {
+            _plugin.TriggerPlayerUploadNow();
+            _playerManualUploadStatus = $"Triggered pending upload at {DateTime.UtcNow:HH:mm:ss} UTC";
+        }
+
+        ImGui.SameLine();
+        if (ImGui.Button("Requeue All Cached Players + Upload"))
+        {
+            var requeued = _plugin.TriggerPlayerFullResyncUploadNow();
+            _playerManualUploadStatus = $"Requeued {requeued} cached rows and triggered upload at {DateTime.UtcNow:HH:mm:ss} UTC";
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Marks every row in player_cache.db as dirty, then starts upload immediately.");
+        }
+
+        ImGui.TextWrapped("Chat commands: /rpr players-upload, /rpr players-resync");
+        if (!string.IsNullOrEmpty(_playerManualUploadStatus))
+        {
+            ImGui.TextWrapped(_playerManualUploadStatus);
         }
 
         ImGui.Spacing();

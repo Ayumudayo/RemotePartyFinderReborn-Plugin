@@ -161,6 +161,19 @@ WHERE content_id = @content_id;";
         }
     }
 
+    public int MarkAllPlayersDirty() {
+        lock (_sync) {
+            using var connection = OpenConnection();
+            using var command = connection.CreateCommand();
+            command.CommandText = @"
+UPDATE players
+SET dirty = 1;";
+
+            var affected = command.ExecuteNonQuery();
+            return Math.Max(affected, 0);
+        }
+    }
+
     public void Dispose() {
         _disposed = true;
     }

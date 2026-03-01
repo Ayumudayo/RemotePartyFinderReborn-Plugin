@@ -25,6 +25,9 @@ internal sealed class PlayerCollector : IDisposable {
 
     private volatile bool _uploadInProgress;
 
+    internal int PendingCount => _database.PendingCount;
+    internal bool IsUploadInProgress => _uploadInProgress;
+
     internal PlayerCollector(Plugin plugin) {
         _plugin = plugin;
         _database = new PlayerLocalDatabase(plugin);
@@ -35,6 +38,24 @@ internal sealed class PlayerCollector : IDisposable {
     public void Dispose() {
         _plugin.Framework.Update -= OnUpdate;
         _database.Dispose();
+    }
+
+    internal void TriggerManualUploadNow() {
+        if (_uploadInProgress) {
+            Plugin.Log.Warning($"PlayerCollector: Manual upload requested while upload is already in progress. Pending={_database.PendingCount}");
+            return;
+        }
+
+        _uploadInProgress = true;
+        Plugin.Log.Information($"PlayerCollector: Manual upload requested. Pending={_database.PendingCount}");
+        _ = UploadPendingBatchAsync();
+    }
+
+    internal int TriggerManualFullResyncUploadNow() {
+        var requeued = _database.MarkAllPlayersDirty();
+        Plugin.Log.Information($"PlayerCollector: Manual full player-cache resync requested. Requeued={requeued} Pending={_database.PendingCount}");
+        TriggerManualUploadNow();
+        return requeued;
     }
 
     private void OnUpdate(IFramework framework) {

@@ -5,6 +5,8 @@ VisualStudioVersion = 18.2.11415.280 d18.0
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RemotePartyFinder", "RemotePartyFinder\RemotePartyFinder.csproj", "{3B6A57E7-EC71-4E5B-87F0-A110078F125D}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ECommons", "ECommons\ECommons\ECommons.csproj", "{D3D89A2C-0E7D-4FC4-8F68-A8DAE7BC7D8F}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -15,6 +17,10 @@ Global
 		{3B6A57E7-EC71-4E5B-87F0-A110078F125D}.Debug|x64.Build.0 = Debug|x64
 		{3B6A57E7-EC71-4E5B-87F0-A110078F125D}.Release|x64.ActiveCfg = Release|x64
 		{3B6A57E7-EC71-4E5B-87F0-A110078F125D}.Release|x64.Build.0 = Release|x64
+		{D3D89A2C-0E7D-4FC4-8F68-A8DAE7BC7D8F}.Debug|x64.ActiveCfg = Debug|x64
+		{D3D89A2C-0E7D-4FC4-8F68-A8DAE7BC7D8F}.Debug|x64.Build.0 = Debug|x64
+		{D3D89A2C-0E7D-4FC4-8F68-A8DAE7BC7D8F}.Release|x64.ActiveCfg = Release|x64
+		{D3D89A2C-0E7D-4FC4-8F68-A8DAE7BC7D8F}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

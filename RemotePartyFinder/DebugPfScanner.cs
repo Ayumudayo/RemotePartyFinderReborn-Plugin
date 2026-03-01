@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Text;
+using ECommons.Automation.UIInput;
 using Dalamud.Game.Addon.Lifecycle;
 using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
 using Dalamud.Game.Agent;
@@ -22,6 +23,12 @@ internal sealed class DebugPfScanner : IDisposable {
     private const int MaxCapturedAtkValues = 16;
     private static readonly TimeSpan CaptureArmTimeout = TimeSpan.FromSeconds(20);
     private static readonly TimeSpan CaptureEventParamWindow = TimeSpan.FromSeconds(3);
+    private static readonly AtkEventType[] NextButtonResolveEventTypes = {
+        AtkEventType.ButtonClick,
+        AtkEventType.MouseClick,
+        AtkEventType.ButtonPress,
+        AtkEventType.ButtonRelease,
+    };
 
     private readonly Plugin _plugin;
     private readonly PartyDetailCollector _detailCollector;
@@ -38,7 +45,6 @@ internal sealed class DebugPfScanner : IDisposable {
     private bool _retryTargetAfterCooldown;
     private int _openAttemptsForTarget;
     private int _pageAdvanceNotReadyCount;
-    private int _pageReloadRefreshAttempts;
     private DateTime _noReadySinceUtc = DateTime.MinValue;
     private int _consecutiveFailures;
     private int _processedCount;
@@ -46,6 +52,8 @@ internal sealed class DebugPfScanner : IDisposable {
     private DateTime _nextRefreshAtUtc = DateTime.MinValue;
     private DateTime _stateDeadlineUtc = DateTime.MinValue;
     private ulong _pageReloadBaselineHash;
+    private bool _pageReloadRefreshRequested;
+    private bool _nextPagePreflightRequested;
     private long _waitForQueueAckVersion = -1;
     private long _waitForAckVersion = -1;
     private long _waitForTerminalAckVersion = -1;
@@ -68,6 +76,9 @@ internal sealed class DebugPfScanner : IDisposable {
     private DateTime _recentAddonEventAtUtc = DateTime.MinValue;
     private int _recentAddonButtonEventParam = -1;
     private DateTime _recentAddonButtonEventAtUtc = DateTime.MinValue;
+    private DateTime _autoHydrateNextPageButtonIdUntilUtc = DateTime.MinValue;
+    private DateTime _autoCaptureNextPageEventUntilUtc = DateTime.MinValue;
+    private DateTime _nextButtonResolveAtUtc = DateTime.MinValue;
 
     internal DebugPfScanner(Plugin plugin, PartyDetailCollector detailCollector, Gatherer gatherer) {
         _plugin = plugin;
@@ -122,7 +133,6 @@ internal sealed class DebugPfScanner : IDisposable {
         _retryTargetAfterCooldown = false;
         _openAttemptsForTarget = 0;
         _pageAdvanceNotReadyCount = 0;
-        _pageReloadRefreshAttempts = 0;
         _noReadySinceUtc = DateTime.MinValue;
         _consecutiveFailures = 0;
         _processedCount = 0;
@@ -130,6 +140,8 @@ internal sealed class DebugPfScanner : IDisposable {
         _nextRefreshAtUtc = DateTime.MinValue;
         _stateDeadlineUtc = DateTime.MinValue;
         _pageReloadBaselineHash = 0;
+        _pageReloadRefreshRequested = false;
+        _nextPagePreflightRequested = false;
         _waitForQueueAckVersion = -1;
         _waitForAckVersion = -1;
         _waitForTerminalAckVersion = -1;
@@ -145,6 +157,9 @@ internal sealed class DebugPfScanner : IDisposable {
         _recentAddonEventAtUtc = DateTime.MinValue;
         _recentAddonButtonEventParam = -1;
         _recentAddonButtonEventAtUtc = DateTime.MinValue;
+        _autoHydrateNextPageButtonIdUntilUtc = DateTime.MinValue;
+        _autoCaptureNextPageEventUntilUtc = DateTime.MinValue;
+        _nextButtonResolveAtUtc = DateTime.MinValue;
     }
 
     internal void ArmNextPageCapture() {
@@ -169,6 +184,9 @@ internal sealed class DebugPfScanner : IDisposable {
         _recentAddonEventAtUtc = DateTime.MinValue;
         _recentAddonButtonEventParam = -1;
         _recentAddonButtonEventAtUtc = DateTime.MinValue;
+        _autoHydrateNextPageButtonIdUntilUtc = DateTime.MinValue;
+        _autoCaptureNextPageEventUntilUtc = DateTime.MinValue;
+        _nextButtonResolveAtUtc = DateTime.MinValue;
         Plugin.Log.Debug("DebugPfScanner: cleared captured next-page event");
     }
 
@@ -185,40 +203,55 @@ internal sealed class DebugPfScanner : IDisposable {
         ));
     }
 
-    private void OnLookingForGroupAddonReceiveEvent(AddonEvent eventType, AddonArgs args) {
+    private unsafe void OnLookingForGroupAddonReceiveEvent(AddonEvent eventType, AddonArgs args) {
         if (args is not AddonReceiveEventArgs receiveEventArgs) {
             return;
         }
 
-        _lastObservedAddonReceiveEvent = $"atk_type={receiveEventArgs.AtkEventType} event_param={receiveEventArgs.EventParam}";
-
-        if (_isReplayingNextPageEvent) {
-            return;
-        }
-
-        var eventParam = receiveEventArgs.EventParam;
-        if (eventParam <= 0 || eventParam > 1000) {
-            return;
-        }
-
         var now = DateTime.UtcNow;
-        _recentAddonEventParam = eventParam;
-        _recentAddonEventAtUtc = now;
+        var eventParam = receiveEventArgs.EventParam;
+        var hasButtonNodeId = TryExtractButtonNodeIdFromAddonReceiveEvent(receiveEventArgs, out var buttonNodeId, out var addonEventDetail);
+        _lastObservedAddonReceiveEvent = $"atk_type={receiveEventArgs.AtkEventType} event_param={eventParam} {addonEventDetail}";
+
+        var allowReplayAddonSampling = _isReplayingNextPageEvent && now <= _autoHydrateNextPageButtonIdUntilUtc;
+        if (_isReplayingNextPageEvent && !allowReplayAddonSampling) {
+            return;
+        }
+
+        if (eventParam > 0 && eventParam <= 1000) {
+            _recentAddonEventParam = eventParam;
+            _recentAddonEventAtUtc = now;
+        }
 
         var atkEventType = (int)receiveEventArgs.AtkEventType;
         if (atkEventType is (int)AtkEventType.ButtonClick
             or (int)AtkEventType.MouseClick
             or (int)AtkEventType.ButtonPress
             or (int)AtkEventType.ButtonRelease) {
-            _recentAddonButtonEventParam = eventParam;
-            _recentAddonButtonEventAtUtc = now;
+            if (hasButtonNodeId && buttonNodeId > 0) {
+                _recentAddonButtonEventParam = buttonNodeId;
+                _recentAddonButtonEventAtUtc = now;
+            }
+
+            if (_capturedNextPageButtonId <= 0
+                && _plugin.Configuration.AutoDetailScanNextPageButtonId <= 0
+                && now <= _autoHydrateNextPageButtonIdUntilUtc) {
+                var hydratedButtonId = ResolveCapturedNextPageButtonId();
+                if (hydratedButtonId > 0) {
+                    _capturedNextPageButtonId = hydratedButtonId;
+                    _autoHydrateNextPageButtonIdUntilUtc = DateTime.MinValue;
+                    Plugin.Log.Debug($"DebugPfScanner: auto-hydrated next-page button id={hydratedButtonId} from callback-triggered addon button event.");
+                }
+            }
         }
 
         TryHydrateCapturedNextPageButtonId(now);
     }
 
     private unsafe void OnLookingForGroupReceiveEvent(AgentEvent eventType, AgentArgs args) {
-        if (!_captureNextPageEventArmed || _isReplayingNextPageEvent) {
+        var now = DateTime.UtcNow;
+        var allowReplayCapture = _isReplayingNextPageEvent && now <= _autoCaptureNextPageEventUntilUtc;
+        if (_isReplayingNextPageEvent && !allowReplayCapture) {
             return;
         }
 
@@ -237,34 +270,142 @@ internal sealed class DebugPfScanner : IDisposable {
         var valuesPtr = (AtkValue*)receiveEventArgs.AtkValues;
         _lastObservedReceiveEvent = $"kind={receiveEventArgs.EventKind} values={receiveEventArgs.ValueCount} [{DescribeValues(valuesPtr, receiveEventArgs.ValueCount)}]";
 
+        var autoCaptureArmed = now <= _autoCaptureNextPageEventUntilUtc;
+        if (!_captureNextPageEventArmed && !autoCaptureArmed) {
+            return;
+        }
+
         if (!TryReadPrimaryActionId(valuesPtr, receiveEventArgs.ValueCount, out var actionId)) {
-            Plugin.Log.Debug($"DebugPfScanner: skipped next-page capture event kind={receiveEventArgs.EventKind} reason=no_primary_action");
+            if (_captureNextPageEventArmed) {
+                Plugin.Log.Debug($"DebugPfScanner: skipped next-page capture event kind={receiveEventArgs.EventKind} reason=no_primary_action");
+            }
             return;
         }
 
         var expectedActionId = Math.Clamp(_plugin.Configuration.AutoDetailScanNextPageActionId, 0, 1000);
         if (actionId != expectedActionId) {
-            Plugin.Log.Debug($"DebugPfScanner: ignored capture event action={actionId} expected={expectedActionId} kind={receiveEventArgs.EventKind}");
+            if (_captureNextPageEventArmed) {
+                Plugin.Log.Debug($"DebugPfScanner: ignored capture event action={actionId} expected={expectedActionId} kind={receiveEventArgs.EventKind}");
+            }
             return;
         }
 
         if (!TryCopyCaptureValues(valuesPtr, receiveEventArgs.ValueCount, out var values, out var reason)) {
-            Plugin.Log.Debug($"DebugPfScanner: skipped next-page capture event kind={receiveEventArgs.EventKind} reason={reason}");
+            if (_captureNextPageEventArmed) {
+                Plugin.Log.Debug($"DebugPfScanner: skipped next-page capture event kind={receiveEventArgs.EventKind} reason={reason}");
+            }
             return;
         }
 
         var usesWithResult = eventType == AgentEvent.PostReceiveEventWithResult;
-        _capturedNextPageEventAtUtc = DateTime.UtcNow;
+        _capturedNextPageEventAtUtc = now;
         var capturedButtonId = ResolveCapturedNextPageButtonId();
-        _capturedNextPageEvent = new CapturedReceiveEvent(receiveEventArgs.EventKind, usesWithResult, values);
-        _capturedNextPageButtonId = capturedButtonId;
-        _captureNextPageEventArmed = false;
-        _captureArmedAtUtc = DateTime.MinValue;
-        if (capturedButtonId > 0) {
-            Plugin.Log.Debug($"DebugPfScanner: captured next-page event action={actionId} button_id={capturedButtonId} kind={receiveEventArgs.EventKind} with_result={usesWithResult} value_count={values.Length} values=[{DescribeValues(values)}]");
-        } else {
-            Plugin.Log.Debug($"DebugPfScanner: captured next-page event action={actionId} button_id=unknown kind={receiveEventArgs.EventKind} with_result={usesWithResult} value_count={values.Length} values=[{DescribeValues(values)}]; waiting for addon event-param hydration.");
+        if (capturedButtonId <= 0) {
+            _ = TryInferCapturedNextPageButtonId(values, out capturedButtonId);
         }
+
+        _capturedNextPageEvent = new CapturedReceiveEvent(receiveEventArgs.EventKind, usesWithResult, values);
+        if (capturedButtonId > 0) {
+            _capturedNextPageButtonId = capturedButtonId;
+        }
+
+        if (_captureNextPageEventArmed) {
+            _captureNextPageEventArmed = false;
+            _captureArmedAtUtc = DateTime.MinValue;
+        }
+
+        if (autoCaptureArmed) {
+            _autoCaptureNextPageEventUntilUtc = DateTime.MinValue;
+        }
+
+        if (capturedButtonId > 0) {
+            Plugin.Log.Debug($"DebugPfScanner: captured next-page event action={actionId} button_id={capturedButtonId} kind={receiveEventArgs.EventKind} with_result={usesWithResult} auto={autoCaptureArmed} value_count={values.Length} values=[{DescribeValues(values)}]");
+        } else {
+            Plugin.Log.Debug($"DebugPfScanner: captured next-page event action={actionId} button_id=unknown kind={receiveEventArgs.EventKind} with_result={usesWithResult} auto={autoCaptureArmed} value_count={values.Length} values=[{DescribeValues(values)}]; waiting for addon event hydration.");
+        }
+    }
+
+    private unsafe bool TryExtractButtonNodeIdFromAddonReceiveEvent(AddonReceiveEventArgs receiveEventArgs, out int buttonNodeId, out string detail) {
+        buttonNodeId = -1;
+        detail = "node=none";
+
+        if (receiveEventArgs.AtkEvent == 0) {
+            return false;
+        }
+
+        var atkEvent = (AtkEvent*)receiveEventArgs.AtkEvent;
+        if (atkEvent == null || atkEvent->Node == null) {
+            detail = "node=null";
+            return false;
+        }
+
+        var node = atkEvent->Node;
+        var nodeId = (int)node->NodeId;
+        var nodeType = node->Type;
+        detail = $"node_id={nodeId} node_type={nodeType}";
+        if (nodeId <= 0 || nodeType != NodeType.Component) {
+            return false;
+        }
+
+        var componentNode = node->GetAsAtkComponentNode();
+        if (componentNode == null || componentNode->Component == null) {
+            detail += " component=none";
+            return false;
+        }
+
+        var componentType = componentNode->Component->GetComponentType();
+        detail += $" component_type={componentType}";
+        if (componentType is ComponentType.Button
+            or ComponentType.CheckBox
+            or ComponentType.RadioButton
+            or ComponentType.HoldButton) {
+            buttonNodeId = nodeId;
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool TryInferCapturedNextPageButtonId(CapturedAtkValue[] values, out int buttonId) {
+        buttonId = -1;
+        var candidates = new HashSet<int>();
+        var expectedActionId = Math.Clamp(_plugin.Configuration.AutoDetailScanNextPageActionId, 0, 1000);
+
+        for (var index = 1; index < values.Length; index++) {
+            if (!TryConvertToActionId(values[index].Type, values[index].Raw, out var candidate)) {
+                continue;
+            }
+
+            if (candidate <= 0 || candidate > 1000) {
+                continue;
+            }
+
+            if (candidate == expectedActionId) {
+                continue;
+            }
+
+            if (!TryReadLookingForGroupButtonEnabled((uint)candidate, out _)) {
+                continue;
+            }
+
+            candidates.Add(candidate);
+        }
+
+        if (candidates.Count == 0) {
+            return false;
+        }
+
+        if (candidates.Count == 1) {
+            buttonId = candidates.First();
+            return true;
+        }
+
+        if (_recentAddonButtonEventParam > 0 && candidates.Contains(_recentAddonButtonEventParam)) {
+            buttonId = _recentAddonButtonEventParam;
+            return true;
+        }
+
+        return false;
     }
 
     private void OnUpdate(IFramework framework) {
@@ -428,7 +569,7 @@ internal sealed class DebugPfScanner : IDisposable {
             _noMorePagesDetected = true;
 
             if (_detailCollector.PendingQueueCount == 0) {
-                CompleteRun("pending_drained");
+                CompleteRun("no_more_pages");
                 return;
             }
 
@@ -609,6 +750,24 @@ internal sealed class DebugPfScanner : IDisposable {
         DrainIncoming();
         PruneCaches();
 
+        var configuredFallbackButtonId = (uint)Math.Clamp(_plugin.Configuration.AutoDetailScanNextPageButtonId, 0, 1000);
+        var resolvedButtonId = ResolveNextPageButtonId(configuredFallbackButtonId);
+        if (resolvedButtonId > 0
+            && TryReadLookingForGroupButtonEnabled(resolvedButtonId, out var nextButtonEnabled)
+            && !nextButtonEnabled) {
+            _noMorePagesDetected = true;
+            Plugin.Log.Debug($"DebugPfScanner: detected last page while waiting for reload (button_id={resolvedButtonId}, baseline_hash=0x{_pageReloadBaselineHash:X16}).");
+
+            if (_detailCollector.PendingQueueCount == 0) {
+                CompleteRun("no_more_pages_button_disabled");
+                return;
+            }
+
+            _nextActionAtUtc = DateTime.UtcNow.AddMilliseconds(250);
+            _state = ScanState.Cooldown;
+            return;
+        }
+
         if (HasConfirmedPageReload()) {
             _state = ScanState.SyncQueue;
             return;
@@ -618,21 +777,59 @@ internal sealed class DebugPfScanner : IDisposable {
             return;
         }
 
-        if (_pageReloadRefreshAttempts < 1) {
-            _pageReloadRefreshAttempts++;
-            _stateDeadlineUtc = DateTime.UtcNow.AddMilliseconds(GetPageReloadTimeoutMs());
+        if (!TryReadListingIdsHash(out var currentHash, out var nonZeroCount)) {
+            _noMorePagesDetected = true;
+            Plugin.Log.Debug($"DebugPfScanner: failed to read listings after next-page invoke (baseline_hash=0x{_pageReloadBaselineHash:X16}); treating as no more pages.");
+
+            if (_detailCollector.PendingQueueCount == 0) {
+                CompleteRun("no_more_pages_reload_unreadable");
+                return;
+            }
+
+            _nextActionAtUtc = DateTime.UtcNow.AddMilliseconds(250);
+            _state = ScanState.Cooldown;
             return;
         }
 
-        _noMorePagesDetected = true;
+        if (currentHash == _pageReloadBaselineHash) {
+            _noMorePagesDetected = true;
+            Plugin.Log.Debug($"DebugPfScanner: page did not change after next-page invoke (baseline_hash=0x{_pageReloadBaselineHash:X16}, non_zero={nonZeroCount}); treating as no more pages.");
 
-        if (_detailCollector.PendingQueueCount == 0) {
-            CompleteRun("page_reload_timeout");
+            if (_detailCollector.PendingQueueCount == 0) {
+                CompleteRun("no_more_pages_hash_unchanged");
+                return;
+            }
+
+            _nextActionAtUtc = DateTime.UtcNow.AddMilliseconds(250);
+            _state = ScanState.Cooldown;
             return;
         }
 
-        _nextActionAtUtc = DateTime.UtcNow.AddMilliseconds(250);
-        _state = ScanState.Cooldown;
+        if (_latestVisible.Count == 0 && _incoming.IsEmpty) {
+            if (!_pageReloadRefreshRequested) {
+                _pageReloadRefreshRequested = true;
+                TryRequestListingsUpdate(force: true);
+                _stateDeadlineUtc = DateTime.UtcNow.AddMilliseconds(GetPageReloadTimeoutMs());
+                Plugin.Log.Debug($"DebugPfScanner: listing hash changed but no ReceiveListing updates arrived after next-page invoke; requested forced listings refresh (baseline_hash=0x{_pageReloadBaselineHash:X16}, current_hash=0x{currentHash:X16}, non_zero={nonZeroCount}).");
+                return;
+            }
+
+            _noMorePagesDetected = true;
+            Plugin.Log.Debug($"DebugPfScanner: listing hash changed but no ReceiveListing updates arrived after forced listings refresh (baseline_hash=0x{_pageReloadBaselineHash:X16}, current_hash=0x{currentHash:X16}, non_zero={nonZeroCount}); treating as no more pages.");
+
+            if (_detailCollector.PendingQueueCount == 0) {
+                CompleteRun("no_more_pages_no_receive_listing");
+                return;
+            }
+
+            _nextActionAtUtc = DateTime.UtcNow.AddMilliseconds(250);
+            _state = ScanState.Cooldown;
+            return;
+        }
+
+        Plugin.Log.Debug($"DebugPfScanner: listing hash changed after next-page invoke (baseline_hash=0x{_pageReloadBaselineHash:X16}, current_hash=0x{currentHash:X16}, non_zero={nonZeroCount}); resuming sync queue.");
+        _pageReloadRefreshRequested = false;
+        _state = ScanState.SyncQueue;
     }
 
     private void MarkAttempt(bool success, string reason) {
@@ -655,8 +852,9 @@ internal sealed class DebugPfScanner : IDisposable {
         _hasTarget = false;
         _retryTargetAfterCooldown = false;
         _openAttemptsForTarget = 0;
-        _pageReloadRefreshAttempts = 0;
         _pageReloadBaselineHash = 0;
+        _pageReloadRefreshRequested = false;
+        _nextPagePreflightRequested = false;
         _noReadySinceUtc = DateTime.MinValue;
         _waitForQueueAckVersion = -1;
         _waitForAckVersion = -1;
@@ -674,6 +872,7 @@ internal sealed class DebugPfScanner : IDisposable {
         _hasTarget = false;
         _retryTargetAfterCooldown = false;
         _openAttemptsForTarget = 0;
+        _nextPagePreflightRequested = false;
     }
 
     private void CompleteRun(string reason) {
@@ -769,31 +968,79 @@ internal sealed class DebugPfScanner : IDisposable {
             return PageAdvanceResult.NotReady;
         }
 
-        if (_capturedNextPageEvent.HasValue) {
-            var buttonId = _capturedNextPageButtonId;
-            if (buttonId <= 0) {
-                Plugin.Log.Debug("DebugPfScanner: captured next-page event has no button id; re-arm capture and click Next page manually.");
-                return PageAdvanceResult.NotReady;
-            }
-
-            if (!TryReadLookingForGroupButtonEnabled((uint)buttonId, out var buttonEnabled)) {
-                Plugin.Log.Debug($"DebugPfScanner: failed to read next-page button state (button_id={buttonId}); re-arm capture and click Next page manually.");
+        var configuredFallbackButtonId = (uint)Math.Clamp(_plugin.Configuration.AutoDetailScanNextPageButtonId, 0, 1000);
+        var buttonId = ResolveNextPageButtonId(configuredFallbackButtonId);
+        if (buttonId > 0) {
+            if (!TryReadLookingForGroupButtonEnabled(buttonId, out var buttonEnabled)) {
+                Plugin.Log.Debug($"DebugPfScanner: failed to read next-page button state (button_id={buttonId}).");
                 return PageAdvanceResult.NotReady;
             }
 
             if (!buttonEnabled) {
+                _nextPagePreflightRequested = false;
                 Plugin.Log.Debug($"DebugPfScanner: next-page button disabled (button_id={buttonId}); treating as last page.");
                 return PageAdvanceResult.NoMorePages;
             }
+
+            if (!_nextPagePreflightRequested) {
+                _nextPagePreflightRequested = true;
+                TryRequestListingsUpdate(force: true);
+                Plugin.Log.Debug($"DebugPfScanner: requested preflight listings refresh before next-page invoke (button_id={buttonId}).");
+                return PageAdvanceResult.NotReady;
+            }
+        } else {
+            _nextPagePreflightRequested = false;
         }
 
-        if (!TryReplayNextPageEvent()) {
-            Plugin.Log.Debug("DebugPfScanner: no replayable next-page event captured; arm capture and click Next page manually once.");
+        var actionId = Math.Clamp(_plugin.Configuration.AutoDetailScanNextPageActionId, 0, 1000);
+        if (_capturedNextPageEvent.HasValue) {
+            var replayResult = TryReplayNextPageEvent();
+            if (replayResult == PageInvokeResult.Advanced) {
+                Plugin.Log.Debug("DebugPfScanner: advanced using captured next-page event replay.");
+                goto page_advanced;
+            }
+        }
+
+        if (actionId > 0) {
+            var agentResult = TrySendNextPageAgentEvent(actionId, buttonId <= 0);
+            if (agentResult == PageInvokeResult.Advanced) {
+                Plugin.Log.Debug($"DebugPfScanner: advanced using next-page agent event action={actionId}.");
+                goto page_advanced;
+            }
+        }
+
+        if (buttonId <= 0) {
+            Plugin.Log.Debug($"DebugPfScanner: failed to advance page (capture={_capturedNextPageEvent.HasValue} action_id={actionId} button_id={buttonId}); disabled-state check unavailable until button id is known.");
             return PageAdvanceResult.NotReady;
         }
 
+        if (configuredFallbackButtonId == 0 || buttonId != configuredFallbackButtonId) {
+            Plugin.Log.Debug($"DebugPfScanner: skipped next-page button click fallback (resolved_button_id={buttonId} configured_fallback_button_id={configuredFallbackButtonId}); agent/replay path only.");
+            return PageAdvanceResult.NotReady;
+        }
+
+        if (!TryReadLookingForGroupButtonEnabled(buttonId, out var clickButtonEnabled)) {
+            Plugin.Log.Debug($"DebugPfScanner: failed to re-check next-page button before fallback click (button_id={buttonId}).");
+            return PageAdvanceResult.NotReady;
+        }
+
+        if (!clickButtonEnabled) {
+            _nextPagePreflightRequested = false;
+            Plugin.Log.Debug($"DebugPfScanner: next-page button disabled before fallback click (button_id={buttonId}); treating as last page.");
+            return PageAdvanceResult.NoMorePages;
+        }
+
+        if (TryClickLookingForGroupButton(buttonId)) {
+            Plugin.Log.Debug($"DebugPfScanner: advanced using next-page button click (button_id={buttonId}).");
+        } else {
+            Plugin.Log.Debug($"DebugPfScanner: failed to advance page with fallback button click (button_id={buttonId}).");
+            return PageAdvanceResult.NotReady;
+        }
+
+    page_advanced:
         _pageReloadBaselineHash = baselineHash;
-        _pageReloadRefreshAttempts = 0;
+        _pageReloadRefreshRequested = false;
+        _nextPagePreflightRequested = false;
 
         _incoming.Clear();
         _latestVisible.Clear();
@@ -803,19 +1050,225 @@ internal sealed class DebugPfScanner : IDisposable {
         return PageAdvanceResult.Advanced;
     }
 
-    private unsafe bool TryReplayNextPageEvent() {
-        if (!_capturedNextPageEvent.HasValue) {
+    private uint ResolveNextPageButtonId(uint configuredButtonId) {
+        if (configuredButtonId > 0) {
+            return configuredButtonId;
+        }
+
+        if (_capturedNextPageButtonId > 0) {
+            return (uint)_capturedNextPageButtonId;
+        }
+
+        var now = DateTime.UtcNow;
+        if (now < _nextButtonResolveAtUtc) {
+            return 0;
+        }
+
+        _nextButtonResolveAtUtc = now.AddMilliseconds(500);
+        var actionId = Math.Clamp(_plugin.Configuration.AutoDetailScanNextPageActionId, 0, 1000);
+        if (actionId <= 0) {
+            return 0;
+        }
+
+        if (!TryResolveNextPageButtonIdFromAddonEvents(actionId, out var resolvedButtonId, out var resolveDetails)) {
+            return 0;
+        }
+
+        _capturedNextPageButtonId = (int)resolvedButtonId;
+        _nextButtonResolveAtUtc = DateTime.MinValue;
+        Plugin.Log.Debug($"DebugPfScanner: resolved next-page button id={resolvedButtonId} via node event mapping action={actionId} ({resolveDetails}).");
+        return resolvedButtonId;
+    }
+
+    private unsafe bool TryResolveNextPageButtonIdFromAddonEvents(int actionId, out uint buttonId, out string resolveDetails) {
+        buttonId = 0;
+        resolveDetails = "no_candidates";
+
+        var addon = _plugin.GameGui.GetAddonByName("LookingForGroup", 1);
+        if (addon.IsNull || !addon.IsVisible || !addon.IsReady) {
+            resolveDetails = "addon_not_ready";
             return false;
+        }
+
+        var addonPtr = (AtkUnitBase*)addon.Address;
+        if (addonPtr->UldManager.NodeList == null || addonPtr->UldManager.NodeListCount == 0) {
+            resolveDetails = "node_list_empty";
+            return false;
+        }
+
+        var candidates = new List<uint>(4);
+        var candidateLog = new StringBuilder();
+        for (var index = 0; index < addonPtr->UldManager.NodeListCount; index++) {
+            var node = addonPtr->UldManager.NodeList[index];
+            if (node == null) {
+                continue;
+            }
+
+            if (!TryGetNodeActionEventParam(node, (uint)actionId, out var matchedEventType)) {
+                continue;
+            }
+
+            var nodeId = node->NodeId;
+            if (nodeId == 0) {
+                continue;
+            }
+
+            var button = addonPtr->GetComponentButtonById(nodeId);
+            if (button == null) {
+                continue;
+            }
+
+            candidates.Add(nodeId);
+            if (candidateLog.Length > 0) {
+                candidateLog.Append("; ");
+            }
+
+            candidateLog.Append($"id={nodeId} enabled={button->IsEnabled} evt={matchedEventType} x={node->ScreenX:0.#} y={node->ScreenY:0.#}");
+        }
+
+        if (candidates.Count == 0) {
+            return false;
+        }
+
+        if (candidates.Count == 1) {
+            buttonId = candidates[0];
+            resolveDetails = candidateLog.ToString();
+            return true;
+        }
+
+        buttonId = SelectLikelyNextButtonId(addonPtr, candidates);
+        resolveDetails = $"{candidateLog}; selected={buttonId}";
+        return true;
+    }
+
+    private static unsafe bool TryGetNodeActionEventParam(AtkResNode* node, uint actionId, out AtkEventType matchedEventType) {
+        matchedEventType = 0;
+        foreach (var eventType in NextButtonResolveEventTypes) {
+            if (!node->IsEventRegistered(eventType)) {
+                continue;
+            }
+
+            if (node->GetEventParam(eventType) != actionId) {
+                continue;
+            }
+
+            matchedEventType = eventType;
+            return true;
+        }
+
+        foreach (var eventType in Enum.GetValues<AtkEventType>()) {
+            if (NextButtonResolveEventTypes.Contains(eventType)) {
+                continue;
+            }
+
+            if (!node->IsEventRegistered(eventType)) {
+                continue;
+            }
+
+            if (node->GetEventParam(eventType) != actionId) {
+                continue;
+            }
+
+            matchedEventType = eventType;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static unsafe uint SelectLikelyNextButtonId(AtkUnitBase* addon, List<uint> candidates) {
+        var selectedId = candidates[0];
+        var bestX = float.MinValue;
+        var bestY = float.MinValue;
+
+        foreach (var candidate in candidates) {
+            var button = addon->GetComponentButtonById(candidate);
+            if (button == null || button->OwnerNode == null) {
+                continue;
+            }
+
+            var node = button->OwnerNode;
+            var x = node->ScreenX;
+            var y = node->ScreenY;
+            if (x > bestX || (Math.Abs(x - bestX) < 0.001f && y > bestY)) {
+                bestX = x;
+                bestY = y;
+                selectedId = candidate;
+            }
+        }
+
+        return selectedId;
+    }
+
+    private unsafe PageInvokeResult TrySendNextPageAgentEvent(int actionId, bool armButtonIdHydration) {
+        if (actionId <= 0) {
+            return PageInvokeResult.Failed;
         }
 
         var agent = AgentLookingForGroup.Instance();
         if (agent == null) {
+            return PageInvokeResult.Failed;
+        }
+
+        var values = stackalloc AtkValue[1];
+        values[0].Type = AtkValueType.Int;
+        values[0].Int = actionId;
+
+        var returnValue = new AtkValue();
+        _isReplayingNextPageEvent = true;
+        try {
+            if (armButtonIdHydration) {
+                var autoHydrateUntilUtc = DateTime.UtcNow.Add(CaptureEventParamWindow);
+                _autoHydrateNextPageButtonIdUntilUtc = autoHydrateUntilUtc;
+                _autoCaptureNextPageEventUntilUtc = autoHydrateUntilUtc;
+            }
+
+            agent->ReceiveEvent(&returnValue, values, 1, 1);
+            Plugin.Log.Debug($"DebugPfScanner: sent next-page agent event action={actionId} eventKind=1");
+            return PageInvokeResult.Advanced;
+        } catch (Exception ex) {
+            Plugin.Log.Error($"DebugPfScanner: next-page agent event failed (action_id={actionId}): {ex.Message}");
+            return PageInvokeResult.Failed;
+        } finally {
+            _isReplayingNextPageEvent = false;
+            returnValue.ReleaseManagedMemory();
+        }
+    }
+
+    private unsafe bool TryClickLookingForGroupButton(uint buttonId) {
+        var addon = _plugin.GameGui.GetAddonByName("LookingForGroup", 1);
+        if (addon.IsNull || !addon.IsVisible || !addon.IsReady) {
             return false;
+        }
+
+        var addonPtr = (AtkUnitBase*)addon.Address;
+        var button = addonPtr->GetComponentButtonById(buttonId);
+        if (button == null) {
+            return false;
+        }
+
+        try {
+            (*button).ClickAddonButton(addonPtr);
+            return true;
+        } catch (Exception ex) {
+            Plugin.Log.Error($"DebugPfScanner: click next-page button failed: {ex.Message}");
+            return false;
+        }
+    }
+
+    private unsafe PageInvokeResult TryReplayNextPageEvent() {
+        if (!_capturedNextPageEvent.HasValue) {
+            return PageInvokeResult.Failed;
+        }
+
+        var agent = AgentLookingForGroup.Instance();
+        if (agent == null) {
+            return PageInvokeResult.Failed;
         }
 
         var capture = _capturedNextPageEvent.Value;
         if (capture.Values.Length == 0) {
-            return false;
+            return PageInvokeResult.Failed;
         }
 
         var replayValues = stackalloc AtkValue[capture.Values.Length];
@@ -833,11 +1286,11 @@ internal sealed class DebugPfScanner : IDisposable {
                 agent->ReceiveEvent(&returnValue, replayValues, (uint)capture.Values.Length, capture.EventKind);
             }
 
-            Plugin.Log.Debug($"DebugPfScanner: replayed next-page event kind={capture.EventKind} with_result={capture.UsesWithResult} values={capture.Values.Length}");
-            return true;
+            Plugin.Log.Debug($"DebugPfScanner: replayed next-page event kind={capture.EventKind} with_result={capture.UsesWithResult} values={capture.Values.Length} return={DescribeValue(returnValue.Type, returnValue.UInt64)}");
+            return PageInvokeResult.Advanced;
         } catch (Exception ex) {
             Plugin.Log.Error($"DebugPfScanner: failed to replay next-page event: {ex.Message}");
-            return false;
+            return PageInvokeResult.Failed;
         } finally {
             _isReplayingNextPageEvent = false;
             returnValue.ReleaseManagedMemory();
@@ -909,11 +1362,6 @@ internal sealed class DebugPfScanner : IDisposable {
         if (_recentAddonButtonEventParam > 0
             && DateTime.UtcNow - _recentAddonButtonEventAtUtc <= CaptureEventParamWindow) {
             return _recentAddonButtonEventParam;
-        }
-
-        if (_recentAddonEventParam > 0
-            && DateTime.UtcNow - _recentAddonEventAtUtc <= CaptureEventParamWindow) {
-            return _recentAddonEventParam;
         }
 
         return -1;
@@ -1178,5 +1626,10 @@ internal sealed class DebugPfScanner : IDisposable {
         Advanced,
         NoMorePages,
         NotReady,
+    }
+
+    private enum PageInvokeResult {
+        Advanced,
+        Failed,
     }
 }
