@@ -17,6 +17,7 @@ public class FFLogsCollector : IDisposable
     private Dictionary<string, ParseResult> PendingSubmitResults { get; } = new();
     private bool IsRunning { get; set; }
     private System.Threading.CancellationTokenSource Cts { get; set; } = new();
+    private DateTime _lastCooldownSkipLogUtc = DateTime.MinValue;
 
     public FFLogsCollector(Plugin plugin)
     {
@@ -67,7 +68,7 @@ public class FFLogsCollector : IDisposable
         {
             if (!enc.HasValue || enc.Value == 0) return;
             var hit = data.Parses.FirstOrDefault(p => p.EncounterId == (int)enc.Value);
-            if (hit.EncounterId == 0) return;
+            if (hit == null) return;
             // Strong signal: this exact encounter has logs.
             score += 100_000 + (long)Math.Round(hit.Percentile * 100.0);
         }
@@ -114,12 +115,59 @@ public class FFLogsCollector : IDisposable
     private static string ParseResultKey(ParseResult result)
         => $"{result.ContentId}:{result.ZoneId}:{result.DifficultyId}:{result.Partition}";
 
-    private List<ParseResult> BuildSubmitBatch(List<ParseResult> freshResults)
+    private static string ParseJobKey(ParseJob job)
+        => $"{job.ContentId}:{job.ZoneId}:{job.DifficultyId}:{job.Partition}";
+
+    private static List<AbandonFflogsLease> BuildAbandonLeaseBatch(
+        IEnumerable<ParseJob> leasedJobs,
+        IEnumerable<ParseResult> processedResults,
+        string reason)
+    {
+        var processedKeys = new HashSet<string>(
+            processedResults.Select(ParseResultKey),
+            StringComparer.Ordinal);
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var batch = new List<AbandonFflogsLease>();
+
+        foreach (var job in leasedJobs)
+        {
+            if (string.IsNullOrWhiteSpace(job.LeaseToken))
+            {
+                continue;
+            }
+
+            var key = ParseJobKey(job);
+            if (processedKeys.Contains(key) || !seen.Add(key))
+            {
+                continue;
+            }
+
+            batch.Add(new AbandonFflogsLease
+            {
+                ContentId = job.ContentId,
+                ZoneId = job.ZoneId,
+                DifficultyId = job.DifficultyId,
+                Partition = job.Partition,
+                LeaseToken = job.LeaseToken,
+                Reason = reason,
+            });
+        }
+
+        return batch;
+    }
+
+    private void QueueSubmitResults(IEnumerable<ParseResult> freshResults)
     {
         foreach (var result in freshResults)
         {
             this.PendingSubmitResults[ParseResultKey(result)] = result;
         }
+    }
+
+    private List<ParseResult> BuildSubmitBatch(List<ParseResult> freshResults)
+    {
+        QueueSubmitResults(freshResults);
 
         if (this.PendingSubmitResults.Count == 0)
         {
@@ -167,6 +215,28 @@ public class FFLogsCollector : IDisposable
     private Task DelayWithJitterAsync(int baseDelayMs, int jitterMs = 1000)
         => Task.Delay(JitteredDelayMs(baseDelayMs, jitterMs), Cts.Token);
 
+    public bool TryGetRateLimitCooldownRemaining(out TimeSpan remaining)
+        => FFLogsClient.TryGetRateLimitRemaining(out remaining);
+
+    public DateTime RateLimitCooldownUntilUtc
+        => FFLogsClient.RateLimitCooldownUntilUtc;
+
+    public void ResetRateLimitCooldown()
+        => FFLogsClient.ResetRateLimitCooldown();
+
+    private void LogCooldownSkipIfNeeded(TimeSpan remaining)
+    {
+        var now = DateTime.UtcNow;
+        if ((now - _lastCooldownSkipLogUtc) < TimeSpan.FromMinutes(1))
+        {
+            return;
+        }
+
+        _lastCooldownSkipLogUtc = now;
+        var minutesRemaining = Math.Max(1, (int)Math.Ceiling(remaining.TotalMinutes));
+        Plugin.Log.Warning($"FFLogsCollector: FFLogs cooldown active; skipping server polling for about {minutesRemaining} minute(s).");
+    }
+
     private async Task<int> DelayWithBackoffAsync(int consecutiveFailures)
     {
         var nextFailures = Math.Min(consecutiveFailures + 1, 16);
@@ -174,6 +244,102 @@ public class FFLogsCollector : IDisposable
         var backoffDelay = Math.Min(WorkerMaxBackoffDelayMs, WorkerBaseDelayMs * (1 << exponent));
         await DelayWithJitterAsync(backoffDelay, WorkerJitterMs);
         return nextFailures;
+    }
+
+    private static bool TryParseResultsSubmitResponse(string content, out ContributeFflogsResultsResponse parsed)
+    {
+        parsed = null;
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            return false;
+        }
+
+        try
+        {
+            parsed = JsonConvert.DeserializeObject<ContributeFflogsResultsResponse>(content);
+            return parsed != null;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static bool TryParseLeaseAbandonResponse(string content, out ContributeFflogsLeaseAbandonResponse parsed)
+    {
+        parsed = null;
+        if (string.IsNullOrWhiteSpace(content))
+        {
+            return false;
+        }
+
+        try
+        {
+            parsed = JsonConvert.DeserializeObject<ContributeFflogsLeaseAbandonResponse>(content);
+            return parsed != null;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private async Task TryAbandonUnprocessedLeasesAsync(
+        string baseUrl,
+        IEnumerable<ParseJob> leasedJobs,
+        IEnumerable<ParseResult> processedResults,
+        string reason)
+    {
+        var abandonBatch = BuildAbandonLeaseBatch(leasedJobs, processedResults, reason);
+        if (abandonBatch.Count == 0)
+        {
+            return;
+        }
+
+        var abandonUrl = $"{baseUrl}/contribute/fflogs/leases/abandon";
+        var jsonContent = JsonConvert.SerializeObject(abandonBatch);
+
+        try
+        {
+            using var abandonRequest = IngestRequestFactory.CreatePostJsonRequest(
+                Plugin.Configuration,
+                abandonUrl,
+                "/contribute/fflogs/leases/abandon",
+                jsonContent
+            );
+            var response = await HttpClient.SendAsync(abandonRequest, Cts.Token);
+            var responseBody = await response.Content.ReadAsStringAsync(Cts.Token);
+
+            if (response.IsSuccessStatusCode)
+            {
+                if (TryParseLeaseAbandonResponse(responseBody, out var parsed))
+                {
+                    Plugin.Log.Warning(
+                        $"FFLogsCollector: released abandoned leases {parsed.Released}/{parsed.Submitted} (rejected={parsed.Rejected}).");
+                }
+                else
+                {
+                    Plugin.Log.Warning(
+                        $"FFLogsCollector: released abandoned leases request succeeded (submitted={abandonBatch.Count}).");
+                }
+
+                return;
+            }
+
+            if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+                Plugin.Log.Debug(
+                    "FFLogsCollector: lease abandon endpoint is unavailable on this server version.");
+                return;
+            }
+
+            Plugin.Log.Warning(
+                $"FFLogsCollector: failed to release abandoned leases ({response.StatusCode}) body={responseBody}");
+        }
+        catch (Exception ex)
+        {
+            Plugin.Log.Debug($"FFLogsCollector: lease abandon request error: {ex.Message}");
+        }
     }
  
     private async Task WorkerLoop()
@@ -196,6 +362,14 @@ public class FFLogsCollector : IDisposable
                     string.IsNullOrEmpty(Plugin.Configuration.FFLogsClientSecret))
                 {
                     consecutiveFailures = 0;
+                    await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
+                    continue;
+                }
+
+                if (FFLogsClient.TryGetRateLimitRemaining(out var rateLimitRemaining))
+                {
+                    consecutiveFailures = 0;
+                    LogCooldownSkipIfNeeded(rateLimitRemaining);
                     await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
                     continue;
                 }
@@ -296,9 +470,17 @@ public class FFLogsCollector : IDisposable
 
                 const int recentReportsLimit = 10;
                 const int reportsToCheckForProgress = 5;
+                var hitRateLimitCooldown = false;
+                var cooldownRemaining = TimeSpan.Zero;
 
                 foreach (var group in jobsByZone)
                 {
+                    if (FFLogsClient.TryGetRateLimitRemaining(out cooldownRemaining))
+                    {
+                        hitRateLimitCooldown = true;
+                        break;
+                    }
+
                     var zoneId = group.Key.ZoneId;
                     var difficultyId = group.Key.DifficultyId == 0 ? (int?)null : group.Key.DifficultyId;
                     var partition = group.Key.Partition == 0 ? (int?)null : group.Key.Partition;
@@ -342,6 +524,12 @@ public class FFLogsCollector : IDisposable
                         recentReportsLimit,
                         Cts.Token
                     );
+
+                    if (FFLogsClient.TryGetRateLimitRemaining(out cooldownRemaining))
+                    {
+                        hitRateLimitCooldown = true;
+                        break;
+                    }
 
                     // Create result objects per character (choose best candidate per ContentId)
                     var resultsByContentId = new Dictionary<ulong, ParseResult>();
@@ -392,7 +580,14 @@ public class FFLogsCollector : IDisposable
 
                         if (!pr.IsHidden)
                         {
-                            pr.Encounters = bestData.Parses.ToDictionary(e => e.EncounterId, e => e.Percentile);
+                            pr.Encounters = bestData.Parses
+                                .GroupBy(e => e.EncounterId)
+                                .ToDictionary(g => g.Key, g => g.Max(x => x.Percentile));
+
+                            pr.ClearCounts = bestData.Parses
+                                .Where(e => e.ClearCount.HasValue && e.ClearCount.Value > 0)
+                                .GroupBy(e => e.EncounterId)
+                                .ToDictionary(g => g.Key, g => g.Max(x => x.ClearCount!.Value));
                         }
 
                         resultsByContentId[job.ContentId] = pr;
@@ -414,6 +609,12 @@ public class FFLogsCollector : IDisposable
 
                     foreach (var encId in encounterIdsNeeded)
                     {
+                        if (FFLogsClient.TryGetRateLimitRemaining(out cooldownRemaining))
+                        {
+                            hitRateLimitCooldown = true;
+                            break;
+                        }
+
                         var cids = nonHiddenJobs
                             .Where(j => j.EncounterId == encId || j.SecondaryEncounterId == encId)
                             .Select(j => j.ContentId)
@@ -448,6 +649,12 @@ public class FFLogsCollector : IDisposable
                             Cts.Token
                         );
 
+                        if (FFLogsClient.TryGetRateLimitRemaining(out cooldownRemaining))
+                        {
+                            hitRateLimitCooldown = true;
+                            break;
+                        }
+
                         foreach (var (cid, codes) in codesByCid)
                         {
                             double? best = null;
@@ -465,11 +672,18 @@ public class FFLogsCollector : IDisposable
                         }
                     }
 
+                    if (hitRateLimitCooldown)
+                    {
+                        break;
+                    }
+
                     results.AddRange(resultsByContentId.Values);
-                     
+                      
                     // Respect Rate Limit (done in Client mostly but we can pause here too)
                     await Task.Delay(1000, Cts.Token);
                 }
+
+                    var shouldAbandonRemainingLeases = hitRateLimitCooldown;
 
                     // 3. Submit Results (retry-safe)
                     var submitBatch = BuildSubmitBatch(results);
@@ -486,10 +700,19 @@ public class FFLogsCollector : IDisposable
                                 jsonContent
                             );
                             var submitResp = await HttpClient.SendAsync(submitRequest, Cts.Token);
+                            var submitRespBody = await submitResp.Content.ReadAsStringAsync(Cts.Token);
 
                             if (submitResp.IsSuccessStatusCode)
                             {
-                                Plugin.Log.Info($"Uploaded {submitBatch.Count} parse results.");
+                                if (TryParseResultsSubmitResponse(submitRespBody, out var parsed))
+                                {
+                                    Plugin.Log.Info(
+                                        $"Uploaded parse results: updated={parsed.Updated}, accepted={parsed.Accepted}/{parsed.Submitted}, rejected={parsed.Rejected}, status={parsed.Status}.");
+                                }
+                                else
+                                {
+                                    Plugin.Log.Info($"Uploaded {submitBatch.Count} parse results.");
+                                }
                             }
                             else
                             {
@@ -503,7 +726,7 @@ public class FFLogsCollector : IDisposable
                                         Plugin.Log.Warning($"FFLogsCollector: results endpoint rate limited, retry_after={retryAfter.Value}s");
                                     }
                                 }
-                                Plugin.Log.Error($"Failed to upload results: {submitResp.StatusCode} (requeued {submitBatch.Count})");
+                                Plugin.Log.Error($"Failed to upload results: {submitResp.StatusCode} (requeued {submitBatch.Count}) body={submitRespBody}");
                             }
                         }
                         catch (Exception ex)
@@ -512,6 +735,24 @@ public class FFLogsCollector : IDisposable
                             RequeueSubmitBatch(submitBatch);
                             Plugin.Log.Error($"Failed to upload results (exception): {ex.Message} (requeued {submitBatch.Count})");
                         }
+                    }
+
+                    if (shouldAbandonRemainingLeases)
+                    {
+                        await TryAbandonUnprocessedLeasesAsync(
+                            baseUrl,
+                            jobs,
+                            results,
+                            "fflogs_rate_limit_cooldown"
+                        );
+                    }
+
+                    if (hitRateLimitCooldown)
+                    {
+                        consecutiveFailures = 0;
+                        LogCooldownSkipIfNeeded(cooldownRemaining);
+                        await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
+                        continue;
                     }
 
                     if (hadTransientFailure)
@@ -573,8 +814,42 @@ public class ParseResult
     public int Partition { get; set; }
     public Dictionary<int, double> Encounters { get; set; } = new();
     public Dictionary<int, double> BossPercentages { get; set; } = new();
+    public Dictionary<int, int> ClearCounts { get; set; } = new();
     public bool IsHidden { get; set; }
     public bool IsEstimated { get; set; }
     public string MatchedServer { get; set; } = "";
     public string LeaseToken { get; set; } = "";
+}
+
+[Serializable]
+[JsonObject(NamingStrategyType = typeof(SnakeCaseNamingStrategy))]
+public class AbandonFflogsLease
+{
+    public ulong ContentId { get; set; }
+    public uint ZoneId { get; set; }
+    public int DifficultyId { get; set; }
+    public int Partition { get; set; }
+    public string LeaseToken { get; set; } = "";
+    public string Reason { get; set; } = "";
+}
+
+[Serializable]
+[JsonObject(NamingStrategyType = typeof(SnakeCaseNamingStrategy))]
+public class ContributeFflogsResultsResponse
+{
+    public string Status { get; set; } = "";
+    public int Submitted { get; set; }
+    public int Accepted { get; set; }
+    public int Updated { get; set; }
+    public int Rejected { get; set; }
+}
+
+[Serializable]
+[JsonObject(NamingStrategyType = typeof(SnakeCaseNamingStrategy))]
+public class ContributeFflogsLeaseAbandonResponse
+{
+    public string Status { get; set; } = "";
+    public int Submitted { get; set; }
+    public int Released { get; set; }
+    public int Rejected { get; set; }
 }

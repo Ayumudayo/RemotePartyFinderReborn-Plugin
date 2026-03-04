@@ -8,7 +8,6 @@ using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-using Dalamud.Logging;
 
 namespace RemotePartyFinder;
 
@@ -18,9 +17,13 @@ public class FFLogsClient : IDisposable
     private readonly HttpClient _httpClient;
     private string _accessToken = string.Empty;
     private DateTime _tokenExpiration;
+    private readonly object _rateLimitLock = new();
+    private DateTime _rateLimitCooldownUntilUtc = DateTime.MinValue;
+    private DateTime _lastRateLimitBlockLogUtc = DateTime.MinValue;
 
     private DateTime _lastGraphQlErrorLog = DateTime.MinValue;
     private string _lastGraphQlErrorMessage = string.Empty;
+    private static readonly TimeSpan RateLimitCooldownDuration = TimeSpan.FromHours(1);
 
     private const string TokenUrl = "https://www.fflogs.com/oauth/token";
     private const string GraphQlUrl = "https://www.fflogs.com/api/v2/client";
@@ -34,6 +37,85 @@ public class FFLogsClient : IDisposable
     public void Dispose()
     {
         _httpClient.Dispose();
+    }
+
+    public DateTime RateLimitCooldownUntilUtc
+    {
+        get
+        {
+            lock (_rateLimitLock)
+            {
+                return _rateLimitCooldownUntilUtc;
+            }
+        }
+    }
+
+    public bool TryGetRateLimitRemaining(out TimeSpan remaining)
+    {
+        lock (_rateLimitLock)
+        {
+            var now = DateTime.UtcNow;
+            if (_rateLimitCooldownUntilUtc <= now)
+            {
+                remaining = TimeSpan.Zero;
+                return false;
+            }
+
+            remaining = _rateLimitCooldownUntilUtc - now;
+            return true;
+        }
+    }
+
+    public void ResetRateLimitCooldown()
+    {
+        lock (_rateLimitLock)
+        {
+            _rateLimitCooldownUntilUtc = DateTime.MinValue;
+            _lastRateLimitBlockLogUtc = DateTime.MinValue;
+        }
+
+        Plugin.Log.Info("FFLogs rate-limit cooldown was reset manually.");
+    }
+
+    private void ActivateRateLimitCooldown(string source)
+    {
+        DateTime cooldownUntilUtc;
+        lock (_rateLimitLock)
+        {
+            var proposedCooldownUntilUtc = DateTime.UtcNow.Add(RateLimitCooldownDuration);
+            if (proposedCooldownUntilUtc > _rateLimitCooldownUntilUtc)
+            {
+                _rateLimitCooldownUntilUtc = proposedCooldownUntilUtc;
+            }
+
+            cooldownUntilUtc = _rateLimitCooldownUntilUtc;
+            _lastRateLimitBlockLogUtc = DateTime.MinValue;
+        }
+
+        Plugin.Log.Warning(
+            $"FFLogs API rate limited at {source}. Pausing FFLogs requests until {cooldownUntilUtc:O} (1 hour lockout).");
+    }
+
+    private void LogCooldownSkipIfNeeded(TimeSpan remaining)
+    {
+        var shouldLog = false;
+        lock (_rateLimitLock)
+        {
+            var now = DateTime.UtcNow;
+            if ((now - _lastRateLimitBlockLogUtc) >= TimeSpan.FromMinutes(1))
+            {
+                _lastRateLimitBlockLogUtc = now;
+                shouldLog = true;
+            }
+        }
+
+        if (!shouldLog)
+        {
+            return;
+        }
+
+        var minutesRemaining = Math.Max(1, (int)Math.Ceiling(remaining.TotalMinutes));
+        Plugin.Log.Warning($"FFLogs cooldown active. Skipping FFLogs query for about {minutesRemaining} minute(s).");
     }
 
     private async Task<bool> EnsureTokenAsync()
@@ -60,6 +142,12 @@ public class FFLogsClient : IDisposable
             request.Content = new FormUrlEncodedContent(form);
 
             var response = await _httpClient.SendAsync(request);
+            if (!response.IsSuccessStatusCode && (int)response.StatusCode == 429)
+            {
+                ActivateRateLimitCooldown("oauth token request");
+                return false;
+            }
+
             response.EnsureSuccessStatusCode();
 
             var content = await response.Content.ReadAsStringAsync();
@@ -83,6 +171,12 @@ public class FFLogsClient : IDisposable
 
     public async Task<JObject> QueryAsync(string query, CancellationToken cancellationToken)
     {
+        if (TryGetRateLimitRemaining(out var cooldownRemaining))
+        {
+            LogCooldownSkipIfNeeded(cooldownRemaining);
+            return null;
+        }
+
         if (!await EnsureTokenAsync())
         {
             return null;
@@ -99,7 +193,13 @@ public class FFLogsClient : IDisposable
             var response = await _httpClient.SendAsync(request, cancellationToken);
             if (!response.IsSuccessStatusCode)
             {
-                Plugin.Log.Error($"FFLogs API Query failed: {response.StatusCode} - {await response.Content.ReadAsStringAsync()}");
+                var errorBody = await response.Content.ReadAsStringAsync();
+                if ((int)response.StatusCode == 429)
+                {
+                    ActivateRateLimitCooldown("GraphQL query");
+                }
+
+                Plugin.Log.Error($"FFLogs API Query failed: {response.StatusCode} - {errorBody}");
                 return null;
             }
 
@@ -202,8 +302,15 @@ public class FFLogsClient : IDisposable
     public sealed class CharacterFetchedData
     {
         public bool Hidden { get; init; }
-        public List<(int EncounterId, double Percentile)> Parses { get; init; } = new();
+        public List<CharacterEncounterParse> Parses { get; init; } = new();
         public List<string> RecentReportCodes { get; init; } = new();
+    }
+
+    public sealed class CharacterEncounterParse
+    {
+        public int EncounterId { get; init; }
+        public double Percentile { get; init; }
+        public int? ClearCount { get; init; }
     }
 
     public sealed class CandidateCharacterQuery
@@ -280,7 +387,7 @@ public class FFLogsClient : IDisposable
             }
 
             var hidden = character["hidden"]?.ToObject<bool?>() ?? false;
-            var parses = new List<(int EncounterId, double Percentile)>();
+            var parses = new List<CharacterEncounterParse>();
 
             if (character["zoneRankings"]?["rankings"] is JArray rankings)
             {
@@ -291,7 +398,12 @@ public class FFLogsClient : IDisposable
                     var percentile = rank["rankPercent"]?.ToObject<double?>();
                     if (encounterId.HasValue && percentile.HasValue)
                     {
-                        parses.Add((encounterId.Value, percentile.Value));
+                        parses.Add(new CharacterEncounterParse
+                        {
+                            EncounterId = encounterId.Value,
+                            Percentile = percentile.Value,
+                            ClearCount = ReadClearCount(rank),
+                        });
                     }
                 }
             }
@@ -384,7 +496,7 @@ public class FFLogsClient : IDisposable
                 }
 
                 var hidden = character["hidden"]?.ToObject<bool?>() ?? false;
-                var parses = new List<(int EncounterId, double Percentile)>();
+                var parses = new List<CharacterEncounterParse>();
 
                 if (character["zoneRankings"]?["rankings"] is JArray rankings)
                 {
@@ -395,7 +507,12 @@ public class FFLogsClient : IDisposable
                         var percentile = rank["rankPercent"]?.ToObject<double?>();
                         if (encounterId.HasValue && percentile.HasValue)
                         {
-                            parses.Add((encounterId.Value, percentile.Value));
+                            parses.Add(new CharacterEncounterParse
+                            {
+                                EncounterId = encounterId.Value,
+                                Percentile = percentile.Value,
+                                ClearCount = ReadClearCount(rank),
+                            });
                         }
                     }
                 }
@@ -500,4 +617,16 @@ public class FFLogsClient : IDisposable
 
     private static string EscapeGraphQlString(string s)
         => s.Replace("\\", "\\\\").Replace("\"", "\\\"");
+
+    private static int? ReadClearCount(JToken ranking)
+    {
+        var totalKills = ranking["totalKills"]?.ToObject<int?>();
+        if (totalKills.HasValue)
+        {
+            return totalKills.Value;
+        }
+
+        var kills = ranking["kills"]?.ToObject<int?>();
+        return kills;
+    }
 }
