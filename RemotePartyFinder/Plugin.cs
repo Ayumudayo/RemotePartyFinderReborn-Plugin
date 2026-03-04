@@ -1,3 +1,4 @@
+using System;
 using Dalamud.IoC;
 using Dalamud.Game.Command;
 using Dalamud.Interface.Windowing;
@@ -46,6 +47,7 @@ public class Plugin : IDalamudPlugin {
 
     internal int PendingPlayerUploadCount => this.PlayerCollector.PendingCount;
     internal bool IsPlayerUploadInProgress => this.PlayerCollector.IsUploadInProgress;
+    internal DateTime FFLogsRateLimitCooldownUntilUtc => this.FFLogsCollector.RateLimitCooldownUntilUtc;
 
     public Plugin() {
         ECommonsMain.Init(PluginInterface, this);
@@ -100,6 +102,14 @@ public class Plugin : IDalamudPlugin {
 
     internal int TriggerPlayerFullResyncUploadNow() {
         return this.PlayerCollector.TriggerManualFullResyncUploadNow();
+    }
+
+    internal bool TryGetFFLogsRateLimitCooldownRemaining(out TimeSpan remaining) {
+        return this.FFLogsCollector.TryGetRateLimitCooldownRemaining(out remaining);
+    }
+
+    internal void ResetFFLogsRateLimitCooldown() {
+        this.FFLogsCollector.ResetRateLimitCooldown();
     }
 
     public void DrawUI() => WindowSystem.Draw();

@@ -16,6 +16,8 @@ public class ConfigWindow : Window, IDisposable
     private string _uploadUrlTempString = string.Empty;
     private string _uploadUrlError = string.Empty;
     private string _playerManualUploadStatus = string.Empty;
+    private string _scannerCollectionStatus = string.Empty;
+    private string _fflogsCooldownStatus = string.Empty;
 
     public ConfigWindow(Plugin plugin) : base("Remote Party Finder Reborn")
     {
@@ -326,58 +328,53 @@ public class ConfigWindow : Window, IDisposable
         ImGui.Separator();
         ImGui.Spacing();
 
+        ImGui.TextColored(new Vector4(0.4f, 1.0f, 0.4f, 1.0f), "[FFLogs API Rate-Limit Lockout]");
+
+        if (_plugin.TryGetFFLogsRateLimitCooldownRemaining(out var cooldownRemaining))
+        {
+            var untilLocal = FormatLocalClock(_plugin.FFLogsRateLimitCooldownUntilUtc);
+            ImGui.TextColored(
+                new Vector4(1.0f, 0.8f, 0.2f, 1.0f),
+                $"ACTIVE - remaining {cooldownRemaining.TotalMinutes:F1} min (until {untilLocal} Local)");
+        }
+        else
+        {
+            ImGui.TextColored(new Vector4(0.0f, 1.0f, 0.0f, 1.0f), "INACTIVE");
+        }
+
+        if (ImGui.Button("Reset FFLogs Rate-Limit Lockout"))
+        {
+            _plugin.ResetFFLogsRateLimitCooldown();
+            _fflogsCooldownStatus = $"[{DateTime.Now:HH:mm:ss}] FFLogs rate-limit lockout reset";
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Clears the local 1-hour FFLogs 429 lockout immediately.");
+        }
+
+        if (!string.IsNullOrEmpty(_fflogsCooldownStatus))
+        {
+            ImGui.TextWrapped(_fflogsCooldownStatus);
+        }
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
         ImGui.TextColored(new Vector4(0.4f, 1.0f, 0.4f, 1.0f), "[PF Detail Auto Scanner (Debug)]");
         ImGui.Spacing();
 
-        var enableScanner = _configuration.EnableAutoDetailScanDebug;
-        if (ImGui.Checkbox("Enable Auto Detail Scanner", ref enableScanner))
+        ImGui.TextWrapped("Scanner runs only from current-page snapshots or collected listings.");
+
+        var manualCollectionEnabled = _configuration.EnableManualPageCollectionDebug;
+        if (ImGui.Checkbox("Manual Page Collection (Deferred Batch)", ref manualCollectionEnabled))
         {
-            _configuration.EnableAutoDetailScanDebug = enableScanner;
-            if (!enableScanner)
-            {
-                _plugin.DebugPfScanner.ResetSession();
-            }
+            _configuration.EnableManualPageCollectionDebug = manualCollectionEnabled;
             _configuration.Save();
         }
         if (ImGui.IsItemHovered())
         {
-            ImGui.SetTooltip("Debug mode: automatically opens PF listing details one-by-one to accelerate detail collection.");
-        }
-
-        ImGui.TextWrapped("Scanner bootstrap: each run forces a PF listings refresh and starts from page 1 data.");
-
-        var currentPageOnly = _configuration.AutoDetailScanCurrentPageOnly;
-        if (ImGui.Checkbox("Current Page Only", ref currentPageOnly))
-        {
-            _configuration.AutoDetailScanCurrentPageOnly = currentPageOnly;
-            _plugin.DebugPfScanner.ResetSession();
-            _configuration.Save();
-        }
-        if (ImGui.IsItemHovered())
-        {
-            ImGui.SetTooltip("Enabled: only scan listings on the current page. Disabled: automatically turn pages and continue scanning until the last page.");
-        }
-
-        var nextPageButtonId = _configuration.AutoDetailScanNextPageButtonId;
-        if (ImGui.InputInt("Next Page Button Id (fallback)", ref nextPageButtonId, 1, 5))
-        {
-            _configuration.AutoDetailScanNextPageButtonId = Math.Clamp(nextPageButtonId, 0, 1000);
-            _configuration.Save();
-        }
-        if (ImGui.IsItemHovered())
-        {
-            ImGui.SetTooltip("Optional direct-click fallback button id. Default 0 disables direct click and uses callback/replay path first.");
-        }
-
-        var nextPageActionId = _configuration.AutoDetailScanNextPageActionId;
-        if (ImGui.InputInt("Capture Action Id", ref nextPageActionId, 1, 5))
-        {
-            _configuration.AutoDetailScanNextPageActionId = Math.Clamp(nextPageActionId, 0, 1000);
-            _configuration.Save();
-        }
-        if (ImGui.IsItemHovered())
-        {
-            ImGui.SetTooltip("ReceiveEvent first int value used only for optional Next-page capture filtering (observed: 22).");
+            ImGui.SetTooltip("When enabled, listings seen while you manually turn PF pages are collected for a later one-click batch detail run.");
         }
 
         var actionInterval = _configuration.AutoDetailScanActionIntervalMs;
@@ -405,13 +402,6 @@ public class ConfigWindow : Window, IDisposable
         if (ImGui.SliderInt("Post Listing Cooldown", ref postCooldown, 50, 3000, "%d ms"))
         {
             _configuration.AutoDetailScanPostListingCooldownMs = postCooldown;
-            _configuration.Save();
-        }
-
-        var refreshInterval = _configuration.AutoDetailScanRefreshIntervalMs;
-        if (ImGui.SliderInt("Refresh Interval", ref refreshInterval, 1000, 30000, "%d ms"))
-        {
-            _configuration.AutoDetailScanRefreshIntervalMs = refreshInterval;
             _configuration.Save();
         }
 
@@ -448,11 +438,39 @@ public class ConfigWindow : Window, IDisposable
         ImGui.TextUnformatted($"Detail Last Success (Local): {FormatLocalClock(_plugin.PartyDetailCollector.LastSuccessfulUploadAtUtc)}");
         ImGui.TextUnformatted($"Detail Missing Ack Version: {_plugin.PartyDetailCollector.LastTerminalUploadAckVersion} listing={_plugin.PartyDetailCollector.LastTerminalUploadListingId}");
         ImGui.TextUnformatted($"Detail Pending Queue: {_plugin.PartyDetailCollector.PendingQueueCount}");
-        ImGui.TextUnformatted("Next-page event arm/capture controls removed; scanner now uses automatic agent-event flow.");
+        ImGui.TextUnformatted($"Collected Listings: {_plugin.DebugPfScanner.CollectedListingCount}");
+
+        if (ImGui.Button("Collect Current Page Snapshot"))
+        {
+            var added = _plugin.DebugPfScanner.CollectCurrentPageSnapshot();
+            _scannerCollectionStatus = $"[{DateTime.Now:HH:mm:ss}] collected current-page snapshot (+{added})";
+        }
+
+        ImGui.SameLine();
+        if (ImGui.Button("Run Collected Batch Click"))
+        {
+            var ok = _plugin.DebugPfScanner.StartCollectedBatchRun(out var status);
+            _scannerCollectionStatus = $"[{DateTime.Now:HH:mm:ss}] {(ok ? "OK" : "FAIL")} {status}";
+        }
+
+        ImGui.SameLine();
+        if (ImGui.Button("Clear Collected"))
+        {
+            var removed = _plugin.DebugPfScanner.ClearCollectedListings();
+            _scannerCollectionStatus = $"[{DateTime.Now:HH:mm:ss}] cleared collected listings ({removed})";
+        }
+
+        if (!string.IsNullOrEmpty(_scannerCollectionStatus))
+        {
+            ImGui.TextWrapped(_scannerCollectionStatus);
+        }
 
         if (ImGui.Button("Reset Scanner Session"))
         {
+            _configuration.EnableAutoDetailScanDebug = false;
+            _configuration.Save();
             _plugin.DebugPfScanner.ResetSession();
+            _scannerCollectionStatus = $"[{DateTime.Now:HH:mm:ss}] scanner stopped and session reset";
         }
 
         ImGui.Spacing();

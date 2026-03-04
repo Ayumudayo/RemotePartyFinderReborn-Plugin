@@ -30,14 +30,11 @@ public class Configuration : IPluginConfiguration {
 
     // Debug scanner: auto-open PF detail windows
     public bool EnableAutoDetailScanDebug { get; set; } = false;
-    public bool AutoDetailScanCurrentPageOnly { get; set; } = true;
-    public int AutoDetailScanNextPageButtonId { get; set; } = 0;
-    public int AutoDetailScanNextPageActionId { get; set; } = 22;
+    public bool EnableManualPageCollectionDebug { get; set; } = false;
     public int AutoDetailScanActionIntervalMs { get; set; } = 400;
     public int AutoDetailScanDetailTimeoutMs { get; set; } = 3500;
     public int AutoDetailScanMinDwellMs { get; set; } = 800;
     public int AutoDetailScanPostListingCooldownMs { get; set; } = 300;
-    public int AutoDetailScanRefreshIntervalMs { get; set; } = 5000;
     public int AutoDetailScanDedupTtlSeconds { get; set; } = 600;
     public int AutoDetailScanMaxConsecutiveFailures { get; set; } = 5;
     public int AutoDetailScanMaxPerRun { get; set; } = 0;
