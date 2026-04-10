@@ -101,12 +101,15 @@ internal sealed class PartyDetailCollector : IDisposable {
 
         var memberContentIds = new List<ulong>(slotCount);
         var memberJobs = new List<byte>(slotCount);
+        var slotFlags = new List<string>(slotCount);
         var nonZeroMemberCount = 0;
 
         for (var slotIndex = 0; slotIndex < slotCount; slotIndex++) {
             var memberContentId = viewedListing.MemberContentIds[slotIndex];
             memberContentIds.Add(memberContentId);
             memberJobs.Add(viewedListing.Jobs[slotIndex]);
+            var rawSlotFlag = Convert.ToUInt64(viewedListing.SlotFlags[slotIndex]);
+            slotFlags.Add($"0x{rawSlotFlag:X16}");
             if (memberContentId != 0) {
                 nonZeroMemberCount++;
             }
@@ -123,9 +126,10 @@ internal sealed class PartyDetailCollector : IDisposable {
             HomeWorld = homeWorld,
             MemberContentIds = memberContentIds,
             MemberJobs = memberJobs,
+            SlotFlags = slotFlags,
         };
 
-        var fingerprint = ComputeFingerprint(memberContentIds, memberJobs);
+        var fingerprint = ComputeFingerprint(memberContentIds, memberJobs, slotFlags);
 
         var now = DateTime.UtcNow;
         if (payload.ListingId == _lastQueuedListingId
@@ -230,19 +234,31 @@ internal sealed class PartyDetailCollector : IDisposable {
                 continue;
             }
 
-            var endpointUrl = BuildDetailEndpoint(uploadTarget.Url);
+            if (!IngestEndpointResolver.TryBuildEndpointUrl(uploadTarget, "/contribute/detail", out var endpointUrl)) {
+                continue;
+            }
+
+            if (uploadTarget.ShouldDeferDetailRequest(payload.ListingId)) {
+                continue;
+            }
+
+            var capabilityToken = uploadTarget.TryGetDetailCapability(payload.ListingId, out var cachedCapability)
+                ? cachedCapability
+                : null;
             try {
                 using var request = IngestRequestFactory.CreatePostJsonRequest(
                     _plugin.Configuration,
                     endpointUrl,
                     "/contribute/detail",
-                    jsonPayload
+                    jsonPayload,
+                    capabilityToken
                 );
                 var response = await _httpClient.SendAsync(request);
                 var body = await response.Content.ReadAsStringAsync();
 
                 if (response.IsSuccessStatusCode) {
                     uploadTarget.FailureCount = 0;
+                    uploadTarget.InvalidateDetailCapability(payload.ListingId);
 
                     if (TryParseDetailResponse(body, out var matchedCount, out var modifiedCount)) {
                         if (matchedCount == 0) {
@@ -257,8 +273,15 @@ internal sealed class PartyDetailCollector : IDisposable {
                         Plugin.Log.Debug($"PartyDetailCollector: {endpointUrl}: {response.StatusCode} {body}");
                     }
                 } else {
-                    uploadTarget.FailureCount++;
-                    uploadTarget.LastFailureTime = DateTime.UtcNow;
+                    var isAuthFailure = response.StatusCode == System.Net.HttpStatusCode.Forbidden
+                        || response.StatusCode == System.Net.HttpStatusCode.Unauthorized;
+                    if (isAuthFailure) {
+                        uploadTarget.MarkDetailCapabilitiesRequired();
+                        uploadTarget.InvalidateDetailCapability(payload.ListingId);
+                    } else {
+                        uploadTarget.FailureCount++;
+                        uploadTarget.LastFailureTime = DateTime.UtcNow;
+                    }
                     if ((int)response.StatusCode == 429) {
                         var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);
                         if (retryAfter.HasValue) {
@@ -293,17 +316,6 @@ internal sealed class PartyDetailCollector : IDisposable {
 
         var elapsedSinceLastFailure = DateTime.UtcNow - uploadTarget.LastFailureTime;
         return elapsedSinceLastFailure.TotalMinutes < _plugin.Configuration.CircuitBreakerBreakDurationMinutes;
-    }
-
-    private static string BuildDetailEndpoint(string configuredUrl) {
-        var baseUrl = configuredUrl.TrimEnd('/');
-        if (baseUrl.EndsWith("/contribute/multiple")) {
-            baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute/multiple".Length);
-        } else if (baseUrl.EndsWith("/contribute")) {
-            baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute".Length);
-        }
-
-        return baseUrl + "/contribute/detail";
     }
 
     private static bool TryParseDetailResponse(string rawBody, out long matchedCount, out long modifiedCount) {
@@ -374,13 +386,23 @@ internal sealed class PartyDetailCollector : IDisposable {
         return boundedDelay + jitterMs;
     }
 
-    private static ulong ComputeFingerprint(List<ulong> memberContentIds, List<byte> memberJobs) {
+    private static ulong ComputeFingerprint(
+        List<ulong> memberContentIds,
+        List<byte> memberJobs,
+        List<string> slotFlags
+    ) {
         unchecked {
             var hash = 1469598103934665603UL;
             hash = MixFnv(hash, (ulong)memberContentIds.Count);
             for (var i = 0; i < memberContentIds.Count; i++) {
                 hash = MixFnv(hash, memberContentIds[i]);
                 hash = MixFnv(hash, memberJobs[i]);
+            }
+
+            foreach (var slotFlag in slotFlags) {
+                foreach (var c in slotFlag) {
+                    hash = MixFnv(hash, c);
+                }
             }
 
             return hash;
@@ -427,4 +449,5 @@ internal sealed class UploadablePartyDetail {
     public ushort HomeWorld { get; set; }
     public List<ulong> MemberContentIds { get; set; } = new();
     public List<byte> MemberJobs { get; set; } = new();
+    public List<string> SlotFlags { get; set; } = new();
 }
