@@ -234,6 +234,10 @@ internal sealed class PartyDetailCollector : IDisposable {
                 continue;
             }
 
+            if (uploadTarget.ShouldDeferDetailRequest(payload.ListingId)) {
+                continue;
+            }
+
             var capabilityToken = uploadTarget.TryGetDetailCapability(payload.ListingId, out var cachedCapability)
                 ? cachedCapability
                 : null;
@@ -265,11 +269,14 @@ internal sealed class PartyDetailCollector : IDisposable {
                         Plugin.Log.Debug($"PartyDetailCollector: {endpointUrl}: {response.StatusCode} {body}");
                     }
                 } else {
-                    uploadTarget.FailureCount++;
-                    uploadTarget.LastFailureTime = DateTime.UtcNow;
-                    if (response.StatusCode == System.Net.HttpStatusCode.Forbidden
-                        || response.StatusCode == System.Net.HttpStatusCode.Unauthorized) {
+                    var isAuthFailure = response.StatusCode == System.Net.HttpStatusCode.Forbidden
+                        || response.StatusCode == System.Net.HttpStatusCode.Unauthorized;
+                    if (isAuthFailure) {
+                        uploadTarget.MarkDetailCapabilitiesRequired();
                         uploadTarget.InvalidateDetailCapability(payload.ListingId);
+                    } else {
+                        uploadTarget.FailureCount++;
+                        uploadTarget.LastFailureTime = DateTime.UtcNow;
                     }
                     if ((int)response.StatusCode == 429) {
                         var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);

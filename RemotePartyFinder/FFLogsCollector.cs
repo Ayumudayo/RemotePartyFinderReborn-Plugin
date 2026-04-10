@@ -301,6 +301,12 @@ public class FFLogsCollector : IDisposable
             return;
         }
 
+        if (uploadUrl.ShouldDeferProtectedEndpointRequest(
+            ProtectedEndpointCapabilityKind.FflogsLeasesAbandon))
+        {
+            return;
+        }
+
         var jsonContent = JsonConvert.SerializeObject(abandonBatch);
         var capabilityToken = uploadUrl.TryGetProtectedEndpointCapability(
             ProtectedEndpointCapabilityKind.FflogsLeasesAbandon,
@@ -339,6 +345,7 @@ public class FFLogsCollector : IDisposable
             if (response.StatusCode == System.Net.HttpStatusCode.Forbidden
                 || response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
             {
+                uploadUrl.MarkProtectedEndpointCapabilitiesRequired();
                 uploadUrl.InvalidateProtectedEndpointCapability(
                     ProtectedEndpointCapabilityKind.FflogsLeasesAbandon);
             }
@@ -426,6 +433,14 @@ public class FFLogsCollector : IDisposable
                     continue;
                 }
 
+                if (uploadUrl.ShouldDeferProtectedEndpointRequest(
+                    ProtectedEndpointCapabilityKind.FflogsJobs))
+                {
+                    consecutiveFailures = 0;
+                    await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
+                    continue;
+                }
+
                 List<ParseJob> jobs = null;
                 
                 try 
@@ -454,14 +469,19 @@ public class FFLogsCollector : IDisposable
                          // Log only if not 404 to avoid spam on old servers
                         if (response.StatusCode != System.Net.HttpStatusCode.NotFound)
                         {
-                            hadTransientFailure = true;
-                            uploadUrl.FailureCount++;
-                            uploadUrl.LastFailureTime = DateTime.UtcNow;
-                            if (response.StatusCode == System.Net.HttpStatusCode.Forbidden
-                                || response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+                            var isAuthFailure = response.StatusCode == System.Net.HttpStatusCode.Forbidden
+                                || response.StatusCode == System.Net.HttpStatusCode.Unauthorized;
+                            if (isAuthFailure)
                             {
+                                uploadUrl.MarkProtectedEndpointCapabilitiesRequired();
                                 uploadUrl.InvalidateProtectedEndpointCapability(
                                     ProtectedEndpointCapabilityKind.FflogsJobs);
+                            }
+                            else
+                            {
+                                hadTransientFailure = true;
+                                uploadUrl.FailureCount++;
+                                uploadUrl.LastFailureTime = DateTime.UtcNow;
                             }
                             if ((int)response.StatusCode == 429)
                             {
@@ -732,6 +752,15 @@ public class FFLogsCollector : IDisposable
                             continue;
                         }
 
+                        if (uploadUrl.ShouldDeferProtectedEndpointRequest(
+                            ProtectedEndpointCapabilityKind.FflogsResults))
+                        {
+                            RequeueSubmitBatch(submitBatch);
+                            consecutiveFailures = 0;
+                            await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
+                            continue;
+                        }
+
                         var jsonContent = JsonConvert.SerializeObject(submitBatch);
                         try
                         {
@@ -764,13 +793,18 @@ public class FFLogsCollector : IDisposable
                             }
                             else
                             {
-                                hadTransientFailure = true;
                                 RequeueSubmitBatch(submitBatch);
-                                if (submitResp.StatusCode == System.Net.HttpStatusCode.Forbidden
-                                    || submitResp.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+                                var isAuthFailure = submitResp.StatusCode == System.Net.HttpStatusCode.Forbidden
+                                    || submitResp.StatusCode == System.Net.HttpStatusCode.Unauthorized;
+                                if (isAuthFailure)
                                 {
+                                    uploadUrl.MarkProtectedEndpointCapabilitiesRequired();
                                     uploadUrl.InvalidateProtectedEndpointCapability(
                                         ProtectedEndpointCapabilityKind.FflogsResults);
+                                }
+                                else
+                                {
+                                    hadTransientFailure = true;
                                 }
                                 if ((int)submitResp.StatusCode == 429)
                                 {

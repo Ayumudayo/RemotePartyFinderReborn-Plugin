@@ -31,6 +31,12 @@ public record UploadUrl(string Url)
     [JsonIgnore]
     private readonly Dictionary<uint, CachedCapability> _detailCapabilities = new();
 
+    [JsonIgnore]
+    private bool _requiresProtectedEndpointCapabilities;
+
+    [JsonIgnore]
+    private bool _requiresDetailCapabilities;
+
     internal bool ShouldLogSecurityWarning(DateTime utcNow, TimeSpan cooldown)
     {
         if (utcNow - LastSecurityWarningTime < cooldown)
@@ -51,15 +57,15 @@ public record UploadUrl(string Url)
         {
             PruneExpiredCapabilities(now);
 
-            UpsertProtectedCapability(
+            _requiresProtectedEndpointCapabilities |= UpsertProtectedCapability(
                 ProtectedEndpointCapabilityKind.FflogsJobs,
                 protectedEndpoints?.FflogsJobs,
                 now);
-            UpsertProtectedCapability(
+            _requiresProtectedEndpointCapabilities |= UpsertProtectedCapability(
                 ProtectedEndpointCapabilityKind.FflogsResults,
                 protectedEndpoints?.FflogsResults,
                 now);
-            UpsertProtectedCapability(
+            _requiresProtectedEndpointCapabilities |= UpsertProtectedCapability(
                 ProtectedEndpointCapabilityKind.FflogsLeasesAbandon,
                 protectedEndpoints?.FflogsLeasesAbandon,
                 now);
@@ -83,7 +89,46 @@ public record UploadUrl(string Url)
                 }
 
                 _detailCapabilities[detailCapability.ListingId] = cached;
+                _requiresDetailCapabilities = true;
             }
+        }
+    }
+
+    internal bool ShouldDeferProtectedEndpointRequest(ProtectedEndpointCapabilityKind kind)
+    {
+        var now = DateTimeOffset.UtcNow;
+        lock (_capabilityLock)
+        {
+            PruneExpiredCapabilities(now);
+            return _requiresProtectedEndpointCapabilities
+                && !_protectedEndpointCapabilities.ContainsKey(kind);
+        }
+    }
+
+    internal bool ShouldDeferDetailRequest(uint listingId)
+    {
+        var now = DateTimeOffset.UtcNow;
+        lock (_capabilityLock)
+        {
+            PruneExpiredCapabilities(now);
+            return _requiresDetailCapabilities
+                && !_detailCapabilities.ContainsKey(listingId);
+        }
+    }
+
+    internal void MarkProtectedEndpointCapabilitiesRequired()
+    {
+        lock (_capabilityLock)
+        {
+            _requiresProtectedEndpointCapabilities = true;
+        }
+    }
+
+    internal void MarkDetailCapabilitiesRequired()
+    {
+        lock (_capabilityLock)
+        {
+            _requiresDetailCapabilities = true;
         }
     }
 
@@ -137,7 +182,7 @@ public record UploadUrl(string Url)
         }
     }
 
-    private void UpsertProtectedCapability(
+    private bool UpsertProtectedCapability(
         ProtectedEndpointCapabilityKind kind,
         ProtectedEndpointCapabilityGrant grant,
         DateTimeOffset now)
@@ -145,10 +190,11 @@ public record UploadUrl(string Url)
         var cached = BuildCachedCapability(grant?.Token, grant?.ExpiresAt ?? 0, now);
         if (cached == null)
         {
-            return;
+            return false;
         }
 
         _protectedEndpointCapabilities[kind] = cached;
+        return true;
     }
 
     private static CachedCapability BuildCachedCapability(
