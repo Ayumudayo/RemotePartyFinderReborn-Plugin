@@ -130,7 +130,9 @@ internal sealed class PlayerCollector : IDisposable {
                         continue;
                     }
 
-                    var endpointUrl = BuildPlayersEndpoint(uploadTarget.Url);
+                    if (!IngestEndpointResolver.TryBuildEndpointUrl(uploadTarget, "/contribute/players", out var endpointUrl)) {
+                        continue;
+                    }
                     try {
                         using var request = IngestRequestFactory.CreatePostJsonRequest(
                             _plugin.Configuration,
@@ -139,10 +141,12 @@ internal sealed class PlayerCollector : IDisposable {
                             jsonPayload
                         );
                         var response = await _httpClient.SendAsync(request);
+                        var responseBody = await response.Content.ReadAsStringAsync();
 
                         if (response.IsSuccessStatusCode) {
                             anySuccess = true;
                             uploadTarget.FailureCount = 0;
+                            IngestResponseParser.CapturePlayersResponse(uploadTarget, responseBody);
                         } else {
                             uploadTarget.FailureCount++;
                             uploadTarget.LastFailureTime = DateTime.UtcNow;
@@ -184,16 +188,6 @@ internal sealed class PlayerCollector : IDisposable {
         return elapsedSinceFailure.TotalMinutes < _plugin.Configuration.CircuitBreakerBreakDurationMinutes;
     }
 
-    private static string BuildPlayersEndpoint(string configuredUrl) {
-        var baseUrl = configuredUrl.TrimEnd('/');
-        if (baseUrl.EndsWith("/contribute/multiple", StringComparison.OrdinalIgnoreCase)) {
-            baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute/multiple".Length);
-        } else if (baseUrl.EndsWith("/contribute", StringComparison.OrdinalIgnoreCase)) {
-            baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute".Length);
-        }
-
-        return baseUrl + "/contribute/players";
-    }
 }
 
 [Serializable]

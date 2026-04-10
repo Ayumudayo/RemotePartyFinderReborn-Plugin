@@ -285,7 +285,7 @@ public class FFLogsCollector : IDisposable
     }
 
     private async Task TryAbandonUnprocessedLeasesAsync(
-        string baseUrl,
+        UploadUrl uploadUrl,
         IEnumerable<ParseJob> leasedJobs,
         IEnumerable<ParseResult> processedResults,
         string reason)
@@ -296,8 +296,17 @@ public class FFLogsCollector : IDisposable
             return;
         }
 
-        var abandonUrl = $"{baseUrl}/contribute/fflogs/leases/abandon";
+        if (!IngestEndpointResolver.TryBuildEndpointUrl(uploadUrl, "/contribute/fflogs/leases/abandon", out var abandonUrl))
+        {
+            return;
+        }
+
         var jsonContent = JsonConvert.SerializeObject(abandonBatch);
+        var capabilityToken = uploadUrl.TryGetProtectedEndpointCapability(
+            ProtectedEndpointCapabilityKind.FflogsLeasesAbandon,
+            out var cachedCapability)
+            ? cachedCapability
+            : null;
 
         try
         {
@@ -305,7 +314,8 @@ public class FFLogsCollector : IDisposable
                 Plugin.Configuration,
                 abandonUrl,
                 "/contribute/fflogs/leases/abandon",
-                jsonContent
+                jsonContent,
+                capabilityToken
             );
             var response = await HttpClient.SendAsync(abandonRequest, Cts.Token);
             var responseBody = await response.Content.ReadAsStringAsync(Cts.Token);
@@ -324,6 +334,13 @@ public class FFLogsCollector : IDisposable
                 }
 
                 return;
+            }
+
+            if (response.StatusCode == System.Net.HttpStatusCode.Forbidden
+                || response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+            {
+                uploadUrl.InvalidateProtectedEndpointCapability(
+                    ProtectedEndpointCapabilityKind.FflogsLeasesAbandon);
             }
 
             if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
@@ -374,8 +391,26 @@ public class FFLogsCollector : IDisposable
                     continue;
                 }
 
-                // Get primary upload URL
-                var uploadUrl = Plugin.Configuration.UploadUrls.FirstOrDefault(u => u.IsEnabled);
+                // Get first enabled upload URL that is not circuit-broken and passes transport policy.
+                UploadUrl uploadUrl = null;
+                foreach (var candidate in Plugin.Configuration.UploadUrls.Where(u => u.IsEnabled))
+                {
+                    if (candidate.FailureCount >= Plugin.Configuration.CircuitBreakerFailureThreshold
+                        && (DateTime.UtcNow - candidate.LastFailureTime).TotalMinutes
+                            < Plugin.Configuration.CircuitBreakerBreakDurationMinutes)
+                    {
+                        continue;
+                    }
+
+                    if (!IngestEndpointResolver.TryBuildEndpointUrl(candidate, string.Empty, out _))
+                    {
+                        continue;
+                    }
+
+                    uploadUrl = candidate;
+                    break;
+                }
+
                 if (uploadUrl == null)
                 {
                     consecutiveFailures = 0;
@@ -383,34 +418,28 @@ public class FFLogsCollector : IDisposable
                     continue;
                 }
 
-                // Circuit Breaker check
-                if (uploadUrl.FailureCount >= Plugin.Configuration.CircuitBreakerFailureThreshold)
+                // 1. Request Work
+                if (!IngestEndpointResolver.TryBuildEndpointUrl(uploadUrl, "/contribute/fflogs/jobs", out var workUrl))
                 {
-                    if ((DateTime.UtcNow - uploadUrl.LastFailureTime).TotalMinutes < Plugin.Configuration.CircuitBreakerBreakDurationMinutes)
-                    {
-                        consecutiveFailures = 0;
-                        await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
-                        continue;
-                    }
+                    consecutiveFailures = 0;
+                    await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
+                    continue;
                 }
 
-                var baseUrl = uploadUrl.Url.TrimEnd('/');
-                // Fix base URL if needed (same logic as others)
-                if (baseUrl.EndsWith("/contribute/multiple"))
-                    baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute/multiple".Length);
-                else if (baseUrl.EndsWith("/contribute"))
-                    baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute".Length);
-
-                // 1. Request Work
-                var workUrl = $"{baseUrl}/contribute/fflogs/jobs";
                 List<ParseJob> jobs = null;
                 
                 try 
                 {
+                    var workCapability = uploadUrl.TryGetProtectedEndpointCapability(
+                        ProtectedEndpointCapabilityKind.FflogsJobs,
+                        out var cachedCapability)
+                        ? cachedCapability
+                        : null;
                     using var workRequest = IngestRequestFactory.CreateGetRequest(
                         Plugin.Configuration,
                         workUrl,
-                        "/contribute/fflogs/jobs"
+                        "/contribute/fflogs/jobs",
+                        workCapability
                     );
                     var response = await HttpClient.SendAsync(workRequest, Cts.Token);
                     if (response.IsSuccessStatusCode)
@@ -428,6 +457,12 @@ public class FFLogsCollector : IDisposable
                             hadTransientFailure = true;
                             uploadUrl.FailureCount++;
                             uploadUrl.LastFailureTime = DateTime.UtcNow;
+                            if (response.StatusCode == System.Net.HttpStatusCode.Forbidden
+                                || response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+                            {
+                                uploadUrl.InvalidateProtectedEndpointCapability(
+                                    ProtectedEndpointCapabilityKind.FflogsJobs);
+                            }
                             if ((int)response.StatusCode == 429)
                             {
                                 var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);
@@ -689,15 +724,28 @@ public class FFLogsCollector : IDisposable
                     var submitBatch = BuildSubmitBatch(results);
                     if (submitBatch.Count > 0)
                     {
-                        var submitUrl = $"{baseUrl}/contribute/fflogs/results";
+                        if (!IngestEndpointResolver.TryBuildEndpointUrl(uploadUrl, "/contribute/fflogs/results", out var submitUrl))
+                        {
+                            RequeueSubmitBatch(submitBatch);
+                            consecutiveFailures = 0;
+                            await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
+                            continue;
+                        }
+
                         var jsonContent = JsonConvert.SerializeObject(submitBatch);
                         try
                         {
+                            var submitCapability = uploadUrl.TryGetProtectedEndpointCapability(
+                                ProtectedEndpointCapabilityKind.FflogsResults,
+                                out var cachedCapability)
+                                ? cachedCapability
+                                : null;
                             using var submitRequest = IngestRequestFactory.CreatePostJsonRequest(
                                 Plugin.Configuration,
                                 submitUrl,
                                 "/contribute/fflogs/results",
-                                jsonContent
+                                jsonContent,
+                                submitCapability
                             );
                             var submitResp = await HttpClient.SendAsync(submitRequest, Cts.Token);
                             var submitRespBody = await submitResp.Content.ReadAsStringAsync(Cts.Token);
@@ -718,6 +766,12 @@ public class FFLogsCollector : IDisposable
                             {
                                 hadTransientFailure = true;
                                 RequeueSubmitBatch(submitBatch);
+                                if (submitResp.StatusCode == System.Net.HttpStatusCode.Forbidden
+                                    || submitResp.StatusCode == System.Net.HttpStatusCode.Unauthorized)
+                                {
+                                    uploadUrl.InvalidateProtectedEndpointCapability(
+                                        ProtectedEndpointCapabilityKind.FflogsResults);
+                                }
                                 if ((int)submitResp.StatusCode == 429)
                                 {
                                     var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(submitResp);
@@ -740,7 +794,7 @@ public class FFLogsCollector : IDisposable
                     if (shouldAbandonRemainingLeases)
                     {
                         await TryAbandonUnprocessedLeasesAsync(
-                            baseUrl,
+                            uploadUrl,
                             jobs,
                             results,
                             "fflogs_rate_limit_cooldown"

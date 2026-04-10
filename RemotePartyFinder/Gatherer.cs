@@ -125,12 +125,15 @@ internal sealed class Gatherer : IDisposable {
                 continue;
             }
 
-            var targetUrl = NormalizeTargetUrl(uploadUrl.Url);
+            if (!IngestEndpointResolver.TryBuildEndpointUrl(uploadUrl, "/contribute/multiple", out var targetUrl)) {
+                continue;
+            }
             var attempt = await TryUploadAsync(targetUrl, jsonPayload);
 
             if (attempt.Success) {
                 anySuccess = true;
                 uploadUrl.FailureCount = 0;
+                IngestResponseParser.CaptureMultipleResponse(uploadUrl, attempt.ResponseBody);
             } else {
                 uploadUrl.FailureCount++;
                 uploadUrl.LastFailureTime = DateTime.UtcNow;
@@ -160,18 +163,6 @@ internal sealed class Gatherer : IDisposable {
         return elapsedSinceFailure.TotalMinutes < _plugin.Configuration.CircuitBreakerBreakDurationMinutes;
     }
 
-    private string NormalizeTargetUrl(string configuredUrl) {
-        var baseUrl = configuredUrl.TrimEnd('/');
-
-        if (baseUrl.EndsWith("/contribute/multiple")) {
-            baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute/multiple".Length);
-        } else if (baseUrl.EndsWith("/contribute")) {
-            baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute".Length);
-        }
-
-        return baseUrl + "/contribute/multiple";
-    }
-
     private async Task<UploadAttemptResult> TryUploadAsync(string targetUrl, string jsonPayload) {
         try {
             using var request = IngestRequestFactory.CreatePostJsonRequest(
@@ -181,6 +172,7 @@ internal sealed class Gatherer : IDisposable {
                 jsonPayload
             );
             var response = await _httpClient.SendAsync(request);
+            var responseBody = await response.Content.ReadAsStringAsync();
 
             var retryAfterSeconds = (int)response.StatusCode == 429
                 ? IngestRequestFactory.ReadRetryAfterSeconds(response)
@@ -190,10 +182,11 @@ internal sealed class Gatherer : IDisposable {
                 response.IsSuccessStatusCode,
                 (int)response.StatusCode,
                 retryAfterSeconds,
-                null
+                null,
+                responseBody
             );
         } catch (Exception ex) {
-            return new UploadAttemptResult(false, null, null, ex.Message);
+            return new UploadAttemptResult(false, null, null, ex.Message, string.Empty);
         }
     }
 
@@ -212,6 +205,7 @@ internal sealed class Gatherer : IDisposable {
         bool Success,
         int? StatusCode,
         int? RetryAfterSeconds,
-        string ErrorMessage
+        string ErrorMessage,
+        string ResponseBody
     );
 }

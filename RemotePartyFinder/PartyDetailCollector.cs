@@ -230,19 +230,27 @@ internal sealed class PartyDetailCollector : IDisposable {
                 continue;
             }
 
-            var endpointUrl = BuildDetailEndpoint(uploadTarget.Url);
+            if (!IngestEndpointResolver.TryBuildEndpointUrl(uploadTarget, "/contribute/detail", out var endpointUrl)) {
+                continue;
+            }
+
+            var capabilityToken = uploadTarget.TryGetDetailCapability(payload.ListingId, out var cachedCapability)
+                ? cachedCapability
+                : null;
             try {
                 using var request = IngestRequestFactory.CreatePostJsonRequest(
                     _plugin.Configuration,
                     endpointUrl,
                     "/contribute/detail",
-                    jsonPayload
+                    jsonPayload,
+                    capabilityToken
                 );
                 var response = await _httpClient.SendAsync(request);
                 var body = await response.Content.ReadAsStringAsync();
 
                 if (response.IsSuccessStatusCode) {
                     uploadTarget.FailureCount = 0;
+                    uploadTarget.InvalidateDetailCapability(payload.ListingId);
 
                     if (TryParseDetailResponse(body, out var matchedCount, out var modifiedCount)) {
                         if (matchedCount == 0) {
@@ -259,6 +267,10 @@ internal sealed class PartyDetailCollector : IDisposable {
                 } else {
                     uploadTarget.FailureCount++;
                     uploadTarget.LastFailureTime = DateTime.UtcNow;
+                    if (response.StatusCode == System.Net.HttpStatusCode.Forbidden
+                        || response.StatusCode == System.Net.HttpStatusCode.Unauthorized) {
+                        uploadTarget.InvalidateDetailCapability(payload.ListingId);
+                    }
                     if ((int)response.StatusCode == 429) {
                         var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);
                         if (retryAfter.HasValue) {
@@ -293,17 +305,6 @@ internal sealed class PartyDetailCollector : IDisposable {
 
         var elapsedSinceLastFailure = DateTime.UtcNow - uploadTarget.LastFailureTime;
         return elapsedSinceLastFailure.TotalMinutes < _plugin.Configuration.CircuitBreakerBreakDurationMinutes;
-    }
-
-    private static string BuildDetailEndpoint(string configuredUrl) {
-        var baseUrl = configuredUrl.TrimEnd('/');
-        if (baseUrl.EndsWith("/contribute/multiple")) {
-            baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute/multiple".Length);
-        } else if (baseUrl.EndsWith("/contribute")) {
-            baseUrl = baseUrl.Substring(0, baseUrl.Length - "/contribute".Length);
-        }
-
-        return baseUrl + "/contribute/detail";
     }
 
     private static bool TryParseDetailResponse(string rawBody, out long matchedCount, out long modifiedCount) {

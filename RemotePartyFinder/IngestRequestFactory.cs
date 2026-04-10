@@ -12,9 +12,14 @@ internal static class IngestRequestFactory {
     private const string DefaultSharedSecret = "rpf-reborn-public-ingest-v1";
     private static readonly object ConfigLock = new();
 
-    public static HttpRequestMessage CreateGetRequest(Configuration configuration, string requestUrl, string canonicalPath) {
+    public static HttpRequestMessage CreateGetRequest(
+        Configuration configuration,
+        string requestUrl,
+        string canonicalPath,
+        string capabilityToken = null
+    ) {
         var request = new HttpRequestMessage(HttpMethod.Get, requestUrl);
-        AddIngestHeaders(configuration, request, canonicalPath);
+        AddIngestHeaders(configuration, request, canonicalPath, capabilityToken);
         return request;
     }
 
@@ -22,12 +27,13 @@ internal static class IngestRequestFactory {
         Configuration configuration,
         string requestUrl,
         string canonicalPath,
-        string jsonBody
+        string jsonBody,
+        string capabilityToken = null
     ) {
         var request = new HttpRequestMessage(HttpMethod.Post, requestUrl) {
             Content = new StringContent(jsonBody, Encoding.UTF8, "application/json"),
         };
-        AddIngestHeaders(configuration, request, canonicalPath);
+        AddIngestHeaders(configuration, request, canonicalPath, capabilityToken);
         return request;
     }
 
@@ -57,7 +63,12 @@ internal static class IngestRequestFactory {
         return null;
     }
 
-    private static void AddIngestHeaders(Configuration configuration, HttpRequestMessage request, string canonicalPath) {
+    private static void AddIngestHeaders(
+        Configuration configuration,
+        HttpRequestMessage request,
+        string canonicalPath,
+        string capabilityToken
+    ) {
         var clientId = GetOrCreateClientId(configuration);
         var secret = string.IsNullOrWhiteSpace(configuration.IngestSharedSecret)
             ? DefaultSharedSecret
@@ -85,6 +96,9 @@ internal static class IngestRequestFactory {
         request.Headers.TryAddWithoutValidation("X-RPF-Nonce", nonce);
         request.Headers.TryAddWithoutValidation("X-RPF-Signature", signature);
         request.Headers.TryAddWithoutValidation("X-RPF-Signature-Version", SignatureVersion);
+        if (!string.IsNullOrWhiteSpace(capabilityToken)) {
+            request.Headers.TryAddWithoutValidation("X-RPF-Capability", capabilityToken.Trim());
+        }
     }
 
     private static string GetOrCreateClientId(Configuration configuration) {

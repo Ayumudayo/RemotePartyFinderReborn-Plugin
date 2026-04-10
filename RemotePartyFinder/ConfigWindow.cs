@@ -219,9 +219,9 @@ public class ConfigWindow : Window, IDisposable
                     _uploadUrlError = "Endpoint already exists.";
                     Task.Delay(5000).ContinueWith(t => _uploadUrlError = string.Empty);
                 }
-                else if (!ValidUrl(_uploadUrlTempString))
+                else if (!IngestEndpointResolver.IsValidUploadUrl(_uploadUrlTempString, out var validationError))
                 {
-                    this._uploadUrlError = "Invalid URL format.";
+                    this._uploadUrlError = validationError;
                     Task.Delay(5000).ContinueWith(t => _uploadUrlError = string.Empty);
                 }
                 else
@@ -564,10 +564,6 @@ public class ConfigWindow : Window, IDisposable
         _configuration.UploadUrls = Configuration.DefaultUploadUrls();
         _configuration.Save();
     }
-
-    private static bool ValidUrl(string url)
-        => Uri.TryCreate(url, UriKind.Absolute, out var uriResult)
-           && (uriResult.Scheme == Uri.UriSchemeHttps || uriResult.Scheme == Uri.UriSchemeHttp);
 
     private static string FormatLocalClock(DateTime utcTime)
     {
