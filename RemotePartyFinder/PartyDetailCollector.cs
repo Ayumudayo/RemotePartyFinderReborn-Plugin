@@ -101,12 +101,15 @@ internal sealed class PartyDetailCollector : IDisposable {
 
         var memberContentIds = new List<ulong>(slotCount);
         var memberJobs = new List<byte>(slotCount);
+        var slotFlags = new List<string>(slotCount);
         var nonZeroMemberCount = 0;
 
         for (var slotIndex = 0; slotIndex < slotCount; slotIndex++) {
             var memberContentId = viewedListing.MemberContentIds[slotIndex];
             memberContentIds.Add(memberContentId);
             memberJobs.Add(viewedListing.Jobs[slotIndex]);
+            var rawSlotFlag = Convert.ToUInt64(viewedListing.SlotFlags[slotIndex]);
+            slotFlags.Add($"0x{rawSlotFlag:X16}");
             if (memberContentId != 0) {
                 nonZeroMemberCount++;
             }
@@ -123,9 +126,10 @@ internal sealed class PartyDetailCollector : IDisposable {
             HomeWorld = homeWorld,
             MemberContentIds = memberContentIds,
             MemberJobs = memberJobs,
+            SlotFlags = slotFlags,
         };
 
-        var fingerprint = ComputeFingerprint(memberContentIds, memberJobs);
+        var fingerprint = ComputeFingerprint(memberContentIds, memberJobs, slotFlags);
 
         var now = DateTime.UtcNow;
         if (payload.ListingId == _lastQueuedListingId
@@ -382,13 +386,23 @@ internal sealed class PartyDetailCollector : IDisposable {
         return boundedDelay + jitterMs;
     }
 
-    private static ulong ComputeFingerprint(List<ulong> memberContentIds, List<byte> memberJobs) {
+    private static ulong ComputeFingerprint(
+        List<ulong> memberContentIds,
+        List<byte> memberJobs,
+        List<string> slotFlags
+    ) {
         unchecked {
             var hash = 1469598103934665603UL;
             hash = MixFnv(hash, (ulong)memberContentIds.Count);
             for (var i = 0; i < memberContentIds.Count; i++) {
                 hash = MixFnv(hash, memberContentIds[i]);
                 hash = MixFnv(hash, memberJobs[i]);
+            }
+
+            foreach (var slotFlag in slotFlags) {
+                foreach (var c in slotFlag) {
+                    hash = MixFnv(hash, c);
+                }
             }
 
             return hash;
@@ -435,4 +449,5 @@ internal sealed class UploadablePartyDetail {
     public ushort HomeWorld { get; set; }
     public List<ulong> MemberContentIds { get; set; } = new();
     public List<byte> MemberJobs { get; set; } = new();
+    public List<string> SlotFlags { get; set; } = new();
 }
