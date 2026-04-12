@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
 using ECommons.DalamudServices;
+using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using FFXIVClientStructs.FFXIV.Client.UI.Misc;
@@ -37,6 +38,7 @@ internal sealed class CharaCardResolver : IDisposable {
     private readonly ContentIdResolveQueue _queue = new();
     private readonly ICharaCardResolverRuntime _runtime;
     private readonly Func<ushort, string?> _worldNameResolver;
+    private readonly Func<ulong, string?> _fallbackNameResolver;
     private readonly Func<DateTime> _utcNow;
     private readonly Action<CharacterIdentitySnapshot> _persistResolvedIdentity;
     private readonly TimeSpan _requestTimeout;
@@ -57,6 +59,7 @@ internal sealed class CharaCardResolver : IDisposable {
         ICharaCardResolverRuntime? runtime = null,
         Func<ushort, string?>? worldNameResolver = null,
         Func<DateTime>? utcNow = null,
+        Func<ulong, string?>? fallbackNameResolver = null,
         Action<string>? debugSink = null,
         Action<string>? warningSink = null,
         Action<CharacterIdentitySnapshot>? persistResolvedIdentity = null,
@@ -71,6 +74,7 @@ internal sealed class CharaCardResolver : IDisposable {
         _warningSink = warningSink;
         _runtime = runtime ?? new DalamudCharaCardResolverRuntime(warningSink);
         _worldNameResolver = worldNameResolver ?? ResolveWorldName;
+        _fallbackNameResolver = fallbackNameResolver ?? TryResolveNameFromNameCache;
         _utcNow = utcNow ?? (() => DateTime.UtcNow);
         _persistResolvedIdentity = persistResolvedIdentity ?? _database.UpsertResolvedIdentity;
         _requestTimeout = requestTimeout ?? DefaultRequestTimeout;
@@ -154,6 +158,7 @@ internal sealed class CharaCardResolver : IDisposable {
         ResolveRequestStatus request;
         lock (_sync) {
             if (!_queue.TryStartNext(nowUtc, out request)) {
+                TryPersistNameCacheFallback(nowUtc);
                 return;
             }
         }
@@ -317,6 +322,22 @@ internal sealed class CharaCardResolver : IDisposable {
         return worldHelper->GetWorldNameById(worldId);
     }
 
+    private static unsafe string? TryResolveNameFromNameCache(ulong contentId) {
+        if (contentId == 0) {
+            return null;
+        }
+
+        var nameCache = NameCache.Instance();
+        if (nameCache == null) {
+            return null;
+        }
+
+        var resolvedName = (string)nameCache->GetNameByContentId(contentId);
+        return string.IsNullOrWhiteSpace(resolvedName)
+            ? null
+            : resolvedName.Trim();
+    }
+
     private void LogWarning(string message) {
         _warningSink?.Invoke(message);
     }
@@ -382,6 +403,65 @@ internal sealed class CharaCardResolver : IDisposable {
         }
 
         return true;
+    }
+
+    private bool TryPersistNameCacheFallback(DateTime nowUtc) {
+        ulong contentId = 0;
+        int attemptVersion = 0;
+
+        lock (_sync) {
+            foreach (var request in _queue.Requests
+                         .Where(static request => request.State == ResolveState.FailedTransient)
+                         .OrderBy(static request => request.NextEligibleAttemptAtUtc)
+                         .ThenBy(static request => request.ContentId)) {
+                if (request.LastFallbackAttemptAtUtc != DateTime.MinValue) {
+                    continue;
+                }
+
+                if (_database.TryGetIdentity(request.ContentId, out _)) {
+                    continue;
+                }
+
+                if (_database.TryGetPartialIdentity(request.ContentId, out var partialIdentity)
+                    && !string.IsNullOrWhiteSpace(partialIdentity.Name)) {
+                    continue;
+                }
+
+                contentId = request.ContentId;
+                attemptVersion = request.AttemptVersion;
+                break;
+            }
+
+            if (contentId != 0
+                && !_queue.MarkFallbackAttempt(contentId, attemptVersion, nowUtc)) {
+                return false;
+            }
+        }
+
+        if (contentId == 0) {
+            return false;
+        }
+
+        string? resolvedName;
+        try {
+            resolvedName = _fallbackNameResolver(contentId);
+        } catch (Exception exception) {
+            LogWarning($"CharaCardResolver: failed to read NameCache fallback for {contentId}. {exception.Message}");
+            return false;
+        }
+
+        if (string.IsNullOrWhiteSpace(resolvedName)) {
+            return false;
+        }
+
+        try {
+            _database.UpsertPartialIdentityName(contentId, resolvedName, nowUtc);
+            LogDebug($"CharaCardResolver: stored partial identity name contentId={contentId} name=\"{resolvedName}\".");
+            return true;
+        } catch (Exception exception) {
+            LogWarning($"CharaCardResolver: failed to persist partial identity name for {contentId}. {exception.Message}");
+            return false;
+        }
     }
 
     private void PumpPendingIdentityUploads() {

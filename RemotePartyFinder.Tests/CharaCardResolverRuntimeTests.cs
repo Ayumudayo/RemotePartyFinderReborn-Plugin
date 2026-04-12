@@ -268,6 +268,100 @@ public sealed class CharaCardResolverRuntimeTests {
     }
 
     [Fact]
+    public void Failed_request_uses_name_cache_fallback_without_uploading_incomplete_identity() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+
+        var warnings = new List<string>();
+        var debugLogs = new List<string>();
+        var runtime = new FakeCharaCardResolverRuntime {
+            TryRequestResult = false,
+        };
+
+        using var resolver = new CharaCardResolver(
+            database,
+            runtime,
+            worldId => worldId == 74 ? "Tonberry" : null,
+            fallbackNameResolver: contentId => contentId == 9444UL ? "Fallback Name" : null,
+            utcNow: () => new DateTime(2026, 4, 13, 7, 30, 0, DateTimeKind.Utc),
+            debugSink: debugLogs.Add,
+            warningSink: warnings.Add
+        );
+
+        resolver.EnqueueMany([9444UL]);
+        resolver.Pump();
+
+        Assert.Equal(ResolveState.FailedTransient, resolver.GetResolveState(9444UL));
+        Assert.False(database.TryGetIdentity(9444UL, out _));
+
+        resolver.Pump();
+
+        Assert.False(database.TryGetIdentity(9444UL, out _));
+        Assert.True(database.TryGetPartialIdentity(9444UL, out var partial));
+        Assert.Equal(
+            new PartialCharacterIdentitySnapshot(
+                9444UL,
+                "Fallback Name",
+                null,
+                null,
+                new DateTime(2026, 4, 13, 7, 30, 0, DateTimeKind.Utc)
+            ),
+            partial
+        );
+        Assert.Empty(database.TakePendingIdentityUploads(10));
+        Assert.Contains(
+            warnings,
+            message => message.Contains("failed to dispatch identity request", StringComparison.Ordinal)
+                && message.Contains("contentId=9444", StringComparison.Ordinal)
+        );
+        Assert.Contains(
+            debugLogs,
+            message => message.Contains("stored partial identity name", StringComparison.Ordinal)
+                && message.Contains("contentId=9444", StringComparison.Ordinal)
+                && message.Contains("Fallback Name", StringComparison.Ordinal)
+        );
+    }
+
+    [Fact]
+    public void Failed_request_attempts_name_cache_fallback_only_once_per_backoff_window() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+
+        var runtime = new FakeCharaCardResolverRuntime {
+            TryRequestResult = false,
+        };
+        var nowUtc = new DateTime(2026, 4, 13, 7, 45, 0, DateTimeKind.Utc);
+        var fallbackCalls = 0;
+
+        using var resolver = new CharaCardResolver(
+            database,
+            runtime,
+            worldId => worldId == 74 ? "Tonberry" : null,
+            fallbackNameResolver: contentId => {
+                Assert.Equal(9555UL, contentId);
+                fallbackCalls++;
+                return null;
+            },
+            utcNow: () => nowUtc
+        );
+
+        resolver.EnqueueMany([9555UL]);
+        resolver.Pump();
+        resolver.Pump();
+        resolver.Pump();
+        resolver.Pump();
+
+        Assert.Equal(1, fallbackCalls);
+        Assert.Equal(ResolveState.FailedTransient, resolver.GetResolveState(9555UL));
+
+        nowUtc = nowUtc.AddSeconds(10);
+        resolver.Pump();
+
+        Assert.Equal(1, fallbackCalls);
+        Assert.Equal([9555UL, 9555UL], runtime.RequestedContentIds);
+    }
+
+    [Fact]
     public void Persistence_failure_leaves_request_retryable_instead_of_resolved() {
         using var harness = new TempPlayerCacheDatabase();
         using var database = new PlayerLocalDatabase(harness.DatabasePath);

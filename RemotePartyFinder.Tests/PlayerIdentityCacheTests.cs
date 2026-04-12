@@ -34,6 +34,23 @@ public sealed class PlayerIdentityCacheTests {
     }
 
     [Fact]
+    public void UpsertPartialIdentityName_persists_partial_without_marking_pending_upload() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+
+        var updatedAtUtc = new DateTime(2026, 4, 12, 16, 15, 0, DateTimeKind.Utc);
+        database.UpsertPartialIdentityName(151UL, "Partial Player", updatedAtUtc);
+
+        Assert.False(database.TryGetIdentity(151UL, out _));
+        Assert.True(database.TryGetPartialIdentity(151UL, out var partial));
+        Assert.Equal(
+            new PartialCharacterIdentitySnapshot(151UL, "Partial Player", null, null, updatedAtUtc),
+            partial
+        );
+        Assert.Empty(database.TakePendingIdentityUploads(10));
+    }
+
+    [Fact]
     public void TryGetIdentity_returns_false_for_unknown_content_id() {
         using var harness = new TempPlayerCacheDatabase();
         using var database = new PlayerLocalDatabase(harness.DatabasePath);
@@ -66,6 +83,30 @@ public sealed class PlayerIdentityCacheTests {
     }
 
     [Fact]
+    public void UpsertResolvedIdentity_removes_existing_partial_identity() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+
+        database.UpsertPartialIdentityName(
+            212UL,
+            "Partial Before Complete",
+            new DateTime(2026, 4, 12, 16, 20, 0, DateTimeKind.Utc)
+        );
+
+        database.UpsertResolvedIdentity(new CharacterIdentitySnapshot(
+            212UL,
+            "Complete Player",
+            21,
+            "Ravana",
+            new DateTime(2026, 4, 12, 16, 25, 0, DateTimeKind.Utc)
+        ));
+
+        Assert.False(database.TryGetPartialIdentity(212UL, out _));
+        Assert.True(database.TryGetIdentity(212UL, out var stored));
+        Assert.Equal("Complete Player", stored!.Name);
+    }
+
+    [Fact]
     public void Initialize_migrates_existing_player_cache_without_data_loss() {
         using var harness = new TempPlayerCacheDatabase();
         CreateLegacyPlayersSchema(harness.DatabasePath);
@@ -86,7 +127,7 @@ public sealed class PlayerIdentityCacheTests {
     }
 
     [Fact]
-    public void Initialize_handles_partial_identity_columns_idempotently() {
+    public void Initialize_handles_existing_complete_identity_table_idempotently() {
         using var harness = new TempPlayerCacheDatabase();
         CreateLegacyPlayersSchema(harness.DatabasePath);
         CreatePartialIdentitySchema(harness.DatabasePath);
@@ -111,6 +152,35 @@ public sealed class PlayerIdentityCacheTests {
         Assert.Equal("Migrated Identity", storedAgain!.Name);
         Assert.Equal("Omega", storedAgain.WorldName);
         Assert.Empty(secondInitialization.TakePendingIdentityUploads(10));
+    }
+
+    [Fact]
+    public void Initialize_handles_partial_identity_table_idempotently() {
+        using var harness = new TempPlayerCacheDatabase();
+        CreateLegacyPlayersSchema(harness.DatabasePath);
+        CreatePartialIdentityFallbackSchema(harness.DatabasePath);
+
+        using (var firstInitialization = new PlayerLocalDatabase(harness.DatabasePath)) {
+            Assert.True(firstInitialization.TryGetPartialIdentity(402UL, out var partial));
+            Assert.Equal(
+                new PartialCharacterIdentitySnapshot(
+                    402UL,
+                    "Partial Identity",
+                    null,
+                    null,
+                    new DateTime(2026, 4, 12, 17, 5, 0, DateTimeKind.Utc)
+                ),
+                partial
+            );
+            Assert.False(firstInitialization.TryGetIdentity(402UL, out _));
+        }
+
+        using var secondInitialization = new PlayerLocalDatabase(harness.DatabasePath);
+        Assert.True(secondInitialization.TryGetPartialIdentity(402UL, out var partialAgain));
+        Assert.Equal("Partial Identity", partialAgain!.Name);
+        Assert.Null(partialAgain.HomeWorld);
+        Assert.Null(partialAgain.WorldName);
+        Assert.False(secondInitialization.TryGetIdentity(402UL, out _));
     }
 
     private static void CreateLegacyPlayersSchema(string databasePath) {
@@ -180,6 +250,34 @@ public sealed class PlayerIdentityCacheTests {
                 79,
                 'Omega',
                 '2026-04-12T17:00:00.0000000Z'
+            );
+            """;
+        command.ExecuteNonQuery();
+    }
+
+    private static void CreatePartialIdentityFallbackSchema(string databasePath) {
+        using var connection = OpenConnection(databasePath);
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            CREATE TABLE player_identity_partials (
+                content_id INTEGER PRIMARY KEY,
+                name TEXT,
+                home_world INTEGER,
+                world_name TEXT,
+                last_updated_utc TEXT NOT NULL
+            );
+            INSERT INTO player_identity_partials (
+                content_id,
+                name,
+                home_world,
+                world_name,
+                last_updated_utc
+            ) VALUES (
+                402,
+                'Partial Identity',
+                NULL,
+                NULL,
+                '2026-04-12T17:05:00.0000000Z'
             );
             """;
         command.ExecuteNonQuery();

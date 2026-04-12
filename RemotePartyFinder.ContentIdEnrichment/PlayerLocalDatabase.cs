@@ -12,9 +12,10 @@ namespace RemotePartyFinder;
 internal sealed class PlayerLocalDatabase : IDisposable {
     public const int MaxBatchSize = 100;
 
-    private const int CurrentSchemaVersion = 2;
+    private const int CurrentSchemaVersion = 3;
     private const string PlayersTableName = "players";
     private const string IdentitiesTableName = "player_identities";
+    private const string PartialIdentitiesTableName = "player_identity_partials";
 
     private readonly string _databasePath;
     private readonly object _sync = new();
@@ -224,10 +225,74 @@ internal sealed class PlayerLocalDatabase : IDisposable {
         }
     }
 
-    public void UpsertResolvedIdentity(CharacterIdentitySnapshot snapshot) {
+    public bool TryGetPartialIdentity(ulong contentId, [NotNullWhen(true)] out PartialCharacterIdentitySnapshot? snapshot) {
         lock (_sync) {
             using var connection = OpenConnection();
             using var command = connection.CreateCommand();
+            command.CommandText = """
+                SELECT name, home_world, world_name, last_updated_utc
+                FROM player_identity_partials
+                WHERE content_id = @content_id
+                LIMIT 1;
+                """;
+            command.Parameters.AddWithValue("@content_id", (long)contentId);
+
+            using var reader = command.ExecuteReader();
+            if (!reader.Read()) {
+                snapshot = null;
+                return false;
+            }
+
+            snapshot = new PartialCharacterIdentitySnapshot(
+                contentId,
+                reader.IsDBNull(0) ? null : reader.GetString(0),
+                reader.IsDBNull(1) ? null : Convert.ToUInt16(reader.GetInt64(1)),
+                reader.IsDBNull(2) ? null : reader.GetString(2),
+                ParseTimestamp(reader.GetString(3))
+            );
+            return true;
+        }
+    }
+
+    public void UpsertPartialIdentityName(ulong contentId, string name, DateTime updatedAtUtc) {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+
+        lock (_sync) {
+            using var connection = OpenConnection();
+            using var command = connection.CreateCommand();
+            command.CommandText = """
+                INSERT INTO player_identity_partials (
+                    content_id,
+                    name,
+                    home_world,
+                    world_name,
+                    last_updated_utc
+                )
+                VALUES (
+                    @content_id,
+                    @name,
+                    NULL,
+                    NULL,
+                    @last_updated_utc
+                )
+                ON CONFLICT(content_id) DO UPDATE SET
+                    name = excluded.name,
+                    last_updated_utc = excluded.last_updated_utc;
+                """;
+
+            command.Parameters.AddWithValue("@content_id", (long)contentId);
+            command.Parameters.AddWithValue("@name", name.Trim());
+            command.Parameters.AddWithValue("@last_updated_utc", updatedAtUtc.ToString("O"));
+            command.ExecuteNonQuery();
+        }
+    }
+
+    public void UpsertResolvedIdentity(CharacterIdentitySnapshot snapshot) {
+        lock (_sync) {
+            using var connection = OpenConnection();
+            using var transaction = connection.BeginTransaction();
+            using var command = connection.CreateCommand();
+            command.Transaction = transaction;
             command.CommandText = """
                 INSERT INTO player_identities (
                     content_id,
@@ -262,6 +327,16 @@ internal sealed class PlayerLocalDatabase : IDisposable {
             command.Parameters.AddWithValue("@world_name", snapshot.WorldName);
             command.Parameters.AddWithValue("@last_resolved_utc", snapshot.LastResolvedAtUtc.ToString("O"));
             command.ExecuteNonQuery();
+
+            using var deletePartialCommand = connection.CreateCommand();
+            deletePartialCommand.Transaction = transaction;
+            deletePartialCommand.CommandText = """
+                DELETE FROM player_identity_partials
+                WHERE content_id = @content_id;
+                """;
+            deletePartialCommand.Parameters.AddWithValue("@content_id", (long)snapshot.ContentId);
+            deletePartialCommand.ExecuteNonQuery();
+            transaction.Commit();
         }
     }
 
@@ -344,6 +419,7 @@ internal sealed class PlayerLocalDatabase : IDisposable {
 
             EnsurePlayersTable(connection);
             MigrateIdentityColumns(connection);
+            EnsurePartialIdentityTable(connection);
             EnsureSchemaVersion(connection);
         }
     }
@@ -410,6 +486,20 @@ internal sealed class PlayerLocalDatabase : IDisposable {
             ON player_identities(pending_upload, last_resolved_utc);
             """;
         createIndexCommand.ExecuteNonQuery();
+    }
+
+    private static void EnsurePartialIdentityTable(SqliteConnection connection) {
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            CREATE TABLE IF NOT EXISTS player_identity_partials (
+                content_id INTEGER PRIMARY KEY,
+                name TEXT,
+                home_world INTEGER,
+                world_name TEXT,
+                last_updated_utc TEXT NOT NULL
+            );
+            """;
+        command.ExecuteNonQuery();
     }
 
     private static void EnsureSchemaVersion(SqliteConnection connection) {

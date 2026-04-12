@@ -215,4 +215,27 @@ public sealed class ContentIdEnrichmentModelsTests {
         Assert.Equal(ResolveState.Resolved, request.State);
         Assert.Equal(snapshot.LastResolvedAtUtc, request.LastResolvedAtUtc);
     }
+
+    [Fact]
+    public void Mark_fallback_attempt_allows_only_one_attempt_per_transient_failure_window() {
+        var nowUtc = new DateTime(2026, 4, 13, 3, 0, 0, DateTimeKind.Utc);
+        var queue = new ContentIdResolveQueue();
+
+        Assert.True(queue.Enqueue(9009UL, nowUtc));
+        Assert.True(queue.TryStartNext(nowUtc, out var firstAttempt));
+        Assert.True(queue.MarkTimeout(9009UL, firstAttempt.AttemptVersion, nowUtc.AddSeconds(1)));
+
+        Assert.True(queue.MarkFallbackAttempt(9009UL, firstAttempt.AttemptVersion, nowUtc.AddSeconds(2)));
+        Assert.False(queue.MarkFallbackAttempt(9009UL, firstAttempt.AttemptVersion, nowUtc.AddSeconds(3)));
+
+        var failedRequest = queue.GetRequest(9009UL);
+        Assert.Equal(nowUtc.AddSeconds(2), failedRequest.LastFallbackAttemptAtUtc);
+
+        Assert.True(queue.TryStartNext(failedRequest.NextEligibleAttemptAtUtc, out var secondAttempt));
+        Assert.True(queue.MarkTimeout(9009UL, secondAttempt.AttemptVersion, failedRequest.NextEligibleAttemptAtUtc.AddSeconds(1)));
+
+        var retriedRequest = queue.GetRequest(9009UL);
+        Assert.Equal(DateTime.MinValue, retriedRequest.LastFallbackAttemptAtUtc);
+        Assert.True(queue.MarkFallbackAttempt(9009UL, secondAttempt.AttemptVersion, retriedRequest.NextEligibleAttemptAtUtc.AddSeconds(-1)));
+    }
 }
