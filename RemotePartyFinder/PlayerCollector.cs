@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Runtime.InteropServices;
@@ -30,7 +31,7 @@ internal sealed class PlayerCollector : IDisposable {
 
     internal PlayerCollector(Plugin plugin) {
         _plugin = plugin;
-        _database = new PlayerLocalDatabase(plugin);
+        _database = new PlayerLocalDatabase(Path.Combine(Plugin.PluginInterface.ConfigDirectory.FullName, "player_cache.db"));
         _scanTimer.Start();
         _plugin.Framework.Update += OnUpdate;
     }
@@ -188,17 +189,4 @@ internal sealed class PlayerCollector : IDisposable {
         return elapsedSinceFailure.TotalMinutes < _plugin.Configuration.CircuitBreakerBreakDurationMinutes;
     }
 
-}
-
-[Serializable]
-[JsonObject(NamingStrategyType = typeof(SnakeCaseNamingStrategy))]
-internal sealed class UploadablePlayer {
-    public ulong ContentId { get; set; }
-    public string Name { get; set; } = string.Empty;
-    public ushort HomeWorld { get; set; }
-
-    [JsonProperty(DefaultValueHandling = DefaultValueHandling.Include)]
-    public ushort CurrentWorld { get; set; }
-
-    public ulong AccountId { get; set; }
 }

@@ -33,6 +33,11 @@
           "SQLitePCLRaw.core": "2.1.10"
         }
       },
+      "Newtonsoft.Json": {
+        "type": "Transitive",
+        "resolved": "13.0.3",
+        "contentHash": "HrC5BXdl00IP9zeV+0Z848QWPAoCr9P3bDEZguI+gkLcBKAOxix/tLEAAHC+UvDNPv4a2d18lOReHMOagPa+zQ=="
+      },
       "SQLitePCLRaw.bundle_e_sqlite3": {
         "type": "Transitive",
         "resolved": "2.1.10",
@@ -64,7 +69,11 @@
         "type": "Project"
       },
       "remotepartyfinder.contentidenrichment": {
-        "type": "Project"
+        "type": "Project",
+        "dependencies": {
+          "Microsoft.Data.Sqlite": "[9.0.4, )",
+          "Newtonsoft.Json": "[13.0.3, )"
+        }
       }
     }
   }
