@@ -66,6 +66,7 @@
 
     <ItemGroup>
         <ProjectReference Include="..\ECommons\ECommons\ECommons.csproj" />
+        <ProjectReference Include="..\RemotePartyFinder.ContentIdEnrichment\RemotePartyFinder.ContentIdEnrichment.csproj" />
     </ItemGroup>
 
 </Project>

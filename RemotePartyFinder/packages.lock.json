@@ -62,6 +62,9 @@
       },
       "ecommons": {
         "type": "Project"
+      },
+      "remotepartyfinder.contentidenrichment": {
+        "type": "Project"
       }
     }
   }

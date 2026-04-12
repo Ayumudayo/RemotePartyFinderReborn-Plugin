@@ -51,6 +51,7 @@ internal sealed record ResolveRequestStatus(
     ulong ContentId,
     ResolveState State,
     int TimeoutCount,
+    int AttemptVersion,
     DateTime LastRequestedAtUtc,
     DateTime LastResolvedAtUtc,
     DateTime NextEligibleAttemptAtUtc
@@ -83,6 +84,7 @@ internal sealed class ContentIdResolveQueue {
                 contentId,
                 ResolveState.Queued,
                 0,
+                0,
                 DateTime.MinValue,
                 DateTime.MinValue,
                 nowUtc
@@ -96,6 +98,11 @@ internal sealed class ContentIdResolveQueue {
 
         if (existing.State == ResolveState.Resolved
             && nowUtc - existing.LastResolvedAtUtc < _freshIdentityTtl) {
+            return false;
+        }
+
+        if (existing.State == ResolveState.FailedTransient
+            && nowUtc < existing.NextEligibleAttemptAtUtc) {
             return false;
         }
 
@@ -126,6 +133,7 @@ internal sealed class ContentIdResolveQueue {
                      .ThenBy(candidate => candidate.ContentId)) {
             request = candidate with {
                 State = ResolveState.InFlight,
+                AttemptVersion = candidate.AttemptVersion + 1,
                 LastRequestedAtUtc = nowUtc,
             };
             _requests[candidate.ContentId] = request;
@@ -136,9 +144,13 @@ internal sealed class ContentIdResolveQueue {
         return false;
     }
 
-    public void MarkTimeout(ulong contentId, DateTime nowUtc) {
+    public bool MarkTimeout(ulong contentId, int attemptVersion, DateTime nowUtc) {
         if (!_requests.TryGetValue(contentId, out var request)) {
-            return;
+            return false;
+        }
+
+        if (request.State != ResolveState.InFlight || request.AttemptVersion != attemptVersion) {
+            return false;
         }
 
         var timeoutCount = request.TimeoutCount + 1;
@@ -147,12 +159,24 @@ internal sealed class ContentIdResolveQueue {
             TimeoutCount = timeoutCount,
             NextEligibleAttemptAtUtc = nowUtc + GetTimeoutBackoff(timeoutCount),
         };
+        return true;
     }
 
     public void MarkResolved(CharacterIdentitySnapshot snapshot) {
+        if (_requests.TryGetValue(snapshot.ContentId, out var existing)) {
+            _requests[snapshot.ContentId] = existing with {
+                State = ResolveState.Resolved,
+                TimeoutCount = 0,
+                LastResolvedAtUtc = snapshot.LastResolvedAtUtc,
+                NextEligibleAttemptAtUtc = snapshot.LastResolvedAtUtc,
+            };
+            return;
+        }
+
         _requests[snapshot.ContentId] = new ResolveRequestStatus(
             snapshot.ContentId,
             ResolveState.Resolved,
+            0,
             0,
             DateTime.MinValue,
             snapshot.LastResolvedAtUtc,
