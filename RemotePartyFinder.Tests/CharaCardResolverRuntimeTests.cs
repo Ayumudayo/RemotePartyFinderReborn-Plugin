@@ -47,6 +47,9 @@ public sealed class CharaCardResolverRuntimeTests {
         resolver.EnqueueMany([3003UL]);
         resolver.Pump();
         runtime.Deliver(new CharaCardPacketModel(3003UL, 74, "Resolved Player"));
+        Assert.Equal(ResolveState.InFlight, resolver.GetResolveState(3003UL));
+
+        resolver.Pump();
 
         Assert.Equal(ResolveState.Resolved, resolver.GetResolveState(3003UL));
         Assert.True(database.TryGetIdentity(3003UL, out var snapshot));
@@ -120,6 +123,112 @@ public sealed class CharaCardResolverRuntimeTests {
 
         Assert.True(runtime.IsDisposed);
         Assert.Empty(runtime.RequestedContentIds);
+    }
+
+    [Fact]
+    public void ResolverQueue_times_out_accepted_request_and_retries_after_backoff_when_no_packet_arrives() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+
+        var nowUtc = new DateTime(2026, 4, 13, 6, 0, 0, DateTimeKind.Utc);
+        var runtime = new FakeCharaCardResolverRuntime();
+        using var resolver = new CharaCardResolver(
+            database,
+            runtime,
+            worldId => "Tonberry",
+            () => nowUtc,
+            requestTimeout: TimeSpan.FromSeconds(5)
+        );
+
+        resolver.EnqueueMany([7007UL]);
+        resolver.Pump();
+
+        Assert.Equal(ResolveState.InFlight, resolver.GetResolveState(7007UL));
+        Assert.Equal([7007UL], runtime.RequestedContentIds);
+
+        nowUtc = nowUtc.AddSeconds(6);
+        resolver.Pump();
+
+        Assert.Equal(ResolveState.FailedTransient, resolver.GetResolveState(7007UL));
+        Assert.Equal([7007UL], runtime.RequestedContentIds);
+
+        nowUtc = nowUtc.AddSeconds(10);
+        resolver.Pump();
+
+        Assert.Equal(ResolveState.InFlight, resolver.GetResolveState(7007UL));
+        Assert.Equal([7007UL, 7007UL], runtime.RequestedContentIds);
+    }
+
+    [Fact]
+    public void Packet_receipt_is_buffered_until_pump_persists_identity() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+
+        var persisted = new List<CharacterIdentitySnapshot>();
+        var runtime = new FakeCharaCardResolverRuntime();
+        using var resolver = new CharaCardResolver(
+            database,
+            runtime,
+            worldId => worldId == 74 ? "Tonberry" : null,
+            () => new DateTime(2026, 4, 13, 7, 0, 0, DateTimeKind.Utc),
+            persistResolvedIdentity: snapshot => persisted.Add(snapshot)
+        );
+
+        resolver.EnqueueMany([8008UL]);
+        resolver.Pump();
+        runtime.Deliver(new CharaCardPacketModel(8008UL, 74, "Buffered Player"));
+
+        Assert.Empty(persisted);
+        Assert.Equal(ResolveState.InFlight, resolver.GetResolveState(8008UL));
+
+        resolver.Pump();
+
+        Assert.Equal(
+            [
+                new CharacterIdentitySnapshot(
+                    8008UL,
+                    "Buffered Player",
+                    74,
+                    "Tonberry",
+                    new DateTime(2026, 4, 13, 7, 0, 0, DateTimeKind.Utc))
+            ],
+            persisted
+        );
+        Assert.Equal(ResolveState.Resolved, resolver.GetResolveState(8008UL));
+    }
+
+    [Fact]
+    public void Persistence_failure_leaves_request_retryable_instead_of_resolved() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+
+        var nowUtc = new DateTime(2026, 4, 13, 8, 0, 0, DateTimeKind.Utc);
+        var runtime = new FakeCharaCardResolverRuntime();
+        using var resolver = new CharaCardResolver(
+            database,
+            runtime,
+            worldId => worldId == 21 ? "Ravana" : null,
+            () => nowUtc,
+            persistResolvedIdentity: _ => throw new InvalidOperationException("persist failed")
+        );
+
+        resolver.EnqueueMany([9009UL]);
+        resolver.Pump();
+        runtime.Deliver(new CharaCardPacketModel(9009UL, 21, "Retry Player"));
+
+        Assert.Equal(ResolveState.InFlight, resolver.GetResolveState(9009UL));
+
+        var exception = Record.Exception(() => resolver.Pump());
+
+        Assert.Null(exception);
+        Assert.Equal(ResolveState.FailedTransient, resolver.GetResolveState(9009UL));
+        Assert.False(database.TryGetIdentity(9009UL, out _));
+
+        nowUtc = nowUtc.AddSeconds(10);
+        resolver.Pump();
+
+        Assert.Equal([9009UL, 9009UL], runtime.RequestedContentIds);
+        Assert.Equal(ResolveState.InFlight, resolver.GetResolveState(9009UL));
     }
 
     private sealed class FakeCharaCardResolverRuntime : ICharaCardResolverRuntime {

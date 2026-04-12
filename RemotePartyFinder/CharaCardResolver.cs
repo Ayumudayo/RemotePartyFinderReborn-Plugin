@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
 using ECommons.DalamudServices;
@@ -24,12 +25,17 @@ internal interface ICharaCardResolverRuntime : IDisposable {
 }
 
 internal sealed class CharaCardResolver : IDisposable {
+    private static readonly TimeSpan DefaultRequestTimeout = TimeSpan.FromSeconds(5);
+
     private readonly PlayerLocalDatabase _database;
     private readonly ContentIdResolveQueue _queue = new();
     private readonly ICharaCardResolverRuntime _runtime;
     private readonly Func<ushort, string?> _worldNameResolver;
     private readonly Func<DateTime> _utcNow;
+    private readonly Action<CharacterIdentitySnapshot> _persistResolvedIdentity;
+    private readonly TimeSpan _requestTimeout;
     private readonly Action<string>? _warningSink;
+    private readonly Dictionary<ulong, PendingProjection> _pendingProjections = new();
     private readonly object _sync = new();
     private bool _disposed;
 
@@ -38,13 +44,17 @@ internal sealed class CharaCardResolver : IDisposable {
         ICharaCardResolverRuntime? runtime = null,
         Func<ushort, string?>? worldNameResolver = null,
         Func<DateTime>? utcNow = null,
-        Action<string>? warningSink = null
+        Action<string>? warningSink = null,
+        Action<CharacterIdentitySnapshot>? persistResolvedIdentity = null,
+        TimeSpan? requestTimeout = null
     ) {
         _database = database ?? throw new ArgumentNullException(nameof(database));
         _warningSink = warningSink;
         _runtime = runtime ?? new DalamudCharaCardResolverRuntime(warningSink);
         _worldNameResolver = worldNameResolver ?? ResolveWorldName;
         _utcNow = utcNow ?? (() => DateTime.UtcNow);
+        _persistResolvedIdentity = persistResolvedIdentity ?? _database.UpsertResolvedIdentity;
+        _requestTimeout = requestTimeout ?? DefaultRequestTimeout;
 
         Preflight = _runtime.CheckAvailability();
         if (!Preflight.Enabled) {
@@ -92,9 +102,19 @@ internal sealed class CharaCardResolver : IDisposable {
             return;
         }
 
+        var nowUtc = _utcNow();
+
+        lock (_sync) {
+            ExpireStaleInflightRequests(nowUtc);
+        }
+
+        if (TryPersistPendingProjection(nowUtc)) {
+            return;
+        }
+
         ResolveRequestStatus request;
         lock (_sync) {
-            if (!_queue.TryStartNext(_utcNow(), out request)) {
+            if (!_queue.TryStartNext(nowUtc, out request)) {
                 return;
             }
         }
@@ -171,10 +191,9 @@ internal sealed class CharaCardResolver : IDisposable {
         }
 
         lock (_sync) {
-            _queue.MarkResolved(snapshot);
+            var request = _queue.GetRequest(snapshot.ContentId);
+            _pendingProjections[snapshot.ContentId] = new PendingProjection(snapshot, request.AttemptVersion);
         }
-
-        _database.UpsertResolvedIdentity(snapshot);
     }
 
     private void DisableEnrichment(string reason) {
@@ -208,6 +227,64 @@ internal sealed class CharaCardResolver : IDisposable {
     private void LogWarning(string message) {
         _warningSink?.Invoke(message);
     }
+
+    private void ExpireStaleInflightRequests(DateTime nowUtc) {
+        foreach (var request in _queue.Requests) {
+            if (request.State != ResolveState.InFlight) {
+                continue;
+            }
+
+            if (_pendingProjections.ContainsKey(request.ContentId)) {
+                continue;
+            }
+
+            if (request.LastRequestedAtUtc == DateTime.MinValue) {
+                continue;
+            }
+
+            if (nowUtc - request.LastRequestedAtUtc < _requestTimeout) {
+                continue;
+            }
+
+            _queue.MarkTimeout(request.ContentId, request.AttemptVersion, nowUtc);
+        }
+    }
+
+    private bool TryPersistPendingProjection(DateTime nowUtc) {
+        PendingProjection? candidate = null;
+
+        lock (_sync) {
+            foreach (var entry in _pendingProjections.OrderBy(static entry => entry.Key)) {
+                candidate = entry.Value;
+                break;
+            }
+        }
+
+        if (candidate is null) {
+            return false;
+        }
+
+        try {
+            _persistResolvedIdentity(candidate.Snapshot);
+            lock (_sync) {
+                _pendingProjections.Remove(candidate.Snapshot.ContentId);
+                _queue.MarkResolved(candidate.Snapshot);
+            }
+        } catch (Exception exception) {
+            LogWarning($"CharaCardResolver: failed to persist resolved identity for {candidate.Snapshot.ContentId}. {exception.Message}");
+            lock (_sync) {
+                _pendingProjections.Remove(candidate.Snapshot.ContentId);
+                _queue.MarkTimeout(candidate.Snapshot.ContentId, candidate.AttemptVersion, nowUtc);
+            }
+        }
+
+        return true;
+    }
+
+    private sealed record PendingProjection(
+        CharacterIdentitySnapshot Snapshot,
+        int AttemptVersion
+    );
 }
 
 internal unsafe sealed class DalamudCharaCardResolverRuntime : ICharaCardResolverRuntime {
