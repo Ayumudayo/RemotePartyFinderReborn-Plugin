@@ -1,6 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Net.Http;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
 using ECommons.DalamudServices;
@@ -26,6 +30,7 @@ internal interface ICharaCardResolverRuntime : IDisposable {
 
 internal sealed class CharaCardResolver : IDisposable {
     private static readonly TimeSpan DefaultRequestTimeout = TimeSpan.FromSeconds(5);
+    private const string IdentityUploadPath = "/contribute/character-identity";
 
     private readonly PlayerLocalDatabase _database;
     private readonly ContentIdResolveQueue _queue = new();
@@ -35,8 +40,13 @@ internal sealed class CharaCardResolver : IDisposable {
     private readonly Action<CharacterIdentitySnapshot> _persistResolvedIdentity;
     private readonly TimeSpan _requestTimeout;
     private readonly Action<string>? _warningSink;
+    private readonly Func<IReadOnlyList<CharacterIdentityUploadPayload>, CancellationToken, Task<bool>>? _uploadResolvedIdentitiesAsync;
+    private readonly HttpClient _identityUploadHttpClient;
+    private readonly bool _ownsIdentityUploadHttpClient;
+    private readonly CancellationTokenSource _disposeCts = new();
     private readonly Dictionary<ulong, PendingProjection> _pendingProjections = new();
     private readonly object _sync = new();
+    private int _identityUploadWorkerBusy;
     private bool _disposed;
 
     internal CharaCardResolver(
@@ -46,7 +56,10 @@ internal sealed class CharaCardResolver : IDisposable {
         Func<DateTime>? utcNow = null,
         Action<string>? warningSink = null,
         Action<CharacterIdentitySnapshot>? persistResolvedIdentity = null,
-        TimeSpan? requestTimeout = null
+        TimeSpan? requestTimeout = null,
+        Configuration? configuration = null,
+        Func<IReadOnlyList<CharacterIdentityUploadPayload>, CancellationToken, Task<bool>>? uploadResolvedIdentitiesAsync = null,
+        HttpClient? identityUploadHttpClient = null
     ) {
         _database = database ?? throw new ArgumentNullException(nameof(database));
         _warningSink = warningSink;
@@ -55,6 +68,18 @@ internal sealed class CharaCardResolver : IDisposable {
         _utcNow = utcNow ?? (() => DateTime.UtcNow);
         _persistResolvedIdentity = persistResolvedIdentity ?? _database.UpsertResolvedIdentity;
         _requestTimeout = requestTimeout ?? DefaultRequestTimeout;
+        _identityUploadHttpClient = identityUploadHttpClient ?? new HttpClient();
+        _ownsIdentityUploadHttpClient = identityUploadHttpClient is null;
+        _uploadResolvedIdentitiesAsync = uploadResolvedIdentitiesAsync
+            ?? (configuration is null
+                ? null
+                : (payloads, cancellationToken) => UploadResolvedIdentitiesAsync(
+                    configuration,
+                    payloads,
+                    _identityUploadHttpClient,
+                    warningSink,
+                    cancellationToken
+                ));
 
         Preflight = _runtime.CheckAvailability();
         if (!Preflight.Enabled) {
@@ -98,7 +123,13 @@ internal sealed class CharaCardResolver : IDisposable {
     }
 
     internal void Pump() {
-        if (_disposed || !IsEnabled) {
+        if (_disposed) {
+            return;
+        }
+
+        PumpPendingIdentityUploads();
+
+        if (!IsEnabled) {
             return;
         }
 
@@ -133,6 +164,45 @@ internal sealed class CharaCardResolver : IDisposable {
     internal ResolveState GetResolveState(ulong contentId) {
         lock (_sync) {
             return _queue.GetState(contentId);
+        }
+    }
+
+    internal async Task<bool> DrainPendingIdentityUploadsOnceAsync(CancellationToken cancellationToken) {
+        if (_disposed || _uploadResolvedIdentitiesAsync is null) {
+            return false;
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var snapshots = _database.TakePendingIdentityUploads(PlayerLocalDatabase.MaxBatchSize);
+        if (snapshots.Count == 0) {
+            return false;
+        }
+
+        var payloads = snapshots
+            .Select(static snapshot => CharacterIdentityUploadPayload.FromSnapshot(snapshot, snapshot.LastResolvedAtUtc))
+            .ToArray();
+
+        bool uploadSucceeded;
+        try {
+            uploadSucceeded = await _uploadResolvedIdentitiesAsync(payloads, cancellationToken).ConfigureAwait(false);
+        } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested || _disposeCts.IsCancellationRequested) {
+            return false;
+        } catch (Exception exception) {
+            LogWarning($"CharaCardResolver: failed to upload resolved identities. {exception.Message}");
+            return false;
+        }
+
+        if (!uploadSucceeded) {
+            return false;
+        }
+
+        try {
+            _database.MarkIdentityUploadsSubmitted(payloads.Select(static payload => payload.ContentId));
+            return true;
+        } catch (Exception exception) {
+            LogWarning($"CharaCardResolver: failed to mark identity uploads as submitted. {exception.Message}");
+            return false;
         }
     }
 
@@ -178,7 +248,12 @@ internal sealed class CharaCardResolver : IDisposable {
 
         _disposed = true;
         IsEnabled = false;
+        _disposeCts.Cancel();
         _runtime.Dispose();
+        _disposeCts.Dispose();
+        if (_ownsIdentityUploadHttpClient) {
+            _identityUploadHttpClient.Dispose();
+        }
     }
 
     private void HandlePacket(CharaCardPacketModel packet) {
@@ -283,6 +358,105 @@ internal sealed class CharaCardResolver : IDisposable {
         }
 
         return true;
+    }
+
+    private void PumpPendingIdentityUploads() {
+        if (_uploadResolvedIdentitiesAsync is null) {
+            return;
+        }
+
+        if (Interlocked.CompareExchange(ref _identityUploadWorkerBusy, 1, 0) != 0) {
+            return;
+        }
+
+        if (_database.TakePendingIdentityUploads(1).Count == 0) {
+            Interlocked.Exchange(ref _identityUploadWorkerBusy, 0);
+            return;
+        }
+
+        var cancellationToken = _disposeCts.Token;
+        _ = Task.Run(async () => {
+            try {
+                await DrainPendingIdentityUploadsOnceAsync(cancellationToken).ConfigureAwait(false);
+            } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
+            } catch (Exception exception) {
+                LogWarning($"CharaCardResolver: identity upload worker failed. {exception.Message}");
+            } finally {
+                Interlocked.Exchange(ref _identityUploadWorkerBusy, 0);
+            }
+        }, cancellationToken);
+    }
+
+    private static async Task<bool> UploadResolvedIdentitiesAsync(
+        Configuration configuration,
+        IReadOnlyList<CharacterIdentityUploadPayload> payloads,
+        HttpClient httpClient,
+        Action<string>? warningSink,
+        CancellationToken cancellationToken
+    ) {
+        if (payloads.Count == 0) {
+            return false;
+        }
+
+        var jsonPayload = JsonSerializer.Serialize(payloads);
+        var anySuccess = false;
+
+        foreach (var uploadTarget in configuration.UploadUrls.Where(static candidate => candidate.IsEnabled)) {
+            if (IsCircuitOpen(configuration, uploadTarget)) {
+                continue;
+            }
+
+            if (!IngestEndpointResolver.TryBuildEndpointUrl(uploadTarget, IdentityUploadPath, out var endpointUrl)) {
+                continue;
+            }
+
+            try {
+                using var request = IngestRequestFactory.CreatePostJsonRequest(
+                    configuration,
+                    endpointUrl,
+                    IdentityUploadPath,
+                    jsonPayload
+                );
+                using var response = await httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+
+                if (response.IsSuccessStatusCode) {
+                    anySuccess = true;
+                    uploadTarget.FailureCount = 0;
+                    continue;
+                }
+
+                uploadTarget.FailureCount++;
+                uploadTarget.LastFailureTime = DateTime.UtcNow;
+
+                if ((int)response.StatusCode == 429) {
+                    var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);
+                    if (retryAfter.HasValue) {
+                        warningSink?.Invoke($"CharaCardResolver: rate limited by {endpointUrl}, retry_after={retryAfter.Value}s");
+                    }
+                }
+            } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
+                throw;
+            } catch (Exception exception) {
+                uploadTarget.FailureCount++;
+                uploadTarget.LastFailureTime = DateTime.UtcNow;
+                warningSink?.Invoke($"CharaCardResolver: identity upload error to {endpointUrl}. {exception.Message}");
+            }
+        }
+
+        if (!anySuccess) {
+            warningSink?.Invoke($"CharaCardResolver: identity upload failed, {payloads.Count} identities remain pending.");
+        }
+
+        return anySuccess;
+    }
+
+    private static bool IsCircuitOpen(Configuration configuration, UploadUrl uploadTarget) {
+        if (uploadTarget.FailureCount < configuration.CircuitBreakerFailureThreshold) {
+            return false;
+        }
+
+        var elapsedSinceFailure = DateTime.UtcNow - uploadTarget.LastFailureTime;
+        return elapsedSinceFailure.TotalMinutes < configuration.CircuitBreakerBreakDurationMinutes;
     }
 
     private sealed record PendingProjection(

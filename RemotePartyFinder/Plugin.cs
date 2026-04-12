@@ -62,7 +62,11 @@ public class Plugin : IDalamudPlugin {
         this.Gatherer = new Gatherer(this);
         this.PlayerDatabase = new PlayerLocalDatabase(Path.Combine(PluginInterface.ConfigDirectory.FullName, "player_cache.db"));
         this.PlayerCollector = new PlayerCollector(this, this.PlayerDatabase);
-        this.CharaCardResolver = new CharaCardResolver(this.PlayerDatabase, warningSink: message => Log.Warning(message));
+        this.CharaCardResolver = new CharaCardResolver(
+            this.PlayerDatabase,
+            warningSink: message => Log.Warning(message),
+            configuration: this.Configuration
+        );
         this.Framework.Update += this.CharaCardResolver.OnFrameworkUpdate;
         this.PartyDetailCollector = new PartyDetailCollector(this);
         this.DebugPfScanner = new DebugPfScanner(this, this.PartyDetailCollector, this.Gatherer);
