@@ -142,6 +142,7 @@ internal sealed class PartyDetailCollector : IDisposable {
             $"PartyDetailCollector: Uploading detail listing={payload.ListingId} leader={payload.LeaderContentId} world={payload.HomeWorld} members={payload.MemberContentIds.Count} non_zero_members={nonZeroMemberCount} parties={effectiveParties} fingerprint={fingerprint}");
 
         Enqueue(payload, fingerprint, now);
+        TryEnqueueContentIdsForResolve(payload, _plugin.CharaCardResolver.EnqueueMany, message => Plugin.Log.Warning(message));
         _lastQueuedListingId = payload.ListingId;
         _lastQueuedFingerprint = fingerprint;
         _lastQueuedAtUtc = now;
@@ -414,6 +415,39 @@ internal sealed class PartyDetailCollector : IDisposable {
             hash ^= value;
             hash *= 1099511628211UL;
             return hash;
+        }
+    }
+
+    internal static IReadOnlyList<ulong> BuildContentIdsForResolve(UploadablePartyDetail payload) {
+        var contentIds = new List<ulong>(payload.MemberContentIds.Count + 1);
+        var seen = new HashSet<ulong>();
+
+        if (payload.LeaderContentId != 0 && seen.Add(payload.LeaderContentId)) {
+            contentIds.Add(payload.LeaderContentId);
+        }
+
+        foreach (var memberContentId in payload.MemberContentIds) {
+            if (memberContentId == 0 || !seen.Add(memberContentId)) {
+                continue;
+            }
+
+            contentIds.Add(memberContentId);
+        }
+
+        return contentIds;
+    }
+
+    internal static bool TryEnqueueContentIdsForResolve(
+        UploadablePartyDetail payload,
+        Action<IEnumerable<ulong>> enqueueMany,
+        Action<string> warningSink = null
+    ) {
+        try {
+            enqueueMany(BuildContentIdsForResolve(payload));
+            return true;
+        } catch (Exception exception) {
+            warningSink?.Invoke($"PartyDetailCollector: failed to enqueue detail contentIds for enrichment. {exception.Message}");
+            return false;
         }
     }
 
