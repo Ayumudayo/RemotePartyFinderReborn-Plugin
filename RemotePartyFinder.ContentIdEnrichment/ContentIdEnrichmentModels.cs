@@ -43,9 +43,11 @@ internal sealed record CharacterIdentityUploadPayload(
         DateTime observedAtUtc,
         string source = "chara_card"
     ) {
-        var normalizedObservedAtUtc = observedAtUtc.Kind == DateTimeKind.Utc
-            ? observedAtUtc
-            : observedAtUtc.ToUniversalTime();
+        var normalizedObservedAtUtc = observedAtUtc.Kind switch {
+            DateTimeKind.Utc => observedAtUtc,
+            DateTimeKind.Unspecified => DateTime.SpecifyKind(observedAtUtc, DateTimeKind.Utc),
+            _ => observedAtUtc.ToUniversalTime(),
+        };
 
         return new CharacterIdentityUploadPayload(
             snapshot.ContentId,

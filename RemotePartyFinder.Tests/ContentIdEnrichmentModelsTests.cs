@@ -83,6 +83,29 @@ public sealed class ContentIdEnrichmentModelsTests {
     }
 
     [Fact]
+    public void IdentityUploadPayload_treats_unspecified_observed_at_as_already_utc() {
+        var unspecifiedObservedAt = DateTime.SpecifyKind(
+            new DateTime(2026, 4, 12, 12, 30, 0),
+            DateTimeKind.Unspecified
+        );
+        var snapshot = new CharacterIdentitySnapshot(
+            9011UL,
+            "Utc Unspecified",
+            74,
+            "Tonberry",
+            DateTime.SpecifyKind(unspecifiedObservedAt, DateTimeKind.Utc)
+        );
+
+        var payload = CharacterIdentityUploadPayload.FromSnapshot(snapshot, unspecifiedObservedAt, "party_detail");
+        var json = JsonSerializer.Serialize(payload);
+        using var document = JsonDocument.Parse(json);
+
+        Assert.Equal(DateTimeKind.Utc, payload.ObservedAtUtc.Kind);
+        Assert.Equal(new DateTime(2026, 4, 12, 12, 30, 0, DateTimeKind.Utc), payload.ObservedAtUtc);
+        Assert.Equal("2026-04-12T12:30:00Z", document.RootElement.GetProperty("observed_at").GetString());
+    }
+
+    [Fact]
     public void Mark_timeout_moves_request_to_transient_failure() {
         var nowUtc = new DateTime(2026, 4, 12, 13, 0, 0, DateTimeKind.Utc);
         var queue = new ContentIdResolveQueue();
