@@ -1,9 +1,21 @@
+using System.Linq;
 using Microsoft.Data.Sqlite;
 using Xunit;
 
 namespace RemotePartyFinder.Tests;
 
 public sealed class PlayerIdentityCacheTests {
+    [Fact]
+    public void ContentIdEnrichment_assembly_does_not_reference_newtonsoft_json() {
+        var referencedAssemblies = typeof(PlayerLocalDatabase)
+            .Assembly
+            .GetReferencedAssemblies()
+            .Select(static assemblyName => assemblyName.Name)
+            .ToArray();
+
+        Assert.DoesNotContain("Newtonsoft.Json", referencedAssemblies);
+    }
+
     [Fact]
     public void UpsertResolvedIdentity_persists_name_world_and_marks_pending_upload() {
         using var harness = new TempPlayerCacheDatabase();

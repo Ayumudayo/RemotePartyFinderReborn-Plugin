@@ -6,8 +6,6 @@ using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
 using Microsoft.Data.Sqlite;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Serialization;
 
 namespace RemotePartyFinder;
 
@@ -509,15 +507,10 @@ internal sealed class PlayerLocalDatabase : IDisposable {
     }
 }
 
-[Serializable]
-[JsonObject(NamingStrategyType = typeof(SnakeCaseNamingStrategy))]
 internal sealed class UploadablePlayer {
     public ulong ContentId { get; set; }
     public string Name { get; set; } = string.Empty;
     public ushort HomeWorld { get; set; }
-
-    [JsonProperty(DefaultValueHandling = DefaultValueHandling.Include)]
     public ushort CurrentWorld { get; set; }
-
     public ulong AccountId { get; set; }
 }

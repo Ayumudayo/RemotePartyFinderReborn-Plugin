@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Runtime.InteropServices;
@@ -18,6 +17,12 @@ internal sealed class PlayerCollector : IDisposable {
     private const int ScanIntervalSeconds = 5;
     private const int ContentIdOffset = 0x2358;
     private const int AccountIdOffset = 0x2350;
+    private static readonly JsonSerializerSettings UploadPayloadSerializerSettings = new() {
+        ContractResolver = new DefaultContractResolver {
+            NamingStrategy = new SnakeCaseNamingStrategy()
+        },
+        DefaultValueHandling = DefaultValueHandling.Include
+    };
 
     private readonly Plugin _plugin;
     private readonly PlayerLocalDatabase _database;
@@ -29,16 +34,16 @@ internal sealed class PlayerCollector : IDisposable {
     internal int PendingCount => _database.PendingCount;
     internal bool IsUploadInProgress => _uploadInProgress;
 
-    internal PlayerCollector(Plugin plugin) {
+    internal PlayerCollector(Plugin plugin, PlayerLocalDatabase database) {
         _plugin = plugin;
-        _database = new PlayerLocalDatabase(Path.Combine(Plugin.PluginInterface.ConfigDirectory.FullName, "player_cache.db"));
+        _database = database;
         _scanTimer.Start();
         _plugin.Framework.Update += OnUpdate;
     }
 
     public void Dispose() {
         _plugin.Framework.Update -= OnUpdate;
-        _database.Dispose();
+        _httpClient.Dispose();
     }
 
     internal void TriggerManualUploadNow() {
@@ -123,7 +128,7 @@ internal sealed class PlayerCollector : IDisposable {
                     return;
                 }
 
-                var jsonPayload = JsonConvert.SerializeObject(batch);
+                var jsonPayload = JsonConvert.SerializeObject(batch, UploadPayloadSerializerSettings);
                 var anySuccess = false;
 
                 foreach (var uploadTarget in _plugin.Configuration.UploadUrls.Where(static candidate => candidate.IsEnabled)) {

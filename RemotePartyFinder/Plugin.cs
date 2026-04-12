@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using Dalamud.IoC;
 using Dalamud.Game.Command;
 using Dalamud.Interface.Windowing;
@@ -40,6 +41,7 @@ public class Plugin : IDalamudPlugin {
     private ConfigWindow ConfigWindow { get; init; }
 
     internal Gatherer Gatherer { get; }
+    internal PlayerLocalDatabase PlayerDatabase { get; }
     private PlayerCollector PlayerCollector { get; }
     internal PartyDetailCollector PartyDetailCollector { get; }
     internal DebugPfScanner DebugPfScanner { get; }
@@ -54,7 +56,8 @@ public class Plugin : IDalamudPlugin {
 
         Configuration = PluginInterface.GetPluginConfig() as Configuration ?? new Configuration();
         this.Gatherer = new Gatherer(this);
-        this.PlayerCollector = new PlayerCollector(this);
+        this.PlayerDatabase = new PlayerLocalDatabase(Path.Combine(PluginInterface.ConfigDirectory.FullName, "player_cache.db"));
+        this.PlayerCollector = new PlayerCollector(this, this.PlayerDatabase);
         this.PartyDetailCollector = new PartyDetailCollector(this);
         this.DebugPfScanner = new DebugPfScanner(this, this.PartyDetailCollector, this.Gatherer);
         this.FFLogsCollector = new FFLogsCollector(this);
@@ -71,6 +74,7 @@ public class Plugin : IDalamudPlugin {
     public void Dispose() {
         this.Gatherer.Dispose();
         this.PlayerCollector.Dispose();
+        this.PlayerDatabase.Dispose();
         this.PartyDetailCollector.Dispose();
         this.DebugPfScanner.Dispose();
         this.FFLogsCollector.Dispose();

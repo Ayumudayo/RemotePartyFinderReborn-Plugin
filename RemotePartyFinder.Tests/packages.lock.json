@@ -148,8 +148,7 @@
       "remotepartyfinder.contentidenrichment": {
         "type": "Project",
         "dependencies": {
-          "Microsoft.Data.Sqlite": "[9.0.4, )",
-          "Newtonsoft.Json": "[13.0.3, )"
+          "Microsoft.Data.Sqlite": "[9.0.4, )"
         }
       }
     }
