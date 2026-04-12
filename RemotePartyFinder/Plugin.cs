@@ -1,11 +1,14 @@
 using System;
 using System.IO;
+using System.Runtime.CompilerServices;
 using Dalamud.IoC;
 using Dalamud.Game.Command;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using ECommons;
+
+[assembly: InternalsVisibleTo("RemotePartyFinder.Tests")]
 
 namespace RemotePartyFinder;
 
@@ -43,6 +46,7 @@ public class Plugin : IDalamudPlugin {
     internal Gatherer Gatherer { get; }
     internal PlayerLocalDatabase PlayerDatabase { get; }
     private PlayerCollector PlayerCollector { get; }
+    internal CharaCardResolver CharaCardResolver { get; }
     internal PartyDetailCollector PartyDetailCollector { get; }
     internal DebugPfScanner DebugPfScanner { get; }
     private FFLogsCollector FFLogsCollector { get; }
@@ -58,6 +62,8 @@ public class Plugin : IDalamudPlugin {
         this.Gatherer = new Gatherer(this);
         this.PlayerDatabase = new PlayerLocalDatabase(Path.Combine(PluginInterface.ConfigDirectory.FullName, "player_cache.db"));
         this.PlayerCollector = new PlayerCollector(this, this.PlayerDatabase);
+        this.CharaCardResolver = new CharaCardResolver(this.PlayerDatabase, warningSink: message => Log.Warning(message));
+        this.Framework.Update += this.CharaCardResolver.OnFrameworkUpdate;
         this.PartyDetailCollector = new PartyDetailCollector(this);
         this.DebugPfScanner = new DebugPfScanner(this, this.PartyDetailCollector, this.Gatherer);
         this.FFLogsCollector = new FFLogsCollector(this);
@@ -72,8 +78,10 @@ public class Plugin : IDalamudPlugin {
     }
 
     public void Dispose() {
+        this.Framework.Update -= this.CharaCardResolver.OnFrameworkUpdate;
         this.Gatherer.Dispose();
         this.PlayerCollector.Dispose();
+        this.CharaCardResolver.Dispose();
         this.PlayerDatabase.Dispose();
         this.PartyDetailCollector.Dispose();
         this.DebugPfScanner.Dispose();
