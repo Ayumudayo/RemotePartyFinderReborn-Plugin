@@ -1,0 +1,188 @@
+using System;
+using System.Collections.Generic;
+using System.Collections.ObjectModel;
+using System.Linq;
+
+namespace RemotePartyFinder;
+
+internal enum ResolveState {
+    Unknown,
+    Queued,
+    InFlight,
+    Resolved,
+    FailedTransient,
+}
+
+internal sealed record CharacterIdentitySnapshot(
+    ulong ContentId,
+    string Name,
+    ushort HomeWorld,
+    string WorldName,
+    DateTime LastResolvedAtUtc
+);
+
+internal sealed record ResolverPreflightResult(bool Enabled, string Reason);
+
+internal sealed record CharacterIdentityUploadPayload(
+    ulong ContentId,
+    string Name,
+    ushort HomeWorld,
+    string WorldName,
+    string Source,
+    DateTime ObservedAtUtc
+) {
+    public static CharacterIdentityUploadPayload FromSnapshot(
+        CharacterIdentitySnapshot snapshot,
+        DateTime observedAtUtc,
+        string source = "chara_card"
+    ) {
+        return new CharacterIdentityUploadPayload(
+            snapshot.ContentId,
+            snapshot.Name,
+            snapshot.HomeWorld,
+            snapshot.WorldName ?? string.Empty,
+            source,
+            observedAtUtc
+        );
+    }
+}
+
+internal sealed record ResolveRequestStatus(
+    ulong ContentId,
+    ResolveState State,
+    int TimeoutCount,
+    DateTime LastRequestedAtUtc,
+    DateTime LastResolvedAtUtc,
+    DateTime NextEligibleAttemptAtUtc
+);
+
+internal sealed class ContentIdResolveQueue {
+    private static readonly TimeSpan[] TimeoutBackoffSchedule = [
+        TimeSpan.FromSeconds(10),
+        TimeSpan.FromSeconds(30),
+        TimeSpan.FromSeconds(60),
+    ];
+
+    private readonly Dictionary<ulong, ResolveRequestStatus> _requests = new();
+    private readonly TimeSpan _freshIdentityTtl;
+
+    public ContentIdResolveQueue(TimeSpan? freshIdentityTtl = null) {
+        _freshIdentityTtl = freshIdentityTtl ?? TimeSpan.FromHours(24);
+    }
+
+    public IReadOnlyCollection<ResolveRequestStatus> Requests =>
+        new ReadOnlyCollection<ResolveRequestStatus>(_requests.Values.OrderBy(static request => request.ContentId).ToArray());
+
+    public bool Enqueue(ulong contentId, DateTime nowUtc) {
+        if (contentId == 0) {
+            return false;
+        }
+
+        if (!_requests.TryGetValue(contentId, out var existing)) {
+            _requests[contentId] = new ResolveRequestStatus(
+                contentId,
+                ResolveState.Queued,
+                0,
+                DateTime.MinValue,
+                DateTime.MinValue,
+                nowUtc
+            );
+            return true;
+        }
+
+        if (existing.State is ResolveState.Queued or ResolveState.InFlight) {
+            return false;
+        }
+
+        if (existing.State == ResolveState.Resolved
+            && nowUtc - existing.LastResolvedAtUtc < _freshIdentityTtl) {
+            return false;
+        }
+
+        _requests[contentId] = existing with {
+            State = ResolveState.Queued,
+            NextEligibleAttemptAtUtc = nowUtc,
+            TimeoutCount = existing.State == ResolveState.Resolved ? 0 : existing.TimeoutCount,
+        };
+        return true;
+    }
+
+    public ResolveState GetState(ulong contentId) {
+        return _requests.TryGetValue(contentId, out var request)
+            ? request.State
+            : ResolveState.Unknown;
+    }
+
+    public ResolveRequestStatus GetRequest(ulong contentId) {
+        return _requests[contentId];
+    }
+
+    public bool TryStartNext(DateTime nowUtc, out ResolveRequestStatus request) {
+        foreach (var candidate in _requests.Values
+                     .Where(candidate => candidate.State == ResolveState.Queued
+                                         || (candidate.State == ResolveState.FailedTransient
+                                             && candidate.NextEligibleAttemptAtUtc <= nowUtc))
+                     .OrderBy(candidate => candidate.NextEligibleAttemptAtUtc)
+                     .ThenBy(candidate => candidate.ContentId)) {
+            request = candidate with {
+                State = ResolveState.InFlight,
+                LastRequestedAtUtc = nowUtc,
+            };
+            _requests[candidate.ContentId] = request;
+            return true;
+        }
+
+        request = default!;
+        return false;
+    }
+
+    public void MarkTimeout(ulong contentId, DateTime nowUtc) {
+        if (!_requests.TryGetValue(contentId, out var request)) {
+            return;
+        }
+
+        var timeoutCount = request.TimeoutCount + 1;
+        _requests[contentId] = request with {
+            State = ResolveState.FailedTransient,
+            TimeoutCount = timeoutCount,
+            NextEligibleAttemptAtUtc = nowUtc + GetTimeoutBackoff(timeoutCount),
+        };
+    }
+
+    public void MarkResolved(CharacterIdentitySnapshot snapshot) {
+        _requests[snapshot.ContentId] = new ResolveRequestStatus(
+            snapshot.ContentId,
+            ResolveState.Resolved,
+            0,
+            DateTime.MinValue,
+            snapshot.LastResolvedAtUtc,
+            snapshot.LastResolvedAtUtc
+        );
+    }
+
+    private static TimeSpan GetTimeoutBackoff(int timeoutCount) {
+        if (timeoutCount <= 0) {
+            return TimeoutBackoffSchedule[0];
+        }
+
+        var index = Math.Min(timeoutCount - 1, TimeoutBackoffSchedule.Length - 1);
+        return TimeoutBackoffSchedule[index];
+    }
+}
+
+internal static class ResolverPreflightEvaluator {
+    public static ResolverPreflightResult Evaluate(
+        nint requestCharaCardAddress,
+        nint handleCurrentCharaCardDataPacketAddress
+    ) {
+        if (requestCharaCardAddress == 0) {
+            return new ResolverPreflightResult(false, "RequestCharaCardForContentId interop address is unavailable.");
+        }
+
+        if (handleCurrentCharaCardDataPacketAddress == 0) {
+            return new ResolverPreflightResult(false, "HandleCurrentCharaCardDataPacket interop address is unavailable.");
+        }
+
+        return new ResolverPreflightResult(true, "Ready");
+    }
+}
