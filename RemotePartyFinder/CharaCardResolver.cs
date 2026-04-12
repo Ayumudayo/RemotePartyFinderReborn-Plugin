@@ -41,6 +41,7 @@ internal sealed class CharaCardResolver : IDisposable {
     private readonly Action<CharacterIdentitySnapshot> _persistResolvedIdentity;
     private readonly TimeSpan _requestTimeout;
     private readonly TimeSpan _identityUploadAttemptTimeout;
+    private readonly Action<string>? _debugSink;
     private readonly Action<string>? _warningSink;
     private readonly Func<IReadOnlyList<CharacterIdentityUploadPayload>, CancellationToken, Task<bool>>? _uploadResolvedIdentitiesAsync;
     private readonly HttpClient _identityUploadHttpClient;
@@ -56,6 +57,7 @@ internal sealed class CharaCardResolver : IDisposable {
         ICharaCardResolverRuntime? runtime = null,
         Func<ushort, string?>? worldNameResolver = null,
         Func<DateTime>? utcNow = null,
+        Action<string>? debugSink = null,
         Action<string>? warningSink = null,
         Action<CharacterIdentitySnapshot>? persistResolvedIdentity = null,
         TimeSpan? requestTimeout = null,
@@ -65,6 +67,7 @@ internal sealed class CharaCardResolver : IDisposable {
         HttpClient? identityUploadHttpClient = null
     ) {
         _database = database ?? throw new ArgumentNullException(nameof(database));
+        _debugSink = debugSink;
         _warningSink = warningSink;
         _runtime = runtime ?? new DalamudCharaCardResolverRuntime(warningSink);
         _worldNameResolver = worldNameResolver ?? ResolveWorldName;
@@ -157,10 +160,15 @@ internal sealed class CharaCardResolver : IDisposable {
 
         try {
             if (!_runtime.TryRequest(request.ContentId)) {
+                LogWarning($"CharaCardResolver: failed to dispatch identity request for contentId={request.ContentId}.");
                 lock (_sync) {
                     _queue.MarkTimeout(request.ContentId, request.AttemptVersion, _utcNow());
                 }
+
+                return;
             }
+
+            LogDebug($"CharaCardResolver: dispatched identity request for contentId={request.ContentId}.");
         } catch (Exception exception) {
             DisableEnrichment($"request dispatch failed: {exception.Message}");
         }
@@ -204,6 +212,7 @@ internal sealed class CharaCardResolver : IDisposable {
 
         try {
             _database.MarkIdentityUploadsSubmitted(payloads.Select(static payload => payload.ContentId));
+            LogDebug($"CharaCardResolver: uploaded resolved identity batch count={payloads.Count()}.");
             return true;
         } catch (Exception exception) {
             LogWarning($"CharaCardResolver: failed to mark identity uploads as submitted. {exception.Message}");
@@ -312,6 +321,10 @@ internal sealed class CharaCardResolver : IDisposable {
         _warningSink?.Invoke(message);
     }
 
+    private void LogDebug(string message) {
+        _debugSink?.Invoke(message);
+    }
+
     private void ExpireStaleInflightRequests(DateTime nowUtc) {
         foreach (var request in _queue.Requests) {
             if (request.State != ResolveState.InFlight) {
@@ -354,6 +367,12 @@ internal sealed class CharaCardResolver : IDisposable {
                 _pendingProjections.Remove(candidate.Snapshot.ContentId);
                 _queue.MarkResolved(candidate.Snapshot);
             }
+
+            LogDebug(
+                $"CharaCardResolver: persisted resolved identity contentId={candidate.Snapshot.ContentId} " +
+                $"name=\"{candidate.Snapshot.Name}\" homeWorld={candidate.Snapshot.HomeWorld} " +
+                $"worldName=\"{candidate.Snapshot.WorldName}\"."
+            );
         } catch (Exception exception) {
             LogWarning($"CharaCardResolver: failed to persist resolved identity for {candidate.Snapshot.ContentId}. {exception.Message}");
             lock (_sync) {

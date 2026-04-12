@@ -1,9 +1,15 @@
 using Microsoft.Data.Sqlite;
+using System.Reflection;
+using System.Threading;
 using Xunit;
 
 namespace RemotePartyFinder.Tests;
 
 public sealed class CharaCardResolverRuntimeTests {
+    static CharaCardResolverRuntimeTests() {
+        DalamudAssemblyResolver.Register();
+    }
+
     [Fact]
     public void ResolverQueue_picks_only_uncached_ids() {
         using var harness = new TempPlayerCacheDatabase();
@@ -56,6 +62,42 @@ public sealed class CharaCardResolverRuntimeTests {
         Assert.Equal(
             new CharacterIdentitySnapshot(3003UL, "Resolved Player", 74, "Tonberry", nowUtc),
             snapshot
+        );
+    }
+
+    [Fact]
+    public void Pump_logs_dispatched_and_persisted_identity_lifecycle_for_successful_resolution() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+
+        var debugLogs = new List<string>();
+        var nowUtc = new DateTime(2026, 4, 13, 2, 30, 0, DateTimeKind.Utc);
+        var runtime = new FakeCharaCardResolverRuntime();
+        using var resolver = new CharaCardResolver(
+            database,
+            runtime,
+            worldId => worldId == 74 ? "Tonberry" : null,
+            () => nowUtc,
+            debugSink: debugLogs.Add
+        );
+
+        resolver.EnqueueMany([3131UL]);
+        resolver.Pump();
+        runtime.Deliver(new CharaCardPacketModel(3131UL, 74, "Lifecycle Player"));
+        resolver.Pump();
+
+        Assert.Contains(
+            debugLogs,
+            message => message.Contains("dispatched identity request", StringComparison.Ordinal)
+                && message.Contains("contentId=3131", StringComparison.Ordinal)
+        );
+        Assert.Contains(
+            debugLogs,
+            message => message.Contains("persisted resolved identity", StringComparison.Ordinal)
+                && message.Contains("contentId=3131", StringComparison.Ordinal)
+                && message.Contains("Lifecycle Player", StringComparison.Ordinal)
+                && message.Contains("homeWorld=74", StringComparison.Ordinal)
+                && message.Contains("Tonberry", StringComparison.Ordinal)
         );
     }
 
@@ -123,6 +165,34 @@ public sealed class CharaCardResolverRuntimeTests {
 
         Assert.True(runtime.IsDisposed);
         Assert.Empty(runtime.RequestedContentIds);
+    }
+
+    [Fact]
+    public void Pump_logs_warning_when_runtime_request_cannot_be_dispatched() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+
+        var warnings = new List<string>();
+        var runtime = new FakeCharaCardResolverRuntime {
+            TryRequestResult = false,
+        };
+        using var resolver = new CharaCardResolver(
+            database,
+            runtime,
+            worldId => "Tonberry",
+            () => new DateTime(2026, 4, 13, 5, 30, 0, DateTimeKind.Utc),
+            warningSink: warnings.Add
+        );
+
+        resolver.EnqueueMany([6116UL]);
+        resolver.Pump();
+
+        Assert.Equal(ResolveState.FailedTransient, resolver.GetResolveState(6116UL));
+        Assert.Contains(
+            warnings,
+            message => message.Contains("failed to dispatch identity request", StringComparison.Ordinal)
+                && message.Contains("contentId=6116", StringComparison.Ordinal)
+        );
     }
 
     [Fact]
@@ -263,6 +333,8 @@ public sealed class CharaCardResolverRuntimeTests {
 
         public bool ThrowOnInitialize { get; init; }
 
+        public bool TryRequestResult { get; init; } = true;
+
         public bool IsDisposed { get; private set; }
 
         public ResolverPreflightResult CheckAvailability() => PreflightResult;
@@ -277,7 +349,7 @@ public sealed class CharaCardResolverRuntimeTests {
 
         public bool TryRequest(ulong contentId) {
             RequestedContentIds.Add(contentId);
-            return true;
+            return TryRequestResult;
         }
 
         public void Deliver(CharaCardPacketModel packet) {
@@ -307,6 +379,37 @@ public sealed class CharaCardResolverRuntimeTests {
             if (Directory.Exists(_directoryPath)) {
                 Directory.Delete(_directoryPath, recursive: true);
             }
+        }
+    }
+
+    private static class DalamudAssemblyResolver {
+        private static int _registered;
+
+        public static void Register() {
+            if (Interlocked.Exchange(ref _registered, 1) != 0) {
+                return;
+            }
+
+            AppDomain.CurrentDomain.AssemblyResolve += static (_, args) => {
+                var assemblyName = new AssemblyName(args.Name).Name;
+                if (string.IsNullOrWhiteSpace(assemblyName)) {
+                    return null;
+                }
+
+                var dalamudHome = Environment.GetEnvironmentVariable("DALAMUD_HOME");
+                if (string.IsNullOrWhiteSpace(dalamudHome)) {
+                    dalamudHome = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                        "XIVLauncher",
+                        "addon",
+                        "Hooks",
+                        "dev"
+                    );
+                }
+
+                var candidatePath = Path.Combine(dalamudHome, assemblyName + ".dll");
+                return File.Exists(candidatePath) ? Assembly.LoadFrom(candidatePath) : null;
+            };
         }
     }
 }

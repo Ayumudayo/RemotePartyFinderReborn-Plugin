@@ -202,6 +202,36 @@ public sealed class IdentityUploadWorkerTests {
         Assert.Equal(snapshot, stored);
     }
 
+    [Fact]
+    public async Task Successful_upload_logs_uploaded_batch_count() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+
+        database.UpsertResolvedIdentity(new CharacterIdentitySnapshot(
+            4404UL,
+            "Logged Player",
+            79,
+            "Omega",
+            new DateTime(2026, 4, 13, 12, 30, 0, DateTimeKind.Utc)
+        ));
+
+        var debugLogs = new List<string>();
+        using var resolver = new CharaCardResolver(
+            database,
+            runtime: new FakeCharaCardResolverRuntime { PreflightResult = new ResolverPreflightResult(false, "hook unavailable") },
+            uploadResolvedIdentitiesAsync: (payloads, cancellationToken) => Task.FromResult(true),
+            debugSink: debugLogs.Add
+        );
+
+        await resolver.DrainPendingIdentityUploadsOnceAsync(CancellationToken.None);
+
+        Assert.Contains(
+            debugLogs,
+            message => message.Contains("uploaded resolved identity batch", StringComparison.Ordinal)
+                && message.Contains("count=1", StringComparison.Ordinal)
+        );
+    }
+
     private sealed class FakeCharaCardResolverRuntime : ICharaCardResolverRuntime {
         public ResolverPreflightResult PreflightResult { get; init; } = new(true, "Ready");
 

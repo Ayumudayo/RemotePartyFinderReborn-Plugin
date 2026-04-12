@@ -64,6 +64,7 @@ public class Plugin : IDalamudPlugin {
         this.PlayerCollector = new PlayerCollector(this, this.PlayerDatabase);
         this.CharaCardResolver = new CharaCardResolver(
             this.PlayerDatabase,
+            debugSink: message => Log.Debug(message),
             warningSink: message => Log.Warning(message),
             configuration: this.Configuration
         );
