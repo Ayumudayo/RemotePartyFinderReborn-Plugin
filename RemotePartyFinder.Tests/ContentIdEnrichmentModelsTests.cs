@@ -1,3 +1,4 @@
+using System.Text.Json;
 using Xunit;
 
 namespace RemotePartyFinder.Tests;
@@ -35,6 +36,30 @@ public sealed class ContentIdEnrichmentModelsTests {
         Assert.Equal("Tonberry", payload.WorldName);
         Assert.Equal("chara_card", payload.Source);
         Assert.Equal(observedAtUtc, payload.ObservedAtUtc);
+    }
+
+    [Fact]
+    public void IdentityUploadPayload_serializes_content_name_world_and_source() {
+        var observedAtUtc = new DateTime(2026, 4, 12, 12, 30, 0, DateTimeKind.Utc);
+        var snapshot = new CharacterIdentitySnapshot(
+            9009UL,
+            "Sigma Taro",
+            74,
+            "Tonberry",
+            observedAtUtc
+        );
+
+        var payload = CharacterIdentityUploadPayload.FromSnapshot(snapshot, observedAtUtc, "party_detail");
+        var json = JsonSerializer.Serialize(payload);
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+
+        Assert.Equal(9009UL, root.GetProperty("content_id").GetUInt64());
+        Assert.Equal("Sigma Taro", root.GetProperty("name").GetString());
+        Assert.Equal((uint)74, root.GetProperty("home_world").GetUInt32());
+        Assert.Equal("Tonberry", root.GetProperty("world_name").GetString());
+        Assert.Equal("party_detail", root.GetProperty("source").GetString());
+        Assert.Equal("2026-04-12T12:30:00Z", root.GetProperty("observed_at").GetString());
     }
 
     [Fact]

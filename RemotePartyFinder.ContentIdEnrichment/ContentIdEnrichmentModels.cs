@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
 using System.Linq;
+using System.Text.Json.Serialization;
 
 namespace RemotePartyFinder;
 
@@ -24,11 +25,17 @@ internal sealed record CharacterIdentitySnapshot(
 internal sealed record ResolverPreflightResult(bool Enabled, string Reason);
 
 internal sealed record CharacterIdentityUploadPayload(
+    [property: JsonPropertyName("content_id")]
     ulong ContentId,
+    [property: JsonPropertyName("name")]
     string Name,
+    [property: JsonPropertyName("home_world")]
     ushort HomeWorld,
+    [property: JsonPropertyName("world_name")]
     string WorldName,
+    [property: JsonPropertyName("source")]
     string Source,
+    [property: JsonPropertyName("observed_at")]
     DateTime ObservedAtUtc
 ) {
     public static CharacterIdentityUploadPayload FromSnapshot(
