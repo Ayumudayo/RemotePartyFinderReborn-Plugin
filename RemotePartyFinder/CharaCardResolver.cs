@@ -30,6 +30,7 @@ internal interface ICharaCardResolverRuntime : IDisposable {
 
 internal sealed class CharaCardResolver : IDisposable {
     private static readonly TimeSpan DefaultRequestTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan DefaultIdentityUploadAttemptTimeout = TimeSpan.FromSeconds(5);
     private const string IdentityUploadPath = "/contribute/character-identity";
 
     private readonly PlayerLocalDatabase _database;
@@ -39,6 +40,7 @@ internal sealed class CharaCardResolver : IDisposable {
     private readonly Func<DateTime> _utcNow;
     private readonly Action<CharacterIdentitySnapshot> _persistResolvedIdentity;
     private readonly TimeSpan _requestTimeout;
+    private readonly TimeSpan _identityUploadAttemptTimeout;
     private readonly Action<string>? _warningSink;
     private readonly Func<IReadOnlyList<CharacterIdentityUploadPayload>, CancellationToken, Task<bool>>? _uploadResolvedIdentitiesAsync;
     private readonly HttpClient _identityUploadHttpClient;
@@ -57,6 +59,7 @@ internal sealed class CharaCardResolver : IDisposable {
         Action<string>? warningSink = null,
         Action<CharacterIdentitySnapshot>? persistResolvedIdentity = null,
         TimeSpan? requestTimeout = null,
+        TimeSpan? identityUploadAttemptTimeout = null,
         Configuration? configuration = null,
         Func<IReadOnlyList<CharacterIdentityUploadPayload>, CancellationToken, Task<bool>>? uploadResolvedIdentitiesAsync = null,
         HttpClient? identityUploadHttpClient = null
@@ -68,6 +71,7 @@ internal sealed class CharaCardResolver : IDisposable {
         _utcNow = utcNow ?? (() => DateTime.UtcNow);
         _persistResolvedIdentity = persistResolvedIdentity ?? _database.UpsertResolvedIdentity;
         _requestTimeout = requestTimeout ?? DefaultRequestTimeout;
+        _identityUploadAttemptTimeout = identityUploadAttemptTimeout ?? DefaultIdentityUploadAttemptTimeout;
         _identityUploadHttpClient = identityUploadHttpClient ?? new HttpClient();
         _ownsIdentityUploadHttpClient = identityUploadHttpClient is null;
         _uploadResolvedIdentitiesAsync = uploadResolvedIdentitiesAsync
@@ -77,6 +81,7 @@ internal sealed class CharaCardResolver : IDisposable {
                     configuration,
                     payloads,
                     _identityUploadHttpClient,
+                    _identityUploadAttemptTimeout,
                     warningSink,
                     cancellationToken
                 ));
@@ -391,6 +396,7 @@ internal sealed class CharaCardResolver : IDisposable {
         Configuration configuration,
         IReadOnlyList<CharacterIdentityUploadPayload> payloads,
         HttpClient httpClient,
+        TimeSpan attemptTimeout,
         Action<string>? warningSink,
         CancellationToken cancellationToken
     ) {
@@ -417,7 +423,9 @@ internal sealed class CharaCardResolver : IDisposable {
                     IdentityUploadPath,
                     jsonPayload
                 );
-                using var response = await httpClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+                using var attemptCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                attemptCts.CancelAfter(attemptTimeout);
+                using var response = await httpClient.SendAsync(request, attemptCts.Token).ConfigureAwait(false);
 
                 if (response.IsSuccessStatusCode) {
                     anySuccess = true;
@@ -436,6 +444,10 @@ internal sealed class CharaCardResolver : IDisposable {
                 }
             } catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) {
                 throw;
+            } catch (OperationCanceledException) {
+                uploadTarget.FailureCount++;
+                uploadTarget.LastFailureTime = DateTime.UtcNow;
+                warningSink?.Invoke($"CharaCardResolver: identity upload timed out for {endpointUrl} after {attemptTimeout.TotalMilliseconds:0}ms.");
             } catch (Exception exception) {
                 uploadTarget.FailureCount++;
                 uploadTarget.LastFailureTime = DateTime.UtcNow;

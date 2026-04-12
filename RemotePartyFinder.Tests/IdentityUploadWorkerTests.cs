@@ -1,4 +1,7 @@
 using System.Collections.Generic;
+using System.Net;
+using System.Net.Http;
+using System.Text.Json;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
@@ -10,6 +13,30 @@ namespace RemotePartyFinder.Tests;
 public sealed class IdentityUploadWorkerTests {
     static IdentityUploadWorkerTests() {
         DalamudAssemblyResolver.Register();
+    }
+
+    [Fact]
+    public void IdentityUploadPayload_serializes_content_name_world_and_source() {
+        var observedAtUtc = new DateTime(2026, 4, 13, 9, 30, 0, DateTimeKind.Utc);
+        var snapshot = new CharacterIdentitySnapshot(
+            1001UL,
+            "Serialize Player",
+            74,
+            "Tonberry",
+            observedAtUtc
+        );
+
+        var payload = CharacterIdentityUploadPayload.FromSnapshot(snapshot, observedAtUtc, "chara_card");
+        var json = JsonSerializer.Serialize(payload);
+        using var document = JsonDocument.Parse(json);
+        var root = document.RootElement;
+
+        Assert.Equal(1001UL, root.GetProperty("content_id").GetUInt64());
+        Assert.Equal("Serialize Player", root.GetProperty("name").GetString());
+        Assert.Equal((uint)74, root.GetProperty("home_world").GetUInt32());
+        Assert.Equal("Tonberry", root.GetProperty("world_name").GetString());
+        Assert.Equal("chara_card", root.GetProperty("source").GetString());
+        Assert.Equal("2026-04-13T09:30:00Z", root.GetProperty("observed_at").GetString());
     }
 
     [Fact]
@@ -44,6 +71,42 @@ public sealed class IdentityUploadWorkerTests {
     }
 
     [Fact]
+    public async Task Identity_upload_attempt_times_out_and_leaves_identity_pending() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+
+        var configuration = new Configuration {
+            UploadUrls = [new UploadUrl("http://127.0.0.1:8000") { IsEnabled = true }],
+        };
+        var snapshot = new CharacterIdentitySnapshot(
+            2002UL,
+            "Timeout Player",
+            21,
+            "Ravana",
+            new DateTime(2026, 4, 13, 10, 30, 0, DateTimeKind.Utc)
+        );
+        database.UpsertResolvedIdentity(snapshot);
+
+        using var httpClient = new HttpClient(new DelayedResponseHandler(TimeSpan.FromMilliseconds(500))) {
+            Timeout = Timeout.InfiniteTimeSpan,
+        };
+        using var resolver = new CharaCardResolver(
+            database,
+            runtime: new FakeCharaCardResolverRuntime { PreflightResult = new ResolverPreflightResult(false, "hook unavailable") },
+            configuration: configuration,
+            identityUploadHttpClient: httpClient,
+            identityUploadAttemptTimeout: TimeSpan.FromMilliseconds(100)
+        );
+
+        var drainTask = resolver.DrainPendingIdentityUploadsOnceAsync(CancellationToken.None);
+        var completedTask = await Task.WhenAny(drainTask, Task.Delay(300));
+
+        Assert.Same(drainTask, completedTask);
+        Assert.False(await drainTask);
+        Assert.Equal([snapshot], database.TakePendingIdentityUploads(10));
+    }
+
+    [Fact]
     public async Task Failed_upload_keeps_identity_pending_for_retry() {
         using var harness = new TempPlayerCacheDatabase();
         using var database = new PlayerLocalDatabase(harness.DatabasePath);
@@ -71,6 +134,45 @@ public sealed class IdentityUploadWorkerTests {
 
         Assert.Equal(1, attempts);
         Assert.Equal([snapshot], database.TakePendingIdentityUploads(10));
+    }
+
+    [Fact]
+    public async Task Pump_runs_identity_upload_worker_single_flight_until_current_attempt_completes() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+
+        var snapshot = new CharacterIdentitySnapshot(
+            3003UL,
+            "Pump Player",
+            79,
+            "Omega",
+            new DateTime(2026, 4, 13, 11, 30, 0, DateTimeKind.Utc)
+        );
+        database.UpsertResolvedIdentity(snapshot);
+
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var attempts = 0;
+
+        using var resolver = new CharaCardResolver(
+            database,
+            runtime: new FakeCharaCardResolverRuntime { PreflightResult = new ResolverPreflightResult(false, "hook unavailable") },
+            uploadResolvedIdentitiesAsync: async (payloads, cancellationToken) => {
+                Interlocked.Increment(ref attempts);
+                started.TrySetResult();
+                return await release.Task.WaitAsync(cancellationToken);
+            }
+        );
+
+        resolver.Pump();
+        await started.Task;
+        resolver.Pump();
+
+        Assert.Equal(1, Volatile.Read(ref attempts));
+
+        release.SetResult(true);
+        await WaitUntilAsync(() => database.TakePendingIdentityUploads(10).Count == 0);
+        Assert.Equal(1, Volatile.Read(ref attempts));
     }
 
     [Fact]
@@ -111,6 +213,15 @@ public sealed class IdentityUploadWorkerTests {
         public bool TryRequest(ulong contentId) => true;
 
         public void Dispose() {
+        }
+    }
+
+    private sealed class DelayedResponseHandler(TimeSpan delay) : HttpMessageHandler {
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) {
+            await Task.Delay(delay, cancellationToken);
+            return new HttpResponseMessage(HttpStatusCode.OK) {
+                Content = new StringContent("[]"),
+            };
         }
     }
 
@@ -163,5 +274,18 @@ public sealed class IdentityUploadWorkerTests {
                 return File.Exists(candidatePath) ? Assembly.LoadFrom(candidatePath) : null;
             };
         }
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition, int timeoutMs = 1500, int pollMs = 20) {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (DateTime.UtcNow < deadline) {
+            if (condition()) {
+                return;
+            }
+
+            await Task.Delay(pollMs);
+        }
+
+        Assert.True(condition(), "Condition was not met within timeout.");
     }
 }
