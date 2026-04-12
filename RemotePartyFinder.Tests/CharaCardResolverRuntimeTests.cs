@@ -231,6 +231,29 @@ public sealed class CharaCardResolverRuntimeTests {
         Assert.Equal(ResolveState.InFlight, resolver.GetResolveState(9009UL));
     }
 
+    [Fact]
+    public void Unsolicited_packet_is_ignored_without_warning_or_exception() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+
+        var warnings = new List<string>();
+        var runtime = new FakeCharaCardResolverRuntime();
+        using var resolver = new CharaCardResolver(
+            database,
+            runtime,
+            worldId => worldId == 74 ? "Tonberry" : null,
+            () => new DateTime(2026, 4, 13, 9, 0, 0, DateTimeKind.Utc),
+            warningSink: warnings.Add
+        );
+
+        var exception = Record.Exception(() => runtime.Deliver(new CharaCardPacketModel(123456UL, 74, "Manual Player")));
+
+        Assert.Null(exception);
+        Assert.Empty(warnings);
+        Assert.Equal(ResolveState.Unknown, resolver.GetResolveState(123456UL));
+        Assert.False(database.TryGetIdentity(123456UL, out _));
+    }
+
     private sealed class FakeCharaCardResolverRuntime : ICharaCardResolverRuntime {
         private Action<CharaCardPacketModel>? _packetHandler;
 

@@ -191,7 +191,11 @@ internal sealed class CharaCardResolver : IDisposable {
         }
 
         lock (_sync) {
-            var request = _queue.GetRequest(snapshot.ContentId);
+            if (!_queue.TryGetRequest(snapshot.ContentId, out var request)
+                || request.State != ResolveState.InFlight) {
+                return;
+            }
+
             _pendingProjections[snapshot.ContentId] = new PendingProjection(snapshot, request.AttemptVersion);
         }
     }

@@ -137,6 +137,10 @@ internal sealed class ContentIdResolveQueue {
         return _requests[contentId];
     }
 
+    public bool TryGetRequest(ulong contentId, out ResolveRequestStatus request) {
+        return _requests.TryGetValue(contentId, out request!);
+    }
+
     public bool TryStartNext(DateTime nowUtc, out ResolveRequestStatus request) {
         foreach (var candidate in _requests.Values
                      .Where(candidate => candidate.State == ResolveState.Queued
