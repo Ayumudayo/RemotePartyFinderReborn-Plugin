@@ -37,6 +37,12 @@ public class Plugin : IDalamudPlugin {
     internal IGameGui GameGui { get; private init; }
 
     [PluginService]
+    internal IChatGui ChatGui { get; private init; }
+
+    [PluginService]
+    internal IToastGui ToastGui { get; private init; }
+
+    [PluginService]
     internal ICommandManager CommandManager { get; private init; }
 
     public Configuration Configuration { get; init; }
@@ -66,7 +72,8 @@ public class Plugin : IDalamudPlugin {
             this.PlayerDatabase,
             debugSink: message => Log.Debug(message),
             warningSink: message => Log.Warning(message),
-            configuration: this.Configuration
+            configuration: this.Configuration,
+            selectOkDialogSuppressionRuntime: new DalamudSelectOkDialogSuppressionRuntime(this.AddonLifecycle, this.ChatGui, this.ToastGui, message => Log.Warning(message))
         );
         this.Framework.Update += this.CharaCardResolver.OnFrameworkUpdate;
         this.PartyDetailCollector = new PartyDetailCollector(this);

@@ -12,6 +12,7 @@ internal enum ResolveState {
     InFlight,
     Resolved,
     FailedTransient,
+    FailedPermanent,
 }
 
 internal sealed record CharacterIdentitySnapshot(
@@ -76,12 +77,11 @@ internal sealed record CharacterIdentityUploadPayload(
 internal sealed record ResolveRequestStatus(
     ulong ContentId,
     ResolveState State,
-    int TimeoutCount,
+    int FailureCount,
     int AttemptVersion,
     DateTime LastRequestedAtUtc,
     DateTime LastResolvedAtUtc,
-    DateTime NextEligibleAttemptAtUtc,
-    DateTime LastFallbackAttemptAtUtc
+    DateTime NextEligibleAttemptAtUtc
 );
 
 internal sealed class ContentIdResolveQueue {
@@ -93,9 +93,11 @@ internal sealed class ContentIdResolveQueue {
 
     private readonly Dictionary<ulong, ResolveRequestStatus> _requests = new();
     private readonly TimeSpan _freshIdentityTtl;
+    private readonly int _maxAttempts;
 
-    public ContentIdResolveQueue(TimeSpan? freshIdentityTtl = null) {
+    public ContentIdResolveQueue(TimeSpan? freshIdentityTtl = null, int maxAttempts = 2) {
         _freshIdentityTtl = freshIdentityTtl ?? TimeSpan.FromHours(24);
+        _maxAttempts = Math.Max(1, maxAttempts);
     }
 
     public IReadOnlyCollection<ResolveRequestStatus> Requests =>
@@ -114,13 +116,12 @@ internal sealed class ContentIdResolveQueue {
                 0,
                 DateTime.MinValue,
                 DateTime.MinValue,
-                nowUtc,
-                DateTime.MinValue
+                nowUtc
             );
             return true;
         }
 
-        if (existing.State is ResolveState.Queued or ResolveState.InFlight) {
+        if (existing.State is ResolveState.Queued or ResolveState.InFlight or ResolveState.FailedPermanent) {
             return false;
         }
 
@@ -137,7 +138,7 @@ internal sealed class ContentIdResolveQueue {
         _requests[contentId] = existing with {
             State = ResolveState.Queued,
             NextEligibleAttemptAtUtc = nowUtc,
-            TimeoutCount = existing.State == ResolveState.Resolved ? 0 : existing.TimeoutCount,
+            FailureCount = existing.State == ResolveState.Resolved ? 0 : existing.FailureCount,
         };
         return true;
     }
@@ -156,6 +157,19 @@ internal sealed class ContentIdResolveQueue {
         return _requests.TryGetValue(contentId, out request!);
     }
 
+    public bool TryGetInFlightRequest(out ResolveRequestStatus request) {
+        foreach (var candidate in _requests.Values
+                     .Where(static candidate => candidate.State == ResolveState.InFlight)
+                     .OrderBy(static candidate => candidate.LastRequestedAtUtc)
+                     .ThenBy(static candidate => candidate.ContentId)) {
+            request = candidate;
+            return true;
+        }
+
+        request = default!;
+        return false;
+    }
+
     public bool TryStartNext(DateTime nowUtc, out ResolveRequestStatus request) {
         foreach (var candidate in _requests.Values
                      .Where(candidate => candidate.State == ResolveState.Queued
@@ -167,7 +181,6 @@ internal sealed class ContentIdResolveQueue {
                 State = ResolveState.InFlight,
                 AttemptVersion = candidate.AttemptVersion + 1,
                 LastRequestedAtUtc = nowUtc,
-                LastFallbackAttemptAtUtc = DateTime.MinValue,
             };
             _requests[candidate.ContentId] = request;
             return true;
@@ -178,6 +191,14 @@ internal sealed class ContentIdResolveQueue {
     }
 
     public bool MarkTimeout(ulong contentId, int attemptVersion, DateTime nowUtc) {
+        return MarkFailure(contentId, attemptVersion, nowUtc);
+    }
+
+    public bool MarkLocalFailure(ulong contentId, int attemptVersion, DateTime nowUtc, TimeSpan? retryDelay = null) {
+        return MarkFailure(contentId, attemptVersion, nowUtc, retryDelay);
+    }
+
+    private bool MarkFailure(ulong contentId, int attemptVersion, DateTime nowUtc, TimeSpan? retryDelay = null) {
         if (!_requests.TryGetValue(contentId, out var request)) {
             return false;
         }
@@ -186,29 +207,16 @@ internal sealed class ContentIdResolveQueue {
             return false;
         }
 
-        var timeoutCount = request.TimeoutCount + 1;
+        var failureCount = request.FailureCount + 1;
+        var nextState = failureCount >= _maxAttempts
+            ? ResolveState.FailedPermanent
+            : ResolveState.FailedTransient;
         _requests[contentId] = request with {
-            State = ResolveState.FailedTransient,
-            TimeoutCount = timeoutCount,
-            NextEligibleAttemptAtUtc = nowUtc + GetTimeoutBackoff(timeoutCount),
-            LastFallbackAttemptAtUtc = DateTime.MinValue,
-        };
-        return true;
-    }
-
-    public bool MarkFallbackAttempt(ulong contentId, int attemptVersion, DateTime nowUtc) {
-        if (!_requests.TryGetValue(contentId, out var request)) {
-            return false;
-        }
-
-        if (request.State != ResolveState.FailedTransient
-            || request.AttemptVersion != attemptVersion
-            || request.LastFallbackAttemptAtUtc != DateTime.MinValue) {
-            return false;
-        }
-
-        _requests[contentId] = request with {
-            LastFallbackAttemptAtUtc = nowUtc,
+            State = nextState,
+            FailureCount = failureCount,
+            NextEligibleAttemptAtUtc = nextState == ResolveState.FailedPermanent
+                ? DateTime.MaxValue
+                : nowUtc + (retryDelay ?? GetTimeoutBackoff(failureCount)),
         };
         return true;
     }
@@ -217,10 +225,9 @@ internal sealed class ContentIdResolveQueue {
         if (_requests.TryGetValue(snapshot.ContentId, out var existing)) {
             _requests[snapshot.ContentId] = existing with {
                 State = ResolveState.Resolved,
-                TimeoutCount = 0,
+                FailureCount = 0,
                 LastResolvedAtUtc = snapshot.LastResolvedAtUtc,
                 NextEligibleAttemptAtUtc = snapshot.LastResolvedAtUtc,
-                LastFallbackAttemptAtUtc = DateTime.MinValue,
             };
             return;
         }
@@ -232,8 +239,7 @@ internal sealed class ContentIdResolveQueue {
             0,
             DateTime.MinValue,
             snapshot.LastResolvedAtUtc,
-            snapshot.LastResolvedAtUtc,
-            DateTime.MinValue
+            snapshot.LastResolvedAtUtc
         );
     }
 
@@ -250,7 +256,8 @@ internal sealed class ContentIdResolveQueue {
 internal static class ResolverPreflightEvaluator {
     public static ResolverPreflightResult Evaluate(
         nint requestCharaCardAddress,
-        nint handleCurrentCharaCardDataPacketAddress
+        nint handleCurrentCharaCardDataPacketAddress,
+        nint openCharaCardForPacketAddress
     ) {
         if (requestCharaCardAddress == 0) {
             return new ResolverPreflightResult(false, "RequestCharaCardForContentId interop address is unavailable.");
@@ -258,6 +265,10 @@ internal static class ResolverPreflightEvaluator {
 
         if (handleCurrentCharaCardDataPacketAddress == 0) {
             return new ResolverPreflightResult(false, "HandleCurrentCharaCardDataPacket interop address is unavailable.");
+        }
+
+        if (openCharaCardForPacketAddress == 0) {
+            return new ResolverPreflightResult(false, "OpenCharaCardForPacket interop address is unavailable.");
         }
 
         return new ResolverPreflightResult(true, "Ready");

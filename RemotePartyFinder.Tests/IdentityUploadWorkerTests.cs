@@ -137,6 +137,49 @@ public sealed class IdentityUploadWorkerTests {
     }
 
     [Fact]
+    public async Task Pump_failed_upload_does_not_retry_every_frame_within_backoff_window() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+
+        var snapshot = new CharacterIdentitySnapshot(
+            2212UL,
+            "Backoff Player",
+            21,
+            "Ravana",
+            new DateTime(2026, 4, 13, 11, 5, 0, DateTimeKind.Utc)
+        );
+        database.UpsertResolvedIdentity(snapshot);
+
+        var nowUtc = new DateTime(2026, 4, 13, 11, 6, 0, DateTimeKind.Utc);
+        var attempts = 0;
+
+        using var resolver = new CharaCardResolver(
+            database,
+            runtime: new FakeCharaCardResolverRuntime { PreflightResult = new ResolverPreflightResult(false, "hook unavailable") },
+            utcNow: () => nowUtc,
+            uploadResolvedIdentitiesAsync: (payloads, cancellationToken) => {
+                Interlocked.Increment(ref attempts);
+                return Task.FromResult(false);
+            }
+        );
+
+        resolver.Pump();
+        await WaitUntilAsync(() => Volatile.Read(ref attempts) == 1);
+        await WaitUntilAsync(() => GetPrivateIntField(resolver, "_identityUploadWorkerBusy") == 0);
+
+        resolver.Pump();
+        resolver.Pump();
+        resolver.Pump();
+
+        var retriedWithinBackoffWindow = await WaitForConditionAsync(() => Volatile.Read(ref attempts) >= 2, timeoutMs: 500);
+        Assert.False(retriedWithinBackoffWindow);
+
+        nowUtc = nowUtc.AddSeconds(10);
+        resolver.Pump();
+        await WaitUntilAsync(() => Volatile.Read(ref attempts) == 2);
+    }
+
+    [Fact]
     public async Task Pump_runs_identity_upload_worker_single_flight_until_current_attempt_completes() {
         using var harness = new TempPlayerCacheDatabase();
         using var database = new PlayerLocalDatabase(harness.DatabasePath);
@@ -237,7 +280,16 @@ public sealed class IdentityUploadWorkerTests {
 
         public ResolverPreflightResult CheckAvailability() => PreflightResult;
 
-        public void Initialize(Action<CharaCardPacketModel> packetHandler) {
+        public void Initialize(
+            Func<CharaCardPacketModel, bool> packetHandler,
+            Func<CharaCardPacketModel, bool> agentPacketHandler,
+            Func<BannerHelperResponseModel, bool> bannerHelperResponseHandler,
+            Func<CharaCardPacketModel, bool> bannerHelperPacketHandler,
+            Func<SelectOkStateTransitionModel, bool> selectOkStateTransitionHandler,
+            Func<GameUiMessageModel, bool> simpleGameUiMessageHandler,
+            Func<GameUiMessageModel, bool> parameterizedGameUiMessageHandler,
+            Func<SelectOkDialogRequestModel, bool> selectOkDialogHandler
+        ) {
         }
 
         public bool TryRequest(ulong contentId) => true;
@@ -307,15 +359,26 @@ public sealed class IdentityUploadWorkerTests {
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition, int timeoutMs = 1500, int pollMs = 20) {
+        var completed = await WaitForConditionAsync(condition, timeoutMs, pollMs);
+        Assert.True(completed, "Condition was not met within timeout.");
+    }
+
+    private static async Task<bool> WaitForConditionAsync(Func<bool> condition, int timeoutMs = 1500, int pollMs = 20) {
         var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
         while (DateTime.UtcNow < deadline) {
             if (condition()) {
-                return;
+                return true;
             }
 
             await Task.Delay(pollMs);
         }
 
-        Assert.True(condition(), "Condition was not met within timeout.");
+        return condition();
+    }
+
+    private static int GetPrivateIntField(object instance, string fieldName) {
+        var field = instance.GetType().GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(field);
+        return (int)field!.GetValue(instance)!;
     }
 }

@@ -121,7 +121,7 @@ public sealed class ContentIdEnrichmentModelsTests {
     }
 
     [Fact]
-    public void Backoff_schedule_advances_10s_30s_60s_for_repeated_timeouts() {
+    public void Backoff_schedule_advances_10s_then_permanent_on_second_failure() {
         var baseUtc = new DateTime(2026, 4, 12, 14, 0, 0, DateTimeKind.Utc);
         var queue = new ContentIdResolveQueue();
 
@@ -133,11 +133,26 @@ public sealed class ContentIdEnrichmentModelsTests {
 
         Assert.True(queue.TryStartNext(baseUtc.AddSeconds(10), out var secondAttempt));
         Assert.True(queue.MarkTimeout(4004UL, secondAttempt.AttemptVersion, baseUtc.AddSeconds(10)));
-        Assert.Equal(baseUtc.AddSeconds(40), queue.GetRequest(4004UL).NextEligibleAttemptAtUtc);
+        Assert.Equal(ResolveState.FailedPermanent, queue.GetRequest(4004UL).State);
+        Assert.False(queue.TryStartNext(baseUtc.AddSeconds(100), out _));
+    }
 
-        Assert.True(queue.TryStartNext(baseUtc.AddSeconds(40), out var thirdAttempt));
-        Assert.True(queue.MarkTimeout(4004UL, thirdAttempt.AttemptVersion, baseUtc.AddSeconds(40)));
-        Assert.Equal(baseUtc.AddSeconds(100), queue.GetRequest(4004UL).NextEligibleAttemptAtUtc);
+    [Fact]
+    public void Local_failures_share_same_retry_cap_as_timeouts() {
+        var baseUtc = new DateTime(2026, 4, 12, 14, 30, 0, DateTimeKind.Utc);
+        var queue = new ContentIdResolveQueue();
+
+        Assert.True(queue.Enqueue(4014UL, baseUtc));
+
+        Assert.True(queue.TryStartNext(baseUtc, out var firstAttempt));
+        Assert.True(queue.MarkLocalFailure(4014UL, firstAttempt.AttemptVersion, baseUtc));
+        Assert.Equal(ResolveState.FailedTransient, queue.GetRequest(4014UL).State);
+        Assert.Equal(baseUtc.AddSeconds(10), queue.GetRequest(4014UL).NextEligibleAttemptAtUtc);
+
+        Assert.True(queue.TryStartNext(baseUtc.AddSeconds(10), out var secondAttempt));
+        Assert.True(queue.MarkLocalFailure(4014UL, secondAttempt.AttemptVersion, baseUtc.AddSeconds(10)));
+        Assert.Equal(ResolveState.FailedPermanent, queue.GetRequest(4014UL).State);
+        Assert.False(queue.TryStartNext(baseUtc.AddSeconds(100), out _));
     }
 
     [Fact]
@@ -217,25 +232,17 @@ public sealed class ContentIdEnrichmentModelsTests {
     }
 
     [Fact]
-    public void Mark_fallback_attempt_allows_only_one_attempt_per_transient_failure_window() {
+    public void Enqueue_does_not_requeue_permanently_failed_request() {
         var nowUtc = new DateTime(2026, 4, 13, 3, 0, 0, DateTimeKind.Utc);
         var queue = new ContentIdResolveQueue();
 
         Assert.True(queue.Enqueue(9009UL, nowUtc));
         Assert.True(queue.TryStartNext(nowUtc, out var firstAttempt));
         Assert.True(queue.MarkTimeout(9009UL, firstAttempt.AttemptVersion, nowUtc.AddSeconds(1)));
+        Assert.True(queue.TryStartNext(nowUtc.AddSeconds(11), out var secondAttempt));
+        Assert.True(queue.MarkTimeout(9009UL, secondAttempt.AttemptVersion, nowUtc.AddSeconds(12)));
 
-        Assert.True(queue.MarkFallbackAttempt(9009UL, firstAttempt.AttemptVersion, nowUtc.AddSeconds(2)));
-        Assert.False(queue.MarkFallbackAttempt(9009UL, firstAttempt.AttemptVersion, nowUtc.AddSeconds(3)));
-
-        var failedRequest = queue.GetRequest(9009UL);
-        Assert.Equal(nowUtc.AddSeconds(2), failedRequest.LastFallbackAttemptAtUtc);
-
-        Assert.True(queue.TryStartNext(failedRequest.NextEligibleAttemptAtUtc, out var secondAttempt));
-        Assert.True(queue.MarkTimeout(9009UL, secondAttempt.AttemptVersion, failedRequest.NextEligibleAttemptAtUtc.AddSeconds(1)));
-
-        var retriedRequest = queue.GetRequest(9009UL);
-        Assert.Equal(DateTime.MinValue, retriedRequest.LastFallbackAttemptAtUtc);
-        Assert.True(queue.MarkFallbackAttempt(9009UL, secondAttempt.AttemptVersion, retriedRequest.NextEligibleAttemptAtUtc.AddSeconds(-1)));
+        Assert.Equal(ResolveState.FailedPermanent, queue.GetState(9009UL));
+        Assert.False(queue.Enqueue(9009UL, nowUtc.AddMinutes(5)));
     }
 }
