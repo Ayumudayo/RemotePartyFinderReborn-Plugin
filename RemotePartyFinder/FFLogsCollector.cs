@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Net.Http;
+using System.Threading;
 using System.Threading.Tasks;
 using Dalamud.Plugin.Services;
 using Newtonsoft.Json;
@@ -9,20 +10,120 @@ using Newtonsoft.Json.Serialization;
 
 namespace RemotePartyFinder;
 
+internal interface IFFLogsIngestHttpSender
+{
+    Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken);
+}
+
+internal interface IFFLogsApiClient
+{
+    bool TryGetRateLimitRemaining(out TimeSpan remaining);
+    DateTime RateLimitCooldownUntilUtc { get; }
+    void ResetRateLimitCooldown();
+    Task<Dictionary<string, FFLogsClient.CharacterFetchedData>> FetchCharacterCandidateDataBatchAsync(
+        List<FFLogsClient.CandidateCharacterQuery> queries,
+        int zoneId,
+        int? difficultyId,
+        int? partition,
+        int recentReportsLimit,
+        CancellationToken cancellationToken);
+    Task<Dictionary<string, double>> FetchBestBossPercentByReportAsync(
+        List<string> reportCodes,
+        int encounterId,
+        int? difficultyId,
+        CancellationToken cancellationToken);
+}
+
+internal interface IFFLogsTimeProvider
+{
+    DateTime UtcNow { get; }
+}
+
+internal sealed record FFLogsCollectorSeams(
+    IFFLogsIngestHttpSender IngestHttpSender,
+    IFFLogsApiClient ApiClient,
+    IFFLogsTimeProvider TimeProvider);
+
 public class FFLogsCollector : IDisposable
 {
+    private sealed class HttpClientIngestHttpSender(HttpClient httpClient) : IFFLogsIngestHttpSender
+    {
+        public Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+            => httpClient.SendAsync(request, cancellationToken);
+    }
+
+    private sealed class FFLogsApiClientAdapter(FFLogsClient client) : IFFLogsApiClient
+    {
+        public bool TryGetRateLimitRemaining(out TimeSpan remaining)
+            => client.TryGetRateLimitRemaining(out remaining);
+
+        public DateTime RateLimitCooldownUntilUtc
+            => client.RateLimitCooldownUntilUtc;
+
+        public void ResetRateLimitCooldown()
+            => client.ResetRateLimitCooldown();
+
+        public Task<Dictionary<string, FFLogsClient.CharacterFetchedData>> FetchCharacterCandidateDataBatchAsync(
+            List<FFLogsClient.CandidateCharacterQuery> queries,
+            int zoneId,
+            int? difficultyId,
+            int? partition,
+            int recentReportsLimit,
+            CancellationToken cancellationToken)
+            => client.FetchCharacterCandidateDataBatchAsync(
+                queries,
+                zoneId,
+                difficultyId,
+                partition,
+                recentReportsLimit,
+                cancellationToken);
+
+        public Task<Dictionary<string, double>> FetchBestBossPercentByReportAsync(
+            List<string> reportCodes,
+            int encounterId,
+            int? difficultyId,
+            CancellationToken cancellationToken)
+            => client.FetchBestBossPercentByReportAsync(
+                reportCodes,
+                encounterId,
+                difficultyId,
+                cancellationToken);
+    }
+
+    private sealed class SystemFFLogsTimeProvider : IFFLogsTimeProvider
+    {
+        public DateTime UtcNow
+            => DateTime.UtcNow;
+    }
+
     private Plugin Plugin { get; }
     private FFLogsClient FFLogsClient { get; }
     private HttpClient HttpClient { get; } = new();
+    private FFLogsCollectorSeams Seams { get; }
     private Dictionary<string, ParseResult> PendingSubmitResults { get; } = new();
     private bool IsRunning { get; set; }
     private System.Threading.CancellationTokenSource Cts { get; set; } = new();
     private DateTime _lastCooldownSkipLogUtc = DateTime.MinValue;
 
+    internal static FFLogsCollectorSeams CreateSeams(
+        IFFLogsIngestHttpSender ingestHttpSender,
+        IFFLogsApiClient apiClient,
+        IFFLogsTimeProvider timeProvider)
+    {
+        ArgumentNullException.ThrowIfNull(ingestHttpSender);
+        ArgumentNullException.ThrowIfNull(apiClient);
+        ArgumentNullException.ThrowIfNull(timeProvider);
+        return new FFLogsCollectorSeams(ingestHttpSender, apiClient, timeProvider);
+    }
+
     public FFLogsCollector(Plugin plugin)
     {
         Plugin = plugin;
         FFLogsClient = new FFLogsClient(plugin.Configuration);
+        Seams = CreateSeams(
+            new HttpClientIngestHttpSender(HttpClient),
+            new FFLogsApiClientAdapter(FFLogsClient),
+            new SystemFFLogsTimeProvider());
         Plugin.Framework.Update += OnUpdate;
         StartWorker();
     }
@@ -216,17 +317,17 @@ public class FFLogsCollector : IDisposable
         => Task.Delay(JitteredDelayMs(baseDelayMs, jitterMs), Cts.Token);
 
     public bool TryGetRateLimitCooldownRemaining(out TimeSpan remaining)
-        => FFLogsClient.TryGetRateLimitRemaining(out remaining);
+        => Seams.ApiClient.TryGetRateLimitRemaining(out remaining);
 
     public DateTime RateLimitCooldownUntilUtc
-        => FFLogsClient.RateLimitCooldownUntilUtc;
+        => Seams.ApiClient.RateLimitCooldownUntilUtc;
 
     public void ResetRateLimitCooldown()
-        => FFLogsClient.ResetRateLimitCooldown();
+        => Seams.ApiClient.ResetRateLimitCooldown();
 
     private void LogCooldownSkipIfNeeded(TimeSpan remaining)
     {
-        var now = DateTime.UtcNow;
+        var now = Seams.TimeProvider.UtcNow;
         if ((now - _lastCooldownSkipLogUtc) < TimeSpan.FromMinutes(1))
         {
             return;
@@ -323,7 +424,7 @@ public class FFLogsCollector : IDisposable
                 jsonContent,
                 capabilityToken
             );
-            var response = await HttpClient.SendAsync(abandonRequest, Cts.Token);
+            var response = await Seams.IngestHttpSender.SendAsync(abandonRequest, Cts.Token);
             var responseBody = await response.Content.ReadAsStringAsync(Cts.Token);
 
             if (response.IsSuccessStatusCode)
@@ -390,7 +491,7 @@ public class FFLogsCollector : IDisposable
                     continue;
                 }
 
-                if (FFLogsClient.TryGetRateLimitRemaining(out var rateLimitRemaining))
+                if (Seams.ApiClient.TryGetRateLimitRemaining(out var rateLimitRemaining))
                 {
                     consecutiveFailures = 0;
                     LogCooldownSkipIfNeeded(rateLimitRemaining);
@@ -456,7 +557,7 @@ public class FFLogsCollector : IDisposable
                         "/contribute/fflogs/jobs",
                         workCapability
                     );
-                    var response = await HttpClient.SendAsync(workRequest, Cts.Token);
+                    var response = await Seams.IngestHttpSender.SendAsync(workRequest, Cts.Token);
                     if (response.IsSuccessStatusCode)
                     {
                         var json = await response.Content.ReadAsStringAsync(Cts.Token);
@@ -530,7 +631,7 @@ public class FFLogsCollector : IDisposable
 
                 foreach (var group in jobsByZone)
                 {
-                    if (FFLogsClient.TryGetRateLimitRemaining(out cooldownRemaining))
+                    if (Seams.ApiClient.TryGetRateLimitRemaining(out cooldownRemaining))
                     {
                         hitRateLimitCooldown = true;
                         break;
@@ -571,7 +672,7 @@ public class FFLogsCollector : IDisposable
                         }
                     }
 
-                    var fetchedByKey = await FFLogsClient.FetchCharacterCandidateDataBatchAsync(
+                    var fetchedByKey = await Seams.ApiClient.FetchCharacterCandidateDataBatchAsync(
                         candidateQueries,
                         (int)zoneId,
                         difficultyId,
@@ -580,7 +681,7 @@ public class FFLogsCollector : IDisposable
                         Cts.Token
                     );
 
-                    if (FFLogsClient.TryGetRateLimitRemaining(out cooldownRemaining))
+                    if (Seams.ApiClient.TryGetRateLimitRemaining(out cooldownRemaining))
                     {
                         hitRateLimitCooldown = true;
                         break;
@@ -664,7 +765,7 @@ public class FFLogsCollector : IDisposable
 
                     foreach (var encId in encounterIdsNeeded)
                     {
-                        if (FFLogsClient.TryGetRateLimitRemaining(out cooldownRemaining))
+                        if (Seams.ApiClient.TryGetRateLimitRemaining(out cooldownRemaining))
                         {
                             hitRateLimitCooldown = true;
                             break;
@@ -697,14 +798,14 @@ public class FFLogsCollector : IDisposable
                         if (allCodes.Count == 0)
                             continue;
 
-                        var bestBossByReport = await FFLogsClient.FetchBestBossPercentByReportAsync(
+                        var bestBossByReport = await Seams.ApiClient.FetchBestBossPercentByReportAsync(
                             allCodes.ToList(),
                             (int)encId,
                             difficultyId,
                             Cts.Token
                         );
 
-                        if (FFLogsClient.TryGetRateLimitRemaining(out cooldownRemaining))
+                        if (Seams.ApiClient.TryGetRateLimitRemaining(out cooldownRemaining))
                         {
                             hitRateLimitCooldown = true;
                             break;
@@ -776,7 +877,7 @@ public class FFLogsCollector : IDisposable
                                 jsonContent,
                                 submitCapability
                             );
-                            var submitResp = await HttpClient.SendAsync(submitRequest, Cts.Token);
+                            var submitResp = await Seams.IngestHttpSender.SendAsync(submitRequest, Cts.Token);
                             var submitRespBody = await submitResp.Content.ReadAsStringAsync(Cts.Token);
 
                             if (submitResp.IsSuccessStatusCode)
