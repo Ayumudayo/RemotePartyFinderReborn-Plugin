@@ -1,4 +1,3 @@
-using System.Linq;
 using Microsoft.Data.Sqlite;
 using Xunit;
 
@@ -6,14 +5,10 @@ namespace RemotePartyFinder.Tests;
 
 public sealed class PlayerIdentityCacheTests {
     [Fact]
-    public void ContentIdEnrichment_assembly_does_not_reference_newtonsoft_json() {
-        var referencedAssemblies = typeof(PlayerLocalDatabase)
-            .Assembly
-            .GetReferencedAssemblies()
-            .Select(static assemblyName => assemblyName.Name)
-            .ToArray();
+    public void PlayerLocalDatabase_now_lives_in_plugin_assembly() {
+        var assemblyName = typeof(PlayerLocalDatabase).Assembly.GetName().Name;
 
-        Assert.DoesNotContain("Newtonsoft.Json", referencedAssemblies);
+        Assert.Equal("RemotePartyFinder", assemblyName);
     }
 
     [Fact]

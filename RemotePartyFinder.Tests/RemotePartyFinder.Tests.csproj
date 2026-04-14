@@ -25,7 +25,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\RemotePartyFinder\RemotePartyFinder.csproj" />
-    <ProjectReference Include="..\RemotePartyFinder.ContentIdEnrichment\RemotePartyFinder.ContentIdEnrichment.csproj" />
   </ItemGroup>
 
 </Project>

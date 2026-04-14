@@ -9,8 +9,6 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ECommons", "ECommons\ECommo
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RemotePartyFinder.Tests", "RemotePartyFinder.Tests\RemotePartyFinder.Tests.csproj", "{850B0A6D-21AB-4E2C-BF4D-C95C9FE1F0EA}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "RemotePartyFinder.ContentIdEnrichment", "RemotePartyFinder.ContentIdEnrichment\RemotePartyFinder.ContentIdEnrichment.csproj", "{D30F50CC-F219-4D24-97E4-222183F51D65}"
-EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -29,10 +27,6 @@ Global
 		{850B0A6D-21AB-4E2C-BF4D-C95C9FE1F0EA}.Debug|x64.Build.0 = Debug|Any CPU
 		{850B0A6D-21AB-4E2C-BF4D-C95C9FE1F0EA}.Release|x64.ActiveCfg = Release|Any CPU
 		{850B0A6D-21AB-4E2C-BF4D-C95C9FE1F0EA}.Release|x64.Build.0 = Release|Any CPU
-		{D30F50CC-F219-4D24-97E4-222183F51D65}.Debug|x64.ActiveCfg = Debug|Any CPU
-		{D30F50CC-F219-4D24-97E4-222183F51D65}.Debug|x64.Build.0 = Debug|Any CPU
-		{D30F50CC-F219-4D24-97E4-222183F51D65}.Release|x64.ActiveCfg = Release|Any CPU
-		{D30F50CC-F219-4D24-97E4-222183F51D65}.Release|x64.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
