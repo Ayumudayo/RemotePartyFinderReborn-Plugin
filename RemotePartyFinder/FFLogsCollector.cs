@@ -109,6 +109,7 @@ public class FFLogsCollector : IDisposable
     private FFLogsResultSubmitter ResultSubmitter { get; set; }
     private FFLogsLeaseAbandoner LeaseAbandoner { get; set; }
     private FFLogsJobLeaseClient JobLeaseClient { get; set; }
+    private FFLogsBatchProcessor BatchProcessor { get; set; }
     private IReadOnlyList<IDisposable> OwnedDisposables { get; set; } = [];
     private bool IsRunning { get; set; }
     private System.Threading.CancellationTokenSource Cts { get; set; } = new();
@@ -130,7 +131,8 @@ public class FFLogsCollector : IDisposable
         FFLogsSubmitBuffer submitBuffer,
         FFLogsWorkerPolicy workerPolicy,
         FFLogsJobLeaseClient jobLeaseClient = null,
-        FFLogsResultSubmitter resultSubmitter = null)
+        FFLogsResultSubmitter resultSubmitter = null,
+        FFLogsBatchProcessor batchProcessor = null)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentNullException.ThrowIfNull(seams);
@@ -152,6 +154,7 @@ public class FFLogsCollector : IDisposable
             resultSubmitter ?? new FFLogsResultSubmitter(seams, submitBuffer),
             new FFLogsLeaseAbandoner(seams),
             jobLeaseClient ?? new FFLogsJobLeaseClient(seams),
+            batchProcessor ?? new FFLogsBatchProcessor(seams),
             [],
             startWorker: false);
         return collector;
@@ -189,6 +192,7 @@ public class FFLogsCollector : IDisposable
             new FFLogsResultSubmitter(seams, submitBuffer),
             new FFLogsLeaseAbandoner(seams),
             new FFLogsJobLeaseClient(seams),
+            new FFLogsBatchProcessor(seams),
             [ffLogsClient, httpClient],
             startWorker: true);
     }
@@ -217,6 +221,7 @@ public class FFLogsCollector : IDisposable
         FFLogsResultSubmitter resultSubmitter,
         FFLogsLeaseAbandoner leaseAbandoner,
         FFLogsJobLeaseClient jobLeaseClient,
+        FFLogsBatchProcessor batchProcessor,
         IReadOnlyList<IDisposable> ownedDisposables,
         bool startWorker)
     {
@@ -233,6 +238,7 @@ public class FFLogsCollector : IDisposable
         ResultSubmitter = resultSubmitter ?? throw new ArgumentNullException(nameof(resultSubmitter));
         LeaseAbandoner = leaseAbandoner ?? throw new ArgumentNullException(nameof(leaseAbandoner));
         JobLeaseClient = jobLeaseClient ?? throw new ArgumentNullException(nameof(jobLeaseClient));
+        BatchProcessor = batchProcessor ?? throw new ArgumentNullException(nameof(batchProcessor));
         OwnedDisposables = ownedDisposables ?? throw new ArgumentNullException(nameof(ownedDisposables));
         SubscribeFrameworkUpdate(OnUpdate);
         if (startWorker)
@@ -250,72 +256,6 @@ public class FFLogsCollector : IDisposable
     {
         IsRunning = true;
         Task.Run(WorkerLoop, Cts.Token);
-    }
-
-    private static long ScoreCandidate(
-        FFLogsClient.CharacterFetchedData data,
-        uint encounterId,
-        uint? secondaryEncounterId)
-    {
-        long score = 0;
-
-        // Prefer candidates that have visible rankings/progress.
-        if (!data.Hidden)
-        {
-            score += 1;
-        }
-
-        if (data.Parses.Count > 0)
-        {
-            score += 1000 + data.Parses.Count;
-        }
-
-        void ScoreEncounter(uint? enc)
-        {
-            if (!enc.HasValue || enc.Value == 0) return;
-            var hit = data.Parses.FirstOrDefault(p => p.EncounterId == (int)enc.Value);
-            if (hit == null) return;
-            // Strong signal: this exact encounter has logs.
-            score += 100_000 + (long)Math.Round(hit.Percentile * 100.0);
-        }
-
-        ScoreEncounter(encounterId);
-        ScoreEncounter(secondaryEncounterId);
-
-        score += Math.Min(data.RecentReportCodes.Count, 10);
-        return score;
-    }
-
-    private static List<ParseJobCandidateServer> GetCandidates(ParseJob job)
-    {
-        if (job.CandidateServers != null && job.CandidateServers.Count > 0)
-        {
-            // Dedup while preserving order.
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var list = new List<ParseJobCandidateServer>();
-            foreach (var c in job.CandidateServers)
-            {
-                var server = (c?.Server ?? "").Trim();
-                var region = (c?.Region ?? "").Trim();
-                if (string.IsNullOrWhiteSpace(server) || string.IsNullOrWhiteSpace(region))
-                    continue;
-                var key = server + "|" + region;
-                if (!seen.Add(key))
-                    continue;
-                list.Add(new ParseJobCandidateServer { Server = server, Region = region });
-            }
-            return list;
-        }
-
-        if (!string.IsNullOrWhiteSpace(job.Server) && !string.IsNullOrWhiteSpace(job.Region))
-        {
-            return new List<ParseJobCandidateServer>
-            {
-                new() { Server = job.Server.Trim(), Region = job.Region.Trim() }
-            };
-        }
-
-        return new List<ParseJobCandidateServer>();
     }
 
     public bool TryGetRateLimitCooldownRemaining(out TimeSpan remaining)
@@ -397,227 +337,12 @@ public class FFLogsCollector : IDisposable
                 var jobs = leaseSession.Jobs;
                 DebugLog($"Received {jobs.Count} players to fetch from FFLogs.");
 
-                // 2. Fetch from FFLogs
-                // Group by Zone (+ criteria)
-                var results = new List<ParseResult>();
-                var jobsByZone = jobs.GroupBy(j => new { j.ZoneId, j.DifficultyId, j.Partition });
-
-                const int recentReportsLimit = 10;
-                const int reportsToCheckForProgress = 5;
-                var hitRateLimitCooldown = false;
-                var cooldownRemaining = TimeSpan.Zero;
-
-                foreach (var group in jobsByZone)
-                {
-                    if (Seams.ApiClient.TryGetRateLimitRemaining(out cooldownRemaining))
-                    {
-                        hitRateLimitCooldown = true;
-                        break;
-                    }
-
-                    var zoneId = group.Key.ZoneId;
-                    var difficultyId = group.Key.DifficultyId == 0 ? (int?)null : group.Key.DifficultyId;
-                    var partition = group.Key.Partition == 0 ? (int?)null : group.Key.Partition;
-
-                    // Dedup characters by ContentId
-                    var uniqueJobs = group
-                        .GroupBy(j => j.ContentId)
-                        .Select(g => g.First())
-                        .ToList();
-
-                    // Candidate probing (for unknown home worlds)
-                    var candidatesByCid = new Dictionary<ulong, List<ParseJobCandidateServer>>();
-                    var candidateQueries = new List<FFLogsClient.CandidateCharacterQuery>();
-
-                    foreach (var job in uniqueJobs)
-                    {
-                        var candidates = GetCandidates(job);
-                        if (candidates.Count == 0)
-                            continue;
-
-                        candidatesByCid[job.ContentId] = candidates;
-
-                        for (var i = 0; i < candidates.Count; i++)
-                        {
-                            var c = candidates[i];
-                            candidateQueries.Add(new FFLogsClient.CandidateCharacterQuery
-                            {
-                                Key = $"{job.ContentId}:{i}",
-                                Name = job.Name,
-                                Server = c.Server,
-                                Region = c.Region,
-                            });
-                        }
-                    }
-
-                    var fetchedByKey = await Seams.ApiClient.FetchCharacterCandidateDataBatchAsync(
-                        candidateQueries,
-                        (int)zoneId,
-                        difficultyId,
-                        partition,
-                        recentReportsLimit,
-                        Cts.Token
-                    );
-
-                    if (Seams.ApiClient.TryGetRateLimitRemaining(out cooldownRemaining))
-                    {
-                        hitRateLimitCooldown = true;
-                        break;
-                    }
-
-                    // Create result objects per character (choose best candidate per ContentId)
-                    var resultsByContentId = new Dictionary<ulong, ParseResult>();
-                    var chosenDataByCid = new Dictionary<ulong, FFLogsClient.CharacterFetchedData>();
-
-                    foreach (var job in uniqueJobs)
-                    {
-                        if (!candidatesByCid.TryGetValue(job.ContentId, out var candidates) || candidates.Count == 0)
-                            continue;
-
-                        var bestIdx = -1;
-                        var bestScore = long.MinValue;
-                        FFLogsClient.CharacterFetchedData bestData = null;
-
-                        for (var i = 0; i < candidates.Count; i++)
-                        {
-                            var key = $"{job.ContentId}:{i}";
-                            if (!fetchedByKey.TryGetValue(key, out var data))
-                                continue;
-
-                            var score = ScoreCandidate(data, job.EncounterId, job.SecondaryEncounterId);
-                            if (bestIdx < 0 || score > bestScore)
-                            {
-                                bestIdx = i;
-                                bestScore = score;
-                                bestData = data;
-                            }
-                        }
-
-                        if (bestIdx < 0 || bestData == null)
-                        {
-                            // 후보 데이터를 전혀 얻지 못한 경우(일시적 API 실패 등) - 이번 사이클에서는 스킵
-                            continue;
-                        }
-
-                        var matched = candidates[bestIdx];
-                        var pr = new ParseResult
-                        {
-                            ContentId = job.ContentId,
-                            ZoneId = zoneId,
-                            DifficultyId = group.Key.DifficultyId,
-                            Partition = group.Key.Partition,
-                            IsHidden = bestData.Hidden,
-                            IsEstimated = job.CandidateServers != null && job.CandidateServers.Count > 0,
-                            MatchedServer = matched.Server,
-                            LeaseToken = job.LeaseToken,
-                        };
-
-                        if (!pr.IsHidden)
-                        {
-                            pr.Encounters = bestData.Parses
-                                .GroupBy(e => e.EncounterId)
-                                .ToDictionary(g => g.Key, g => g.Max(x => x.Percentile));
-
-                            pr.ClearCounts = bestData.Parses
-                                .Where(e => e.ClearCount.HasValue && e.ClearCount.Value > 0)
-                                .GroupBy(e => e.EncounterId)
-                                .ToDictionary(g => g.Key, g => g.Max(x => x.ClearCount!.Value));
-                        }
-
-                        resultsByContentId[job.ContentId] = pr;
-                        chosenDataByCid[job.ContentId] = bestData;
-                    }
-
-                    // Progress: Boss remaining HP % (per encounter)
-                    var nonHiddenJobs = uniqueJobs
-                        .Where(j => resultsByContentId.TryGetValue(j.ContentId, out var r) && !r.IsHidden)
-                        .ToList();
-
-                    var encounterIdsNeeded = new HashSet<uint>();
-                    foreach (var job in nonHiddenJobs)
-                    {
-                        if (job.EncounterId != 0) encounterIdsNeeded.Add(job.EncounterId);
-                        if (job.SecondaryEncounterId.HasValue && job.SecondaryEncounterId.Value != 0)
-                            encounterIdsNeeded.Add(job.SecondaryEncounterId.Value);
-                    }
-
-                    foreach (var encId in encounterIdsNeeded)
-                    {
-                        if (Seams.ApiClient.TryGetRateLimitRemaining(out cooldownRemaining))
-                        {
-                            hitRateLimitCooldown = true;
-                            break;
-                        }
-
-                        var cids = nonHiddenJobs
-                            .Where(j => j.EncounterId == encId || j.SecondaryEncounterId == encId)
-                            .Select(j => j.ContentId)
-                            .Distinct()
-                            .ToList();
-
-                        // Collect report codes per character (limit)
-                        var codesByCid = new Dictionary<ulong, List<string>>();
-                        var allCodes = new HashSet<string>();
-                        foreach (var cid in cids)
-                        {
-                            if (!chosenDataByCid.TryGetValue(cid, out var d) || d == null)
-                                continue;
-
-                            var codes = d.RecentReportCodes
-                                .Take(reportsToCheckForProgress)
-                                .Where(code => !string.IsNullOrWhiteSpace(code))
-                                .ToList();
-
-                            codesByCid[cid] = codes;
-                            foreach (var code in codes)
-                                allCodes.Add(code);
-                        }
-
-                        if (allCodes.Count == 0)
-                            continue;
-
-                        var bestBossByReport = await Seams.ApiClient.FetchBestBossPercentByReportAsync(
-                            allCodes.ToList(),
-                            (int)encId,
-                            difficultyId,
-                            Cts.Token
-                        );
-
-                        if (Seams.ApiClient.TryGetRateLimitRemaining(out cooldownRemaining))
-                        {
-                            hitRateLimitCooldown = true;
-                            break;
-                        }
-
-                        foreach (var (cid, codes) in codesByCid)
-                        {
-                            double? best = null;
-                            foreach (var code in codes)
-                            {
-                                if (!bestBossByReport.TryGetValue(code, out var v))
-                                    continue;
-                                best = best.HasValue ? Math.Min(best.Value, v) : v;
-                            }
-
-                            if (best.HasValue && resultsByContentId.TryGetValue(cid, out var pr))
-                            {
-                                pr.BossPercentages[(int)encId] = best.Value;
-                            }
-                        }
-                    }
-
-                    if (hitRateLimitCooldown)
-                    {
-                        break;
-                    }
-
-                    results.AddRange(resultsByContentId.Values);
-                      
-                    // Respect Rate Limit (done in Client mostly but we can pause here too)
-                    await Task.Delay(1000, Cts.Token);
-                }
-
-                    var shouldAbandonRemainingLeases = hitRateLimitCooldown;
+                var processResult = await BatchProcessor.ProcessLeaseSessionAsync(leaseSession, Cts.Token);
+                hadTransientFailure |= processResult.HadTransientFailure;
+                var results = processResult.ProcessedResults;
+                var hitRateLimitCooldown = processResult.HitRateLimitCooldown;
+                var cooldownRemaining = processResult.CooldownRemaining;
+                var shouldAbandonRemainingLeases = processResult.ShouldAbandonRemainingLeases;
 
                     // 3. Submit Results (retry-safe)
                     var submitAttempt = await ResultSubmitter.TrySubmitResultsAsync(
