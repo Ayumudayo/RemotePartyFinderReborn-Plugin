@@ -8,17 +8,23 @@ internal sealed class FFLogsSubmitBuffer
 {
     private readonly Dictionary<string, ParseResult> _pendingSubmitResults = new(StringComparer.Ordinal);
 
+    internal static string GetParseResultKey(ParseResult result)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+        return $"{result.ContentId}:{result.ZoneId}:{result.DifficultyId}:{result.Partition}";
+    }
+
     public void QueueSubmitResults(IEnumerable<ParseResult> freshResults)
     {
         ArgumentNullException.ThrowIfNull(freshResults);
 
         foreach (var result in freshResults)
         {
-            _pendingSubmitResults[BuildParseResultKey(result)] = result;
+            _pendingSubmitResults[GetParseResultKey(result)] = result;
         }
     }
 
-    public List<ParseResult> BuildSubmitBatch(IEnumerable<ParseResult> freshResults)
+    public List<ParseResult> BuildSubmitBatch(List<ParseResult> freshResults)
     {
         ArgumentNullException.ThrowIfNull(freshResults);
 
@@ -39,13 +45,7 @@ internal sealed class FFLogsSubmitBuffer
 
         foreach (var result in failedBatch)
         {
-            _pendingSubmitResults[BuildParseResultKey(result)] = result;
+            _pendingSubmitResults[GetParseResultKey(result)] = result;
         }
-    }
-
-    private static string BuildParseResultKey(ParseResult result)
-    {
-        ArgumentNullException.ThrowIfNull(result);
-        return $"{result.ContentId}:{result.ZoneId}:{result.DifficultyId}:{result.Partition}";
     }
 }

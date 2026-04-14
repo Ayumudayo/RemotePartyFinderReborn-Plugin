@@ -297,9 +297,6 @@ public class FFLogsCollector : IDisposable
         return new List<ParseJobCandidateServer>();
     }
 
-    private static string ParseResultKey(ParseResult result)
-        => $"{result.ContentId}:{result.ZoneId}:{result.DifficultyId}:{result.Partition}";
-
     private static string ParseJobKey(ParseJob job)
         => $"{job.ContentId}:{job.ZoneId}:{job.DifficultyId}:{job.Partition}";
 
@@ -309,7 +306,7 @@ public class FFLogsCollector : IDisposable
         string reason)
     {
         var processedKeys = new HashSet<string>(
-            processedResults.Select(ParseResultKey),
+            processedResults.Select(FFLogsSubmitBuffer.GetParseResultKey),
             StringComparer.Ordinal);
 
         var seen = new HashSet<string>(StringComparer.Ordinal);
@@ -342,17 +339,11 @@ public class FFLogsCollector : IDisposable
         return batch;
     }
 
-    private void QueueSubmitResults(IEnumerable<ParseResult> freshResults)
-        => SubmitBuffer.QueueSubmitResults(freshResults);
+    private int WorkerBaseDelayMs
+        => WorkerPolicy.WorkerBaseDelayMs;
 
     private List<ParseResult> BuildSubmitBatch(List<ParseResult> freshResults)
         => SubmitBuffer.BuildSubmitBatch(freshResults);
-
-    private void RequeueSubmitBatch(IEnumerable<ParseResult> failedBatch)
-        => SubmitBuffer.RequeueSubmitBatch(failedBatch);
-
-    private int WorkerBaseDelayMs
-        => WorkerPolicy.WorkerBaseDelayMs;
 
     private int WorkerIdleDelayMs
         => WorkerPolicy.WorkerIdleDelayMs;
@@ -891,12 +882,12 @@ public class FFLogsCollector : IDisposable
                     var shouldAbandonRemainingLeases = hitRateLimitCooldown;
 
                     // 3. Submit Results (retry-safe)
-                    var submitBatch = BuildSubmitBatch(results);
+                    var submitBatch = SubmitBuffer.BuildSubmitBatch(results);
                     if (submitBatch.Count > 0)
                     {
                         if (!IngestEndpointResolver.TryBuildEndpointUrl(uploadUrl, "/contribute/fflogs/results", out var submitUrl))
                         {
-                            RequeueSubmitBatch(submitBatch);
+                            SubmitBuffer.RequeueSubmitBatch(submitBatch);
                             consecutiveFailures = 0;
                             await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
                             continue;
@@ -905,7 +896,7 @@ public class FFLogsCollector : IDisposable
                         if (uploadUrl.ShouldDeferProtectedEndpointRequest(
                             ProtectedEndpointCapabilityKind.FflogsResults))
                         {
-                            RequeueSubmitBatch(submitBatch);
+                            SubmitBuffer.RequeueSubmitBatch(submitBatch);
                             consecutiveFailures = 0;
                             await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
                             continue;
@@ -943,7 +934,7 @@ public class FFLogsCollector : IDisposable
                             }
                             else
                             {
-                                RequeueSubmitBatch(submitBatch);
+                                SubmitBuffer.RequeueSubmitBatch(submitBatch);
                                 var isAuthFailure = submitResp.StatusCode == System.Net.HttpStatusCode.Forbidden
                                     || submitResp.StatusCode == System.Net.HttpStatusCode.Unauthorized;
                                 if (isAuthFailure)
@@ -970,7 +961,7 @@ public class FFLogsCollector : IDisposable
                         catch (Exception ex)
                         {
                             hadTransientFailure = true;
-                            RequeueSubmitBatch(submitBatch);
+                            SubmitBuffer.RequeueSubmitBatch(submitBatch);
                             ErrorLog($"Failed to upload results (exception): {ex.Message} (requeued {submitBatch.Count})");
                         }
                     }
