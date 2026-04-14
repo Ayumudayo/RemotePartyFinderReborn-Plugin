@@ -277,6 +277,46 @@ public class ConfigWindow : Window, IDisposable
         ImGui.Separator();
         ImGui.Spacing();
 
+        ImGui.TextColored(new Vector4(0.4f, 1.0f, 0.4f, 1.0f), "[Retry Counts]");
+        ImGui.Spacing();
+
+        var detailUploadRetryCount = _configuration.DetailUploadRetryCount;
+        if (ImGui.SliderInt("Detail Upload Retries", ref detailUploadRetryCount, 0, 5, "%d"))
+        {
+            _configuration.DetailUploadRetryCount = detailUploadRetryCount;
+            _configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Additional retries after the initial PF detail upload attempt.");
+        }
+
+        var charaCardResolveRetryCount = _configuration.CharaCardResolveRetryCount;
+        if (ImGui.SliderInt("Plate Resolve Retries", ref charaCardResolveRetryCount, 0, 5, "%d"))
+        {
+            _configuration.CharaCardResolveRetryCount = charaCardResolveRetryCount;
+            _configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Additional retries after the initial contentId-to-plate resolve attempt.");
+        }
+
+        var autoDetailScanRetryCount = _configuration.AutoDetailScanRetryCount;
+        if (ImGui.SliderInt("Auto Detail Open Retries", ref autoDetailScanRetryCount, 0, 5, "%d"))
+        {
+            _configuration.AutoDetailScanRetryCount = autoDetailScanRetryCount;
+            _configuration.Save();
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Additional retries after the initial PF detail open/ready attempt in the debug scanner.");
+        }
+
+        ImGui.Spacing();
+        ImGui.Separator();
+        ImGui.Spacing();
+
         ImGui.TextColored(new Vector4(0.4f, 1.0f, 0.4f, 1.0f), "[FFLogs Worker Timing]");
         ImGui.Spacing();
 

@@ -12,6 +12,9 @@ public class Configuration : IPluginConfiguration {
     // Circuit Breaker Settings
     public int CircuitBreakerFailureThreshold { get; set; } = 3;
     public int CircuitBreakerBreakDurationMinutes { get; set; } = 1;
+    public int DetailUploadRetryCount { get; set; } = 1;
+    public int CharaCardResolveRetryCount { get; set; } = 1;
+    public int AutoDetailScanRetryCount { get; set; } = 1;
     
     public ImmutableList<UploadUrl> UploadUrls = DefaultUploadUrls();
 

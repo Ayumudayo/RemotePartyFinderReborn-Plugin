@@ -17,7 +17,6 @@ internal sealed class PartyDetailCollector : IDisposable {
     private static readonly TimeSpan ScanInterval = TimeSpan.FromMilliseconds(200);
     private static readonly TimeSpan RequeueSameFingerprintDelay = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan UploadPumpInterval = TimeSpan.FromMilliseconds(150);
-    private const int MaxRetryCount = 12;
 
     private readonly Plugin _plugin;
     private readonly HttpClient _httpClient = new();
@@ -363,7 +362,8 @@ internal sealed class PartyDetailCollector : IDisposable {
             return;
         }
 
-        if (current.AttemptCount >= MaxRetryCount) {
+        var configuredRetryCount = NormalizeRetryCount(_plugin.Configuration.DetailUploadRetryCount);
+        if (ShouldDropPendingDetail(current.AttemptCount, configuredRetryCount)) {
             _pendingDetails.TryRemove(pending.Detail.ListingId, out _);
             Plugin.Log.Warning($"PartyDetailCollector: dropping detail payload listing={pending.Detail.ListingId} after {current.AttemptCount} retries");
             return;
@@ -385,6 +385,14 @@ internal sealed class PartyDetailCollector : IDisposable {
         var boundedDelay = Math.Min(baseDelay, 15000);
         var jitterMs = Random.Shared.Next(50, 250);
         return boundedDelay + jitterMs;
+    }
+
+    internal static int NormalizeRetryCount(int configuredRetries) {
+        return Math.Max(0, configuredRetries);
+    }
+
+    internal static bool ShouldDropPendingDetail(int currentRetryCount, int configuredRetries) {
+        return currentRetryCount >= NormalizeRetryCount(configuredRetries);
     }
 
     private static ulong ComputeFingerprint(

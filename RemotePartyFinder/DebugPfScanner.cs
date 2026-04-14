@@ -345,7 +345,7 @@ internal sealed class DebugPfScanner : IDisposable {
             return;
         }
 
-        if (_openAttemptsForTarget < 2) {
+        if (ShouldRetryTargetAfterFailure(_openAttemptsForTarget, _plugin.Configuration.AutoDetailScanRetryCount)) {
             _retryTargetAfterCooldown = true;
             _state = ScanState.Cooldown;
             return;
@@ -403,7 +403,7 @@ internal sealed class DebugPfScanner : IDisposable {
             return;
         }
 
-        if (_openAttemptsForTarget < 2) {
+        if (ShouldRetryTargetAfterFailure(_openAttemptsForTarget, _plugin.Configuration.AutoDetailScanRetryCount)) {
             _retryTargetAfterCooldown = true;
             _state = ScanState.Cooldown;
             return;
@@ -538,6 +538,10 @@ internal sealed class DebugPfScanner : IDisposable {
 
         var dedupTtl = TimeSpan.FromSeconds(Math.Clamp(_plugin.Configuration.AutoDetailScanDedupTtlSeconds, 30, 3600));
         return DateTime.UtcNow - lastAttemptUtc < dedupTtl;
+    }
+
+    internal static bool ShouldRetryTargetAfterFailure(int attemptsMade, int configuredRetries) {
+        return attemptsMade <= PartyDetailCollector.NormalizeRetryCount(configuredRetries);
     }
 
     private void RebuildPendingQueue() {

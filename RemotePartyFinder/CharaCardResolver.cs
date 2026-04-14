@@ -117,8 +117,12 @@ internal sealed class CharaCardResolver : IDisposable {
         "SelectOkTitle",
     ];
 
+    internal static int ResolveMaxAttemptsFromRetryCount(int configuredRetries) {
+        return Math.Max(1, configuredRetries + 1);
+    }
+
     private readonly PlayerLocalDatabase _database;
-    private readonly ContentIdResolveQueue _queue = new();
+    private readonly ContentIdResolveQueue _queue;
     private readonly ICharaCardResolverRuntime _runtime;
     private readonly ISelectOkDialogSuppressionRuntime? _selectOkDialogSuppressionRuntime;
     private readonly Func<ushort, string?> _worldNameResolver;
@@ -168,6 +172,7 @@ internal sealed class CharaCardResolver : IDisposable {
         _worldNameResolver = worldNameResolver ?? ResolveWorldName;
         _utcNow = utcNow ?? (() => DateTime.UtcNow);
         _persistResolvedIdentity = persistResolvedIdentity ?? _database.UpsertResolvedIdentity;
+        _queue = new ContentIdResolveQueue(maxAttempts: ResolveMaxAttemptsFromRetryCount(configuration?.CharaCardResolveRetryCount ?? 1));
         _requestTimeout = requestTimeout ?? DefaultRequestTimeout;
         _identityUploadAttemptTimeout = identityUploadAttemptTimeout ?? DefaultIdentityUploadAttemptTimeout;
         _identityUploadHttpClient = identityUploadHttpClient ?? new HttpClient();
