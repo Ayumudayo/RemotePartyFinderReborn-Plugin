@@ -264,11 +264,14 @@ internal sealed class FFLogsBatchProcessor
         uint? secondaryEncounterId)
     {
         long score = 0;
-        if (data.Hidden)
+
+        // Slightly prefer visible rankings, but keep parse volume as a separate signal.
+        if (!data.Hidden)
         {
             score += 1;
         }
-        else
+
+        if (data.Parses.Count > 0)
         {
             score += 1000 + data.Parses.Count;
         }

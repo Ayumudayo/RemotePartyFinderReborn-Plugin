@@ -83,6 +83,66 @@ public sealed class FFLogsBatchProcessorTests
     }
 
     [Fact]
+    public async Task Batch_processor_prefers_hidden_candidate_with_real_parses_over_visible_candidate_with_none()
+    {
+        var apiClient = new StubFFLogsApiClient
+        {
+            OnFetchCharacterCandidateDataBatchAsync = static (queries, _, _, _, _, _) =>
+            {
+                var output = new Dictionary<string, FFLogsClient.CharacterFetchedData>();
+                foreach (var query in queries)
+                {
+                    output[query.Key] = query.Server switch
+                    {
+                        "VisibleEmpty" => new FFLogsClient.CharacterFetchedData
+                        {
+                            Hidden = false,
+                            Parses = [],
+                            RecentReportCodes = [],
+                        },
+                        "HiddenParsed" => new FFLogsClient.CharacterFetchedData
+                        {
+                            Hidden = true,
+                            Parses =
+                            [
+                                new FFLogsClient.CharacterEncounterParse
+                                {
+                                    EncounterId = 88,
+                                    Percentile = 75.0,
+                                    ClearCount = 1,
+                                },
+                            ],
+                            RecentReportCodes = ["HIDDEN-REPORT"],
+                        },
+                        _ => new FFLogsClient.CharacterFetchedData(),
+                    };
+                }
+
+                return Task.FromResult(output);
+            },
+        };
+        var processor = CreateProcessor(apiClient);
+        var session = new FFLogsLeaseSession(
+            new UploadUrl("https://session-owner.example/"),
+            [
+                CreateJob(
+                    contentId: 1501,
+                    server: "VisibleEmpty",
+                    candidateServers:
+                    [
+                        new ParseJobCandidateServer { Server = "VisibleEmpty", Region = "JP" },
+                        new ParseJobCandidateServer { Server = "HiddenParsed", Region = "JP" },
+                    ])
+            ]);
+
+        var result = await processor.ProcessLeaseSessionAsync(session, CancellationToken.None);
+
+        var parse = Assert.Single(result.ProcessedResults);
+        Assert.Equal("HiddenParsed", parse.MatchedServer);
+        Assert.True(parse.IsHidden);
+    }
+
+    [Fact]
     public async Task Batch_processor_preserves_hidden_parse_results_without_progress_enrichment()
     {
         var progressCalls = 0;
