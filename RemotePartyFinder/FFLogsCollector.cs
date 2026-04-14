@@ -4,7 +4,6 @@ using System.Linq;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
-using Dalamud.Plugin.Services;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Serialization;
 
@@ -97,8 +96,6 @@ public class FFLogsCollector : IDisposable
     }
 
     private Configuration Configuration { get; set; }
-    private Action<IFramework.OnUpdateDelegate> SubscribeFrameworkUpdate { get; set; } = static _ => { };
-    private Action<IFramework.OnUpdateDelegate> UnsubscribeFrameworkUpdate { get; set; } = static _ => { };
     private Action<string> InfoLog { get; set; } = static _ => { };
     private Action<string> WarningLog { get; set; } = static _ => { };
     private Action<string> ErrorLog { get; set; } = static _ => { };
@@ -110,8 +107,8 @@ public class FFLogsCollector : IDisposable
     private FFLogsLeaseAbandoner LeaseAbandoner { get; set; }
     private FFLogsJobLeaseClient JobLeaseClient { get; set; }
     private FFLogsBatchProcessor BatchProcessor { get; set; }
+    private FFLogsBackgroundWorker BackgroundWorker { get; set; }
     private IReadOnlyList<IDisposable> OwnedDisposables { get; set; } = [];
-    private bool IsRunning { get; set; }
     private System.Threading.CancellationTokenSource Cts { get; set; } = new();
 
     internal static FFLogsCollectorSeams CreateSeams(
@@ -146,8 +143,6 @@ public class FFLogsCollector : IDisposable
             static _ => { },
             static _ => { },
             static _ => { },
-            static _ => { },
-            static _ => { },
             seams,
             submitBuffer,
             workerPolicy,
@@ -161,7 +156,7 @@ public class FFLogsCollector : IDisposable
     }
 
     internal Task RunWorkerLoopForTestingAsync()
-        => WorkerLoop();
+        => BackgroundWorker.RunAsync(Cts.Token);
 
     private FFLogsCollector()
     {
@@ -180,8 +175,6 @@ public class FFLogsCollector : IDisposable
         var submitBuffer = new FFLogsSubmitBuffer();
         Initialize(
             plugin.Configuration,
-            handler => plugin.Framework.Update += handler,
-            handler => plugin.Framework.Update -= handler,
             message => Plugin.Log.Info(message),
             message => Plugin.Log.Warning(message),
             message => Plugin.Log.Error(message),
@@ -199,7 +192,6 @@ public class FFLogsCollector : IDisposable
 
     public void Dispose()
     {
-        UnsubscribeFrameworkUpdate(OnUpdate);
         Cts.Cancel();
         foreach (var disposable in OwnedDisposables)
         {
@@ -209,8 +201,6 @@ public class FFLogsCollector : IDisposable
 
     private void Initialize(
         Configuration configuration,
-        Action<IFramework.OnUpdateDelegate> subscribeFrameworkUpdate,
-        Action<IFramework.OnUpdateDelegate> unsubscribeFrameworkUpdate,
         Action<string> infoLog,
         Action<string> warningLog,
         Action<string> errorLog,
@@ -226,8 +216,6 @@ public class FFLogsCollector : IDisposable
         bool startWorker)
     {
         Configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
-        SubscribeFrameworkUpdate = subscribeFrameworkUpdate ?? throw new ArgumentNullException(nameof(subscribeFrameworkUpdate));
-        UnsubscribeFrameworkUpdate = unsubscribeFrameworkUpdate ?? throw new ArgumentNullException(nameof(unsubscribeFrameworkUpdate));
         InfoLog = infoLog ?? throw new ArgumentNullException(nameof(infoLog));
         WarningLog = warningLog ?? throw new ArgumentNullException(nameof(warningLog));
         ErrorLog = errorLog ?? throw new ArgumentNullException(nameof(errorLog));
@@ -240,22 +228,27 @@ public class FFLogsCollector : IDisposable
         JobLeaseClient = jobLeaseClient ?? throw new ArgumentNullException(nameof(jobLeaseClient));
         BatchProcessor = batchProcessor ?? throw new ArgumentNullException(nameof(batchProcessor));
         OwnedDisposables = ownedDisposables ?? throw new ArgumentNullException(nameof(ownedDisposables));
-        SubscribeFrameworkUpdate(OnUpdate);
+        BackgroundWorker = new FFLogsBackgroundWorker(
+            Configuration,
+            Seams.ApiClient,
+            WorkerPolicy,
+            JobLeaseClient,
+            BatchProcessor,
+            ResultSubmitter,
+            LeaseAbandoner,
+            InfoLog,
+            WarningLog,
+            ErrorLog,
+            DebugLog);
         if (startWorker)
         {
             StartWorker();
         }
     }
 
-    private void OnUpdate(IFramework framework)
-    {
-        // Placeholder if we need frame-perfect logic
-    }
-
     private void StartWorker()
     {
-        IsRunning = true;
-        Task.Run(WorkerLoop, Cts.Token);
+        Task.Run(() => BackgroundWorker.RunAsync(Cts.Token), Cts.Token);
     }
 
     public bool TryGetRateLimitCooldownRemaining(out TimeSpan remaining)
@@ -266,145 +259,6 @@ public class FFLogsCollector : IDisposable
 
     public void ResetRateLimitCooldown()
         => Seams.ApiClient.ResetRateLimitCooldown();
-
-    private async Task WorkerLoop()
-    {
-        var consecutiveFailures = 0;
-        while (!Cts.Token.IsCancellationRequested)
-        {
-            try
-            {
-                var hadTransientFailure = false;
-
-                if (!Configuration.EnableFFLogsWorker)
-                {
-                    consecutiveFailures = 0;
-                    await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
-                    continue;
-                }
-
-                if (string.IsNullOrEmpty(Configuration.FFLogsClientId) || 
-                    string.IsNullOrEmpty(Configuration.FFLogsClientSecret))
-                {
-                    consecutiveFailures = 0;
-                    await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
-                    continue;
-                }
-
-                if (Seams.ApiClient.TryGetRateLimitRemaining(out var rateLimitRemaining))
-                {
-                    consecutiveFailures = 0;
-                    WorkerPolicy.LogCooldownSkipIfNeeded(rateLimitRemaining);
-                    await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
-                    continue;
-                }
-
-                // 1. Request Work
-                var leaseAttempt = await JobLeaseClient.TryAcquireSessionAsync(
-                    Configuration,
-                    Cts.Token,
-                    WarningLog,
-                    DebugLog);
-                hadTransientFailure |= leaseAttempt.HadTransientFailure;
-                var leaseSession = leaseAttempt.Session;
-
-                if (leaseSession == null)
-                {
-                    consecutiveFailures = 0;
-                    await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
-                    continue;
-                }
-
-                if (!leaseSession.HasJobs)
-                {
-                    if (hadTransientFailure)
-                    {
-                        consecutiveFailures = await WorkerPolicy.DelayWithBackoffAsync(consecutiveFailures, Cts.Token);
-                    }
-                    else if (leaseSession.UseBaseDelayWhenNoWork)
-                    {
-                        consecutiveFailures = 0;
-                        await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
-                    }
-                    else
-                    {
-                        consecutiveFailures = 0;
-                        await WorkerPolicy.DelayAsync(WorkerPolicy.ComputeIdleDelayMs(), Cts.Token);
-                    }
-                    continue;
-                }
-
-                var jobs = leaseSession.Jobs;
-                DebugLog($"Received {jobs.Count} players to fetch from FFLogs.");
-
-                var processResult = await BatchProcessor.ProcessLeaseSessionAsync(leaseSession, Cts.Token);
-                hadTransientFailure |= processResult.HadTransientFailure;
-                var results = processResult.ProcessedResults;
-                var hitRateLimitCooldown = processResult.HitRateLimitCooldown;
-                var cooldownRemaining = processResult.CooldownRemaining;
-                var shouldAbandonRemainingLeases = processResult.ShouldAbandonRemainingLeases;
-
-                    // 3. Submit Results (retry-safe)
-                    var submitAttempt = await ResultSubmitter.TrySubmitResultsAsync(
-                        Configuration,
-                        leaseSession,
-                        results,
-                        Cts.Token,
-                        InfoLog,
-                        WarningLog,
-                        ErrorLog);
-                    hadTransientFailure |= submitAttempt.HadTransientFailure;
-                    if (submitAttempt.ShouldUseBaseDelayBeforeNextPoll)
-                    {
-                        consecutiveFailures = 0;
-                        await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
-                        continue;
-                    }
-
-                    if (shouldAbandonRemainingLeases)
-                    {
-                        await LeaseAbandoner.TryAbandonUnprocessedLeasesAsync(
-                            Configuration,
-                            leaseSession,
-                            jobs,
-                            results,
-                            "fflogs_rate_limit_cooldown",
-                            Cts.Token,
-                            WarningLog,
-                            DebugLog
-                        );
-                    }
-
-                    if (hitRateLimitCooldown)
-                    {
-                        consecutiveFailures = 0;
-                        WorkerPolicy.LogCooldownSkipIfNeeded(cooldownRemaining);
-                        await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
-                        continue;
-                    }
-
-                    if (hadTransientFailure)
-                    {
-                        consecutiveFailures = await WorkerPolicy.DelayWithBackoffAsync(consecutiveFailures, Cts.Token);
-                    }
-                    else
-                    {
-                        consecutiveFailures = 0;
-                        await WorkerPolicy.DelayAsync(WorkerPolicy.ComputeIdleDelayMs(), Cts.Token);
-                    }
-
-            }
-            catch (TaskCanceledException)
-            {
-                break;
-            }
-            catch (Exception ex)
-            {
-                ErrorLog($"FFLogsCollector Loop Error: {ex.Message}");
-                consecutiveFailures = await WorkerPolicy.DelayWithBackoffAsync(consecutiveFailures, Cts.Token);
-            }
-        }
-    }
 }
 
 [Serializable]
