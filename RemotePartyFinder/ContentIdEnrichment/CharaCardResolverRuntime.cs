@@ -32,11 +32,9 @@ internal interface ISelectOkDialogSuppressionRuntime : IDisposable {
 }
 
 internal sealed class DalamudSelectOkDialogSuppressionRuntime : ISelectOkDialogSuppressionRuntime {
-    private readonly IAddonLifecycle _addonLifecycle;
     private readonly IChatGui _chatGui;
     private readonly IToastGui _toastGui;
     private readonly Action<string>? _warningSink;
-    private readonly IAddonLifecycle.AddonEventDelegate _handler;
     private readonly IChatGui.OnLogMessageDelegate _logMessageHandler;
     private readonly IToastGui.OnNormalToastDelegate _normalToastHandler;
     private readonly IToastGui.OnQuestToastDelegate _questToastHandler;
@@ -50,11 +48,10 @@ internal sealed class DalamudSelectOkDialogSuppressionRuntime : ISelectOkDialogS
         IToastGui toastGui,
         Action<string>? warningSink = null
     ) {
-        _addonLifecycle = addonLifecycle ?? throw new ArgumentNullException(nameof(addonLifecycle));
+        _ = addonLifecycle ?? throw new ArgumentNullException(nameof(addonLifecycle));
         _chatGui = chatGui ?? throw new ArgumentNullException(nameof(chatGui));
         _toastGui = toastGui ?? throw new ArgumentNullException(nameof(toastGui));
         _warningSink = warningSink;
-        _handler = OnAddonEvent;
         _logMessageHandler = OnLogMessage;
         _normalToastHandler = OnNormalToast;
         _questToastHandler = OnQuestToast;
@@ -64,12 +61,6 @@ internal sealed class DalamudSelectOkDialogSuppressionRuntime : ISelectOkDialogS
     public void Initialize(Func<string, bool> selectOkHandler) {
         ObjectDisposedException.ThrowIf(_disposed, this);
         _selectOkHandler = selectOkHandler ?? throw new ArgumentNullException(nameof(selectOkHandler));
-
-        foreach (var addonName in CharaCardResolver.SelectOkAddonNames) {
-            foreach (var eventType in CharaCardResolver.SelectOkSuppressionEvents) {
-                _addonLifecycle.RegisterListener(eventType, addonName, _handler);
-            }
-        }
 
         _chatGui.LogMessage += _logMessageHandler;
         _toastGui.Toast += _normalToastHandler;
@@ -83,26 +74,10 @@ internal sealed class DalamudSelectOkDialogSuppressionRuntime : ISelectOkDialogS
         }
 
         _disposed = true;
-        foreach (var addonName in CharaCardResolver.SelectOkAddonNames) {
-            foreach (var eventType in CharaCardResolver.SelectOkSuppressionEvents) {
-                _addonLifecycle.UnregisterListener(eventType, addonName, _handler);
-            }
-        }
-
         _chatGui.LogMessage -= _logMessageHandler;
         _toastGui.Toast -= _normalToastHandler;
         _toastGui.QuestToast -= _questToastHandler;
         _toastGui.ErrorToast -= _errorToastHandler;
-    }
-
-    private void OnAddonEvent(AddonEvent eventType, AddonArgs args) {
-        try {
-            if (_selectOkHandler?.Invoke($"{args.AddonName}.{eventType}") == true) {
-                args.PreventOriginal();
-            }
-        } catch (Exception exception) {
-            _warningSink?.Invoke($"CharaCardResolver: failed to process SelectOk addon lifecycle event. {exception.Message}");
-        }
     }
 
     private void OnLogMessage(ILogMessage message) {

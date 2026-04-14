@@ -567,7 +567,7 @@ public sealed class CharaCardResolverRuntimeTests {
     }
 
     [Fact]
-    public void Resolver_registers_and_unregisters_select_ok_lifecycle_handlers() {
+    public void Resolver_does_not_register_select_ok_addon_lifecycle_handlers() {
         using var harness = new TempPlayerCacheDatabase();
         using var database = new PlayerLocalDatabase(harness.DatabasePath);
 
@@ -581,19 +581,19 @@ public sealed class CharaCardResolverRuntimeTests {
                    () => new DateTime(2026, 4, 13, 9, 45, 0, DateTimeKind.Utc),
                    selectOkDialogSuppressionRuntime: addonLifecycle
                )) {
-            Assert.Contains("SelectOk.PreSetup", addonLifecycle.RegisteredSources);
-            Assert.Contains("SelectOk.PreRequestedUpdate", addonLifecycle.RegisteredSources);
-            Assert.Contains("SelectOk.PreRefresh", addonLifecycle.RegisteredSources);
-            Assert.Contains("SelectOk.PreOpen", addonLifecycle.RegisteredSources);
-            Assert.Contains("SelectOk.PreShow", addonLifecycle.RegisteredSources);
-            Assert.Contains("SelectOkTitle.PreSetup", addonLifecycle.RegisteredSources);
+            Assert.DoesNotContain("SelectOk.PreSetup", addonLifecycle.RegisteredSources);
+            Assert.DoesNotContain("SelectOk.PreRequestedUpdate", addonLifecycle.RegisteredSources);
+            Assert.DoesNotContain("SelectOk.PreRefresh", addonLifecycle.RegisteredSources);
+            Assert.DoesNotContain("SelectOk.PreOpen", addonLifecycle.RegisteredSources);
+            Assert.DoesNotContain("SelectOk.PreShow", addonLifecycle.RegisteredSources);
+            Assert.DoesNotContain("SelectOkTitle.PreSetup", addonLifecycle.RegisteredSources);
         }
 
         Assert.Equal(addonLifecycle.RegisteredSources.Count, addonLifecycle.UnregisteredSources.Count);
     }
 
     [Fact]
-    public void Failed_tracked_packet_suppresses_select_ok_addon_lifecycle_events_within_window() {
+    public void Failed_tracked_packet_keeps_toast_and_chat_suppressed_without_blocking_select_ok_addon_lifecycle() {
         using var harness = new TempPlayerCacheDatabase();
         using var database = new PlayerLocalDatabase(harness.DatabasePath);
 
@@ -614,11 +614,7 @@ public sealed class CharaCardResolverRuntimeTests {
         resolver.Pump();
         runtime.Deliver(new CharaCardPacketModel(2525UL, 0, string.Empty));
 
-        Assert.True(addonLifecycle.Deliver("SelectOk.PreSetup"));
-        Assert.Contains(
-            debugLogs,
-            message => message.Contains("suppressed SelectOk.PreSetup", StringComparison.Ordinal)
-        );
+        Assert.False(addonLifecycle.Deliver("SelectOk.PreSetup"));
         Assert.True(addonLifecycle.Deliver("Toast.Quest"));
         Assert.True(addonLifecycle.Deliver("ChatLog.5856"));
     }
@@ -770,7 +766,7 @@ public sealed class CharaCardResolverRuntimeTests {
     }
 
     [Fact]
-    public void Inflight_request_should_still_suppress_select_ok_addon_events_after_window_expires() {
+    public void Inflight_request_should_not_block_select_ok_addon_events_after_window_expires() {
         using var harness = new TempPlayerCacheDatabase();
         using var database = new PlayerLocalDatabase(harness.DatabasePath);
 
@@ -790,7 +786,7 @@ public sealed class CharaCardResolverRuntimeTests {
 
         nowUtc = nowUtc.AddSeconds(2);
 
-        Assert.True(addonLifecycle.Deliver("SelectOk.PreSetup"));
+        Assert.False(addonLifecycle.Deliver("SelectOk.PreSetup"));
     }
 
     private sealed class FakeCharaCardResolverRuntime : ICharaCardResolverRuntime {
@@ -883,16 +879,6 @@ public sealed class CharaCardResolverRuntimeTests {
 
     private sealed class FakeAddonLifecycle : ISelectOkDialogSuppressionRuntime {
         private static readonly string[] KnownSources = [
-            "SelectOk.PreSetup",
-            "SelectOk.PreRequestedUpdate",
-            "SelectOk.PreRefresh",
-            "SelectOk.PreOpen",
-            "SelectOk.PreShow",
-            "SelectOkTitle.PreSetup",
-            "SelectOkTitle.PreRequestedUpdate",
-            "SelectOkTitle.PreRefresh",
-            "SelectOkTitle.PreOpen",
-            "SelectOkTitle.PreShow",
             "Toast.Normal",
             "Toast.Quest",
             "Toast.Error",
