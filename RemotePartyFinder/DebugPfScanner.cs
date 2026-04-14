@@ -480,9 +480,11 @@ internal sealed class DebugPfScanner : IDisposable {
         }
 
         if (_currentCaptureAttemptId != Guid.Empty && _currentCaptureAttemptListingId == after.ListingId) {
-            _detailCaptureRuntime.ClearScannerRequest(_currentCaptureAttemptId);
-            _currentCaptureAttemptId = Guid.Empty;
-            _currentCaptureAttemptListingId = 0;
+            _detailCaptureRuntime.CompleteScannerRequest(_currentCaptureAttemptId, after.Success, after.Reason);
+            if (_detailCaptureRuntime.GetArmedScannerRequestSerial(_currentCaptureAttemptId) is null) {
+                _currentCaptureAttemptId = Guid.Empty;
+                _currentCaptureAttemptListingId = 0;
+            }
         }
 
         Plugin.Log.Debug($"DebugPfScanner: listing={after.ListingId} success={after.Success} reason={after.Reason}");

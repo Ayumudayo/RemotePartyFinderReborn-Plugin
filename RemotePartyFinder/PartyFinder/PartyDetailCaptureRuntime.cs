@@ -91,6 +91,16 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         }
     }
 
+    internal void CompleteScannerRequest(Guid attemptId, bool success, string reason) {
+        ArgumentException.ThrowIfNullOrEmpty(reason);
+
+        if (!ShouldClearScannerRequest(success, reason)) {
+            return;
+        }
+
+        ClearScannerRequest(attemptId);
+    }
+
     internal void ResetScannerRequest() {
         lock (_gate) {
             _currentScannerArm = null;
@@ -154,6 +164,10 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         }
 
         return true;
+    }
+
+    private static bool ShouldClearScannerRequest(bool success, string reason) {
+        return success || reason.EndsWith("timeout", StringComparison.Ordinal);
     }
 
     private sealed record ScannerArm(Guid AttemptId, uint ListingId, ulong ContentId, long? RequestSerial);

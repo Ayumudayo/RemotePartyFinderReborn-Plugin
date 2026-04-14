@@ -48,6 +48,35 @@ public sealed class PartyDetailCaptureStateTests {
     }
 
     [Fact]
+    public void Armed_scanner_open_failed_does_not_clear_arm() {
+        var state = new PartyDetailCaptureState();
+        using var runtime = new FakePartyDetailCaptureRuntime(state);
+        var attemptId = Guid.NewGuid();
+
+        runtime.ArmScannerRequest(attemptId, listingId: 9001U, contentId: 44UL);
+        runtime.RaiseOpenListing(listingId: 9001U, contentId: 44UL);
+        var requestSerial = state.CurrentRequestSerial;
+
+        runtime.CompleteScannerAttempt(attemptId, success: false, reason: "open_failed");
+
+        Assert.Equal(requestSerial, runtime.GetArmedScannerRequestSerial(attemptId));
+    }
+
+    [Fact]
+    public void Armed_scanner_timeout_clears_arm() {
+        var state = new PartyDetailCaptureState();
+        using var runtime = new FakePartyDetailCaptureRuntime(state);
+        var attemptId = Guid.NewGuid();
+
+        runtime.ArmScannerRequest(attemptId, listingId: 9001U, contentId: 44UL);
+        runtime.RaiseOpenListing(listingId: 9001U, contentId: 44UL);
+
+        runtime.CompleteScannerAttempt(attemptId, success: false, reason: "detail_timeout");
+
+        Assert.Null(runtime.GetArmedScannerRequestSerial(attemptId));
+    }
+
+    [Fact]
     public void BeginScannerRequest_issues_new_request_serial_and_owner() {
         var state = new PartyDetailCaptureState();
 
@@ -164,6 +193,10 @@ public sealed class PartyDetailCaptureStateTests {
 
         internal void RaiseOpenListingByContentId(ulong contentId) {
             _runtime.TestInterceptOpenListingByContentId(contentId);
+        }
+
+        internal void CompleteScannerAttempt(Guid attemptId, bool success, string reason) {
+            _runtime.CompleteScannerRequest(attemptId, success, reason);
         }
 
         public void Dispose() {
