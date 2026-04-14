@@ -12,6 +12,7 @@ namespace RemotePartyFinder;
 internal sealed class DebugPfScanner : IDisposable {
     private readonly Plugin _plugin;
     private readonly PartyDetailCollector _detailCollector;
+    private readonly PartyDetailCaptureRuntime _detailCaptureRuntime;
 
     private readonly ConcurrentQueue<DebugPfListingCandidate> _incoming = new();
     private readonly Dictionary<uint, DebugPfListingCandidate> _collectedListings = new();
@@ -20,12 +21,20 @@ internal sealed class DebugPfScanner : IDisposable {
     private readonly Stopwatch _tickGate = new();
     private readonly DebugPfScanStateMachine _stateMachine = new(new DebugPfListingQueue());
 
+    private Guid _currentCaptureAttemptId;
+    private uint _currentCaptureAttemptListingId;
     private bool _wasEnabled;
     private bool _runFromCollectedListings;
 
-    internal DebugPfScanner(Plugin plugin, PartyDetailCollector detailCollector, Gatherer _) {
+    internal DebugPfScanner(
+        Plugin plugin,
+        PartyDetailCollector detailCollector,
+        PartyDetailCaptureRuntime detailCaptureRuntime,
+        Gatherer _
+    ) {
         _plugin = plugin;
         _detailCollector = detailCollector;
+        _detailCaptureRuntime = detailCaptureRuntime;
 
         _plugin.PartyFinderGui.ReceiveListing += OnListing;
         _plugin.Framework.Update += OnUpdate;
@@ -121,6 +130,7 @@ internal sealed class DebugPfScanner : IDisposable {
     internal void ResetSession() {
         _incoming.Clear();
         _stateMachine.Reset();
+        ResetCaptureAttempt();
     }
 
     private void OnListing(IPartyFinderListing listing, IPartyFinderListingEventArgs args) {
@@ -265,6 +275,7 @@ internal sealed class DebugPfScanner : IDisposable {
             return false;
         }
 
+        ArmCaptureRequest(target);
         if (agent->OpenListing(target.ListingId)) {
             return true;
         }
@@ -297,6 +308,7 @@ internal sealed class DebugPfScanner : IDisposable {
 
     private void SetIdle() {
         _stateMachine.SetIdle();
+        ResetCaptureAttempt();
         _runFromCollectedListings = false;
         lock (_collectionLock) {
             _collectedRunSnapshot.Clear();
@@ -467,7 +479,33 @@ internal sealed class DebugPfScanner : IDisposable {
             return;
         }
 
+        if (_currentCaptureAttemptId != Guid.Empty && _currentCaptureAttemptListingId == after.ListingId) {
+            _detailCaptureRuntime.ClearScannerRequest(_currentCaptureAttemptId);
+            _currentCaptureAttemptId = Guid.Empty;
+            _currentCaptureAttemptListingId = 0;
+        }
+
         Plugin.Log.Debug($"DebugPfScanner: listing={after.ListingId} success={after.Success} reason={after.Reason}");
+    }
+
+    private void ArmCaptureRequest(DebugPfListingCandidate target) {
+        if (_currentCaptureAttemptId == Guid.Empty || _currentCaptureAttemptListingId != target.ListingId) {
+            _currentCaptureAttemptId = Guid.NewGuid();
+            _currentCaptureAttemptListingId = target.ListingId;
+        }
+
+        _detailCaptureRuntime.ArmScannerRequest(_currentCaptureAttemptId, target.ListingId, target.ContentId);
+    }
+
+    private void ResetCaptureAttempt() {
+        if (_currentCaptureAttemptId != Guid.Empty) {
+            _detailCaptureRuntime.ClearScannerRequest(_currentCaptureAttemptId);
+        } else {
+            _detailCaptureRuntime.ResetScannerRequest();
+        }
+
+        _currentCaptureAttemptId = Guid.Empty;
+        _currentCaptureAttemptListingId = 0;
     }
 
     private readonly record struct AttemptLogState(uint ListingId, bool Success, string Reason);

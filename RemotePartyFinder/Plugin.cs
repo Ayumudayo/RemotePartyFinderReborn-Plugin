@@ -45,6 +45,9 @@ public class Plugin : IDalamudPlugin {
     [PluginService]
     internal ICommandManager CommandManager { get; private init; }
 
+    [PluginService]
+    internal IGameInteropProvider GameInteropProvider { get; private init; }
+
     public Configuration Configuration { get; init; }
     public readonly WindowSystem WindowSystem = new("Remote Party Finder Reborn");
     private ConfigWindow ConfigWindow { get; init; }
@@ -53,6 +56,8 @@ public class Plugin : IDalamudPlugin {
     internal PlayerLocalDatabase PlayerDatabase { get; }
     private PlayerCollector PlayerCollector { get; }
     internal CharaCardResolver CharaCardResolver { get; }
+    internal PartyDetailCaptureState PartyDetailCaptureState { get; }
+    internal PartyDetailCaptureRuntime PartyDetailCaptureRuntime { get; }
     internal PartyDetailCollector PartyDetailCollector { get; }
     internal DebugPfScanner DebugPfScanner { get; }
     private FFLogsCollector FFLogsCollector { get; }
@@ -76,8 +81,14 @@ public class Plugin : IDalamudPlugin {
             selectOkDialogSuppressionRuntime: new DalamudSelectOkDialogSuppressionRuntime(this.AddonLifecycle, this.ChatGui, this.ToastGui, message => Log.Warning(message))
         );
         this.Framework.Update += this.CharaCardResolver.OnFrameworkUpdate;
+        this.PartyDetailCaptureState = new PartyDetailCaptureState();
+        this.PartyDetailCaptureRuntime = new PartyDetailCaptureRuntime(
+            this.PartyDetailCaptureState,
+            this.GameInteropProvider,
+            message => Log.Warning(message)
+        );
         this.PartyDetailCollector = new PartyDetailCollector(this);
-        this.DebugPfScanner = new DebugPfScanner(this, this.PartyDetailCollector, this.Gatherer);
+        this.DebugPfScanner = new DebugPfScanner(this, this.PartyDetailCollector, this.PartyDetailCaptureRuntime, this.Gatherer);
         this.FFLogsCollector = new FFLogsCollector(this);
         ConfigWindow = new ConfigWindow(this);
         WindowSystem.AddWindow(ConfigWindow);
@@ -97,6 +108,7 @@ public class Plugin : IDalamudPlugin {
         this.PlayerDatabase.Dispose();
         this.PartyDetailCollector.Dispose();
         this.DebugPfScanner.Dispose();
+        this.PartyDetailCaptureRuntime.Dispose();
         this.FFLogsCollector.Dispose();
         WindowSystem.RemoveAllWindows();
         ConfigWindow.Dispose();

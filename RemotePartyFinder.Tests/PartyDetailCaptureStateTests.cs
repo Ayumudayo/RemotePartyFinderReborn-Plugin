@@ -1,9 +1,52 @@
+using System;
 using System.Collections.Generic;
 using Xunit;
 
 namespace RemotePartyFinder.Tests;
 
 public sealed class PartyDetailCaptureStateTests {
+    [Fact]
+    public void Unarmed_open_listing_starts_manual_request_cycle() {
+        var state = new PartyDetailCaptureState();
+        using var runtime = new FakePartyDetailCaptureRuntime(state);
+
+        runtime.RaiseOpenListing(listingId: 9001U, contentId: 44UL);
+
+        Assert.Equal(PartyDetailRequestOwner.Manual, state.CurrentOwner);
+        Assert.Equal(9001U, state.CurrentListingId);
+    }
+
+    [Fact]
+    public void Armed_scanner_open_listing_starts_scanner_request_cycle() {
+        var state = new PartyDetailCaptureState();
+        using var runtime = new FakePartyDetailCaptureRuntime(state);
+        var attemptId = Guid.NewGuid();
+
+        runtime.ArmScannerRequest(attemptId, listingId: 9001U, contentId: 44UL);
+        runtime.RaiseOpenListing(listingId: 9001U, contentId: 44UL);
+
+        Assert.Equal(PartyDetailRequestOwner.Scanner, state.CurrentOwner);
+        Assert.Equal(9001U, state.CurrentListingId);
+        Assert.Equal(state.CurrentRequestSerial, runtime.GetArmedScannerRequestSerial(attemptId));
+    }
+
+    [Fact]
+    public void Armed_scanner_fallback_open_reuses_same_request_cycle() {
+        var state = new PartyDetailCaptureState();
+        using var runtime = new FakePartyDetailCaptureRuntime(state);
+        var attemptId = Guid.NewGuid();
+
+        runtime.ArmScannerRequest(attemptId, listingId: 9001U, contentId: 44UL);
+        runtime.RaiseOpenListing(listingId: 9001U, contentId: 44UL);
+        var firstRequestSerial = state.CurrentRequestSerial;
+
+        runtime.RaiseOpenListingByContentId(contentId: 44UL);
+
+        Assert.Equal(firstRequestSerial, state.CurrentRequestSerial);
+        Assert.Equal(firstRequestSerial, runtime.GetArmedScannerRequestSerial(attemptId));
+        Assert.Equal(PartyDetailRequestOwner.Scanner, state.CurrentOwner);
+    }
+
     [Fact]
     public void BeginScannerRequest_issues_new_request_serial_and_owner() {
         var state = new PartyDetailCaptureState();
@@ -98,5 +141,33 @@ public sealed class PartyDetailCaptureStateTests {
             LeaderContentId = leaderContentId,
             MemberContentIds = new List<ulong> { leaderContentId },
         };
+    }
+
+    private sealed class FakePartyDetailCaptureRuntime : IDisposable {
+        private readonly PartyDetailCaptureRuntime _runtime;
+
+        internal FakePartyDetailCaptureRuntime(PartyDetailCaptureState state) {
+            _runtime = new PartyDetailCaptureRuntime(state);
+        }
+
+        internal void ArmScannerRequest(Guid attemptId, uint listingId, ulong contentId) {
+            _runtime.ArmScannerRequest(attemptId, listingId, contentId);
+        }
+
+        internal long? GetArmedScannerRequestSerial(Guid attemptId) {
+            return _runtime.GetArmedScannerRequestSerial(attemptId);
+        }
+
+        internal void RaiseOpenListing(uint listingId, ulong contentId) {
+            _runtime.TestInterceptOpenListing(listingId, contentId);
+        }
+
+        internal void RaiseOpenListingByContentId(ulong contentId) {
+            _runtime.TestInterceptOpenListingByContentId(contentId);
+        }
+
+        public void Dispose() {
+            // Tests construct the runtime without Dalamud hook initialization.
+        }
     }
 }

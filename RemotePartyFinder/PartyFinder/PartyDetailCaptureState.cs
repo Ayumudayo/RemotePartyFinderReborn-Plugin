@@ -29,7 +29,39 @@ internal sealed class PartyDetailCaptureState {
         }
     }
 
-    public PartyDetailRequestCycle BeginRequest(PartyDetailRequestOwner owner, uint listingId, ulong contentId) {
+    internal long? CurrentRequestSerial {
+        get {
+            lock (_gate) {
+                return _nextRequestSerial > 0 ? _nextRequestSerial : null;
+            }
+        }
+    }
+
+    internal PartyDetailRequestOwner? CurrentOwner {
+        get {
+            lock (_gate) {
+                return TryGetCurrentCycle(out var cycle) ? cycle.Owner : null;
+            }
+        }
+    }
+
+    internal uint CurrentListingId {
+        get {
+            lock (_gate) {
+                return TryGetCurrentCycle(out var cycle) ? cycle.ListingId : 0U;
+            }
+        }
+    }
+
+    internal ulong CurrentContentId {
+        get {
+            lock (_gate) {
+                return TryGetCurrentCycle(out var cycle) ? cycle.ContentId : 0UL;
+            }
+        }
+    }
+
+    internal PartyDetailRequestCycle BeginRequest(PartyDetailRequestOwner owner, uint listingId, ulong contentId) {
         lock (_gate) {
             var cycle = new PartyDetailRequestCycle(++_nextRequestSerial, owner, listingId, contentId);
             _pendingRequests[cycle.RequestSerial] = cycle;
@@ -98,6 +130,15 @@ internal sealed class PartyDetailCaptureState {
             MemberJobs = snapshot.MemberJobs is { } memberJobs ? new List<byte>(memberJobs) : new List<byte>(),
             SlotFlags = snapshot.SlotFlags is { } slotFlags ? new List<string>(slotFlags) : new List<string>(),
         };
+    }
+
+    private bool TryGetCurrentCycle(out PartyDetailRequestCycle cycle) {
+        if (_nextRequestSerial <= 0) {
+            cycle = default;
+            return false;
+        }
+
+        return _pendingRequests.TryGetValue(_nextRequestSerial, out cycle);
     }
 
     private sealed record PartyDetailArrival(long Generation, PartyDetailRequestCycle Cycle, UploadablePartyDetail Snapshot);
