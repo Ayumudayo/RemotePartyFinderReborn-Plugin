@@ -46,7 +46,7 @@ internal sealed class PartyDetailCaptureState {
             }
 
             var generation = ++_latestArrivalGeneration;
-            _latestArrival = new PartyDetailArrival(generation, cycle, snapshot);
+            _latestArrival = new PartyDetailArrival(generation, cycle, CloneSnapshot(snapshot));
             _hasLatestArrival = true;
             return true;
         }
@@ -73,14 +73,31 @@ internal sealed class PartyDetailCaptureState {
                 return false;
             }
 
+            var requestContentMatches = _latestArrival.Cycle.ContentId == 0
+                                        || _latestArrival.Cycle.ContentId == contentId;
+            var snapshotContentMatches = contentId == 0
+                                         || _latestArrival.Snapshot.LeaderContentId == contentId;
+
             return _latestArrival.Generation > _latestConsumedGeneration
                    && _latestArrival.Cycle.RequestSerial == requestSerial
                    && _latestArrival.Cycle.Owner == PartyDetailRequestOwner.Scanner
                    && _latestArrival.Cycle.ListingId == listingId
-                   && _latestArrival.Cycle.ContentId == contentId
                    && _latestArrival.Snapshot.ListingId == listingId
-                   && _latestArrival.Snapshot.LeaderContentId == contentId;
+                   && requestContentMatches
+                   && snapshotContentMatches;
         }
+    }
+
+    private static UploadablePartyDetail CloneSnapshot(UploadablePartyDetail snapshot) {
+        return new UploadablePartyDetail {
+            ListingId = snapshot.ListingId,
+            LeaderContentId = snapshot.LeaderContentId,
+            LeaderName = snapshot.LeaderName,
+            HomeWorld = snapshot.HomeWorld,
+            MemberContentIds = snapshot.MemberContentIds is { } memberContentIds ? new List<ulong>(memberContentIds) : new List<ulong>(),
+            MemberJobs = snapshot.MemberJobs is { } memberJobs ? new List<byte>(memberJobs) : new List<byte>(),
+            SlotFlags = snapshot.SlotFlags is { } slotFlags ? new List<string>(slotFlags) : new List<string>(),
+        };
     }
 
     private sealed record PartyDetailArrival(long Generation, PartyDetailRequestCycle Cycle, UploadablePartyDetail Snapshot);

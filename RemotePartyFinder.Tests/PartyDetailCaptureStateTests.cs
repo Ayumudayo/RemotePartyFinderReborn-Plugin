@@ -39,6 +39,17 @@ public sealed class PartyDetailCaptureStateTests {
     }
 
     [Fact]
+    public void IsScannerAckReady_accepts_listing_only_scanner_target() {
+        var state = new PartyDetailCaptureState();
+        var cycle = state.BeginRequest(PartyDetailRequestOwner.Scanner, 9001U, 0UL);
+        var snapshot = CreateSnapshot(9001U, 44UL);
+
+        Assert.True(state.TryRecordArrival(cycle.RequestSerial, snapshot));
+
+        Assert.True(state.IsScannerAckReady(cycle.RequestSerial, 9001U, 0UL));
+    }
+
+    [Fact]
     public void IsScannerAckReady_rejects_stale_generation_after_consume() {
         var state = new PartyDetailCaptureState();
         var cycle = state.BeginRequest(PartyDetailRequestOwner.Scanner, 9001U, 44UL);
@@ -64,6 +75,21 @@ public sealed class PartyDetailCaptureStateTests {
         Assert.Equal(1L, state.LastConsumedGeneration);
         Assert.False(state.TryMarkConsumed(1L));
         Assert.False(state.TryMarkConsumed(0L));
+    }
+
+    [Fact]
+    public void TryRecordArrival_captures_stable_snapshot_before_caller_mutation() {
+        var state = new PartyDetailCaptureState();
+        var cycle = state.BeginRequest(PartyDetailRequestOwner.Scanner, 9001U, 44UL);
+        var snapshot = CreateSnapshot(9001U, 44UL);
+
+        Assert.True(state.TryRecordArrival(cycle.RequestSerial, snapshot));
+
+        snapshot.ListingId = 9002U;
+        snapshot.LeaderContentId = 55UL;
+        snapshot.MemberContentIds[0] = 55UL;
+
+        Assert.True(state.IsScannerAckReady(cycle.RequestSerial, 9001U, 44UL));
     }
 
     private static UploadablePartyDetail CreateSnapshot(uint listingId, ulong leaderContentId) {
