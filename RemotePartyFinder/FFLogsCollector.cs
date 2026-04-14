@@ -339,33 +339,8 @@ public class FFLogsCollector : IDisposable
         return batch;
     }
 
-    private int WorkerBaseDelayMs
-        => WorkerPolicy.WorkerBaseDelayMs;
-
     private List<ParseResult> BuildSubmitBatch(List<ParseResult> freshResults)
         => SubmitBuffer.BuildSubmitBatch(freshResults);
-
-    private int WorkerIdleDelayMs
-        => WorkerPolicy.WorkerIdleDelayMs;
-
-    private int WorkerJitterMs
-        => WorkerPolicy.WorkerJitterMs;
-
-    private int WorkerMaxBackoffDelayMs
-        => WorkerPolicy.WorkerMaxBackoffDelayMs;
-
-    private static int JitteredDelayMs(int baseDelayMs, int jitterMs = 1000)
-    {
-        if (baseDelayMs < 0)
-            baseDelayMs = 0;
-        if (jitterMs < 0)
-            jitterMs = 0;
-
-        return baseDelayMs + Random.Shared.Next(0, jitterMs + 1);
-    }
-
-    private Task DelayWithJitterAsync(int baseDelayMs, int jitterMs = 1000)
-        => Task.Delay(JitteredDelayMs(baseDelayMs, jitterMs), Cts.Token);
 
     public bool TryGetRateLimitCooldownRemaining(out TimeSpan remaining)
         => Seams.ApiClient.TryGetRateLimitRemaining(out remaining);
@@ -375,17 +350,6 @@ public class FFLogsCollector : IDisposable
 
     public void ResetRateLimitCooldown()
         => Seams.ApiClient.ResetRateLimitCooldown();
-
-    private void LogCooldownSkipIfNeeded(TimeSpan remaining)
-        => WorkerPolicy.LogCooldownSkipIfNeeded(remaining);
-
-    private async Task<int> DelayWithBackoffAsync(int consecutiveFailures)
-    {
-        var nextFailures = WorkerPolicy.ComputeNextBackoffFailures(consecutiveFailures);
-        var backoffDelay = WorkerPolicy.ComputeBackoffDelayMs(consecutiveFailures);
-        await DelayWithJitterAsync(backoffDelay, WorkerJitterMs);
-        return nextFailures;
-    }
 
     private static bool TryParseResultsSubmitResponse(string content, out ContributeFflogsResultsResponse parsed)
     {
@@ -519,7 +483,7 @@ public class FFLogsCollector : IDisposable
                 if (!Configuration.EnableFFLogsWorker)
                 {
                     consecutiveFailures = 0;
-                    await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
+                    await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
                     continue;
                 }
 
@@ -527,15 +491,15 @@ public class FFLogsCollector : IDisposable
                     string.IsNullOrEmpty(Configuration.FFLogsClientSecret))
                 {
                     consecutiveFailures = 0;
-                    await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
+                    await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
                     continue;
                 }
 
                 if (Seams.ApiClient.TryGetRateLimitRemaining(out var rateLimitRemaining))
                 {
                     consecutiveFailures = 0;
-                    LogCooldownSkipIfNeeded(rateLimitRemaining);
-                    await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
+                    WorkerPolicy.LogCooldownSkipIfNeeded(rateLimitRemaining);
+                    await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
                     continue;
                 }
 
@@ -562,7 +526,7 @@ public class FFLogsCollector : IDisposable
                 if (uploadUrl == null)
                 {
                     consecutiveFailures = 0;
-                    await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
+                    await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
                     continue;
                 }
 
@@ -570,7 +534,7 @@ public class FFLogsCollector : IDisposable
                 if (!IngestEndpointResolver.TryBuildEndpointUrl(uploadUrl, "/contribute/fflogs/jobs", out var workUrl))
                 {
                     consecutiveFailures = 0;
-                    await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
+                    await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
                     continue;
                 }
 
@@ -578,7 +542,7 @@ public class FFLogsCollector : IDisposable
                     ProtectedEndpointCapabilityKind.FflogsJobs))
                 {
                     consecutiveFailures = 0;
-                    await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
+                    await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
                     continue;
                 }
 
@@ -647,12 +611,12 @@ public class FFLogsCollector : IDisposable
                 {
                     if (hadTransientFailure)
                     {
-                        consecutiveFailures = await DelayWithBackoffAsync(consecutiveFailures);
+                        consecutiveFailures = await WorkerPolicy.DelayWithBackoffAsync(consecutiveFailures, Cts.Token);
                     }
                     else
                     {
                         consecutiveFailures = 0;
-                        await DelayWithJitterAsync(WorkerIdleDelayMs, WorkerJitterMs);
+                        await WorkerPolicy.DelayAsync(WorkerPolicy.ComputeIdleDelayMs(), Cts.Token);
                     }
                     continue;
                 }
@@ -889,7 +853,7 @@ public class FFLogsCollector : IDisposable
                         {
                             SubmitBuffer.RequeueSubmitBatch(submitBatch);
                             consecutiveFailures = 0;
-                            await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
+                            await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
                             continue;
                         }
 
@@ -898,7 +862,7 @@ public class FFLogsCollector : IDisposable
                         {
                             SubmitBuffer.RequeueSubmitBatch(submitBatch);
                             consecutiveFailures = 0;
-                            await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
+                            await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
                             continue;
                         }
 
@@ -979,19 +943,19 @@ public class FFLogsCollector : IDisposable
                     if (hitRateLimitCooldown)
                     {
                         consecutiveFailures = 0;
-                        LogCooldownSkipIfNeeded(cooldownRemaining);
-                        await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
+                        WorkerPolicy.LogCooldownSkipIfNeeded(cooldownRemaining);
+                        await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
                         continue;
                     }
 
                     if (hadTransientFailure)
                     {
-                        consecutiveFailures = await DelayWithBackoffAsync(consecutiveFailures);
+                        consecutiveFailures = await WorkerPolicy.DelayWithBackoffAsync(consecutiveFailures, Cts.Token);
                     }
                     else
                     {
                         consecutiveFailures = 0;
-                        await DelayWithJitterAsync(WorkerIdleDelayMs, WorkerJitterMs);
+                        await WorkerPolicy.DelayAsync(WorkerPolicy.ComputeIdleDelayMs(), Cts.Token);
                     }
 
             }
@@ -1002,7 +966,7 @@ public class FFLogsCollector : IDisposable
             catch (Exception ex)
             {
                 ErrorLog($"FFLogsCollector Loop Error: {ex.Message}");
-                consecutiveFailures = await DelayWithBackoffAsync(consecutiveFailures);
+                consecutiveFailures = await WorkerPolicy.DelayWithBackoffAsync(consecutiveFailures, Cts.Token);
             }
         }
     }

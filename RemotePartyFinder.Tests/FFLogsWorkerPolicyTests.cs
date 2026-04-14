@@ -49,6 +49,21 @@ public sealed class FFLogsWorkerPolicyTests {
     }
 
     [Fact]
+    public void Worker_policy_computes_idle_delay_without_touching_http_or_fflogs_dependencies() {
+        var policy = new FFLogsWorkerPolicy(
+            new Configuration {
+                FFLogsWorkerIdleDelayMs = 250,
+                FFLogsWorkerJitterMs = 0,
+            },
+            _ => { },
+            new ManualFFLogsTimeProvider { UtcNow = new DateTime(2026, 4, 14, 1, 30, 0, DateTimeKind.Utc) });
+
+        var idleDelayMs = policy.ComputeIdleDelayMs();
+
+        Assert.Equal(1000, idleDelayMs);
+    }
+
+    [Fact]
     public void Collector_exposes_internal_dependency_seams_needed_by_future_fflogs_http_services() {
         var ingestHttpSender = new StubFFLogsIngestHttpSender();
         var apiClient = new StubFFLogsApiClient();
@@ -64,7 +79,7 @@ public sealed class FFLogsWorkerPolicyTests {
     }
 
     [Fact]
-    public void Collector_factory_uses_injected_seams_submit_buffer_and_worker_policy_for_live_paths() {
+    public void Collector_factory_uses_injected_seams_submit_buffer_while_worker_policy_owns_scheduling_helpers() {
         var configuration = new Configuration {
             FFLogsWorkerBaseDelayMs = 5000,
             FFLogsWorkerIdleDelayMs = 10000,
@@ -110,12 +125,16 @@ public sealed class FFLogsWorkerPolicyTests {
         var queued = Assert.Single(batch);
         Assert.Equal(7777UL, queued.ContentId);
         Assert.Equal("Injected", queued.MatchedServer);
+        Assert.Empty(warnings.Messages);
 
-        var logCooldownSkipIfNeeded = typeof(FFLogsCollector).GetMethod(
+        Assert.Null(typeof(FFLogsCollector).GetMethod(
+            "DelayWithJitterAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic));
+        Assert.Null(typeof(FFLogsCollector).GetMethod(
+            "DelayWithBackoffAsync",
+            BindingFlags.Instance | BindingFlags.NonPublic));
+        Assert.Null(typeof(FFLogsCollector).GetMethod(
             "LogCooldownSkipIfNeeded",
-            BindingFlags.Instance | BindingFlags.NonPublic);
-        Assert.NotNull(logCooldownSkipIfNeeded);
-        logCooldownSkipIfNeeded!.Invoke(collector, new object[] { TimeSpan.FromMinutes(5) });
-        Assert.Single(warnings.Messages);
+            BindingFlags.Instance | BindingFlags.NonPublic));
     }
 }

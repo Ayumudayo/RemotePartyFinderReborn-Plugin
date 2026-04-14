@@ -41,6 +41,9 @@ internal sealed class FFLogsWorkerPolicy
 
     public int LastBackoffDelayMs { get; private set; }
 
+    public int ComputeIdleDelayMs()
+        => WorkerIdleDelayMs;
+
     public void LogCooldownSkipIfNeeded(TimeSpan remaining)
     {
         var now = _timeProvider.UtcNow;
@@ -64,11 +67,24 @@ internal sealed class FFLogsWorkerPolicy
         return Math.Min(WorkerMaxBackoffDelayMs, WorkerBaseDelayMs * (1 << exponent));
     }
 
+    public Task DelayAsync(int baseDelayMs, CancellationToken cancellationToken)
+        => _delayAsync(ComputeJitteredDelayMs(baseDelayMs), cancellationToken);
+
     public async Task<int> DelayWithBackoffAsync(int consecutiveFailures, CancellationToken cancellationToken)
     {
         LastBackoffDelayMs = ComputeBackoffDelayMs(consecutiveFailures);
-        await _delayAsync(LastBackoffDelayMs, cancellationToken);
+        await DelayAsync(LastBackoffDelayMs, cancellationToken);
         return ComputeNextBackoffFailures(consecutiveFailures);
+    }
+
+    private int ComputeJitteredDelayMs(int baseDelayMs)
+    {
+        if (baseDelayMs < 0)
+        {
+            baseDelayMs = 0;
+        }
+
+        return baseDelayMs + Random.Shared.Next(0, WorkerJitterMs + 1);
     }
 
     private static Task DefaultDelayAsync(int delayMs, CancellationToken cancellationToken)
