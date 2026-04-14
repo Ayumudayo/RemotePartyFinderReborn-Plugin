@@ -32,10 +32,11 @@ public sealed class FFLogsLeaseAbandonerTests
         var seams = FFLogsCollector.CreateSeams(sender, new StubFFLogsApiClient(), new ManualFFLogsTimeProvider());
         var abandoner = new FFLogsLeaseAbandoner(seams);
         var uploadUrl = new UploadUrl("http://127.0.0.1:8000");
+        var session = new FFLogsLeaseSession(uploadUrl, []);
 
         await abandoner.TryAbandonUnprocessedLeasesAsync(
             configuration,
-            uploadUrl,
+            session,
             [
                 CreateJob(contentId: 1001, leaseToken: "lease-a"),
                 CreateJob(contentId: 1002, leaseToken: "lease-b"),
@@ -69,10 +70,11 @@ public sealed class FFLogsLeaseAbandonerTests
         var seams = FFLogsCollector.CreateSeams(sender, new StubFFLogsApiClient(), new ManualFFLogsTimeProvider());
         var abandoner = new FFLogsLeaseAbandoner(seams);
         var uploadUrl = CreateUploadUrlWithAbandonCapability();
+        var session = new FFLogsLeaseSession(uploadUrl, []);
 
         await abandoner.TryAbandonUnprocessedLeasesAsync(
             configuration,
-            uploadUrl,
+            session,
             [CreateJob(contentId: 2001, leaseToken: "lease-a")],
             [],
             "auth_failed",
@@ -98,11 +100,12 @@ public sealed class FFLogsLeaseAbandonerTests
         var seams = FFLogsCollector.CreateSeams(sender, new StubFFLogsApiClient(), new ManualFFLogsTimeProvider());
         var abandoner = new FFLogsLeaseAbandoner(seams);
         var uploadUrl = new UploadUrl("http://127.0.0.1:8000");
+        var session = new FFLogsLeaseSession(uploadUrl, []);
         var debugMessages = new List<string>();
 
         await abandoner.TryAbandonUnprocessedLeasesAsync(
             configuration,
-            uploadUrl,
+            session,
             [CreateJob(contentId: 3001, leaseToken: "lease-a")],
             [],
             "not_found",
@@ -112,6 +115,42 @@ public sealed class FFLogsLeaseAbandonerTests
 
         Assert.Single(sender.Requests);
         Assert.Contains(debugMessages, message => message.Contains("unavailable on this server version", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Lease_abandoner_uses_the_existing_lease_session_endpoint_instead_of_reselecting()
+    {
+        var configuration = new Configuration
+        {
+            IngestClientId = Guid.NewGuid().ToString("N"),
+            UploadUrls = ImmutableList.Create(
+                new UploadUrl("https://reselected.example/"),
+                new UploadUrl("https://session-owner.example/")),
+        };
+        var sender = new StubFFLogsIngestHttpSender
+        {
+            OnSendAsync = static (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("{\"submitted\":1,\"released\":1,\"rejected\":0}"),
+            }),
+        };
+        var seams = FFLogsCollector.CreateSeams(sender, new StubFFLogsApiClient(), new ManualFFLogsTimeProvider());
+        var abandoner = new FFLogsLeaseAbandoner(seams);
+        var sessionOwner = configuration.UploadUrls[1];
+        var session = new FFLogsLeaseSession(sessionOwner, []);
+
+        await abandoner.TryAbandonUnprocessedLeasesAsync(
+            configuration,
+            session,
+            [CreateJob(contentId: 4001, leaseToken: "lease-a")],
+            [],
+            "session_owner",
+            CancellationToken.None,
+            static _ => { },
+            static _ => { });
+
+        var request = Assert.Single(sender.Requests);
+        Assert.StartsWith("https://session-owner.example/contribute/fflogs/leases/abandon", request.RequestUri!.ToString(), StringComparison.Ordinal);
     }
 
     private static Configuration CreateConfiguration()

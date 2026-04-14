@@ -18,7 +18,7 @@ internal sealed class FFLogsLeaseAbandoner
 
     public async Task TryAbandonUnprocessedLeasesAsync(
         Configuration configuration,
-        UploadUrl uploadUrl,
+        FFLogsLeaseSession leaseSession,
         IEnumerable<ParseJob> leasedJobs,
         IEnumerable<ParseResult> processedResults,
         string reason,
@@ -27,7 +27,7 @@ internal sealed class FFLogsLeaseAbandoner
         Action<string> debugLog)
     {
         ArgumentNullException.ThrowIfNull(configuration);
-        ArgumentNullException.ThrowIfNull(uploadUrl);
+        ArgumentNullException.ThrowIfNull(leaseSession);
         ArgumentNullException.ThrowIfNull(leasedJobs);
         ArgumentNullException.ThrowIfNull(processedResults);
         ArgumentNullException.ThrowIfNull(reason);
@@ -40,19 +40,19 @@ internal sealed class FFLogsLeaseAbandoner
             return;
         }
 
-        if (!IngestEndpointResolver.TryBuildEndpointUrl(uploadUrl, "/contribute/fflogs/leases/abandon", out var abandonUrl))
+        if (!leaseSession.TryBuildEndpointUrl("/contribute/fflogs/leases/abandon", out var abandonUrl))
         {
             return;
         }
 
-        if (uploadUrl.ShouldDeferProtectedEndpointRequest(
+        if (leaseSession.ShouldDeferProtectedEndpointRequest(
             ProtectedEndpointCapabilityKind.FflogsLeasesAbandon))
         {
             return;
         }
 
         var jsonContent = JsonConvert.SerializeObject(abandonBatch);
-        var capabilityToken = uploadUrl.TryGetProtectedEndpointCapability(
+        var capabilityToken = leaseSession.TryGetProtectedEndpointCapability(
             ProtectedEndpointCapabilityKind.FflogsLeasesAbandon,
             out var cachedCapability)
             ? cachedCapability
@@ -89,8 +89,8 @@ internal sealed class FFLogsLeaseAbandoner
             if (response.StatusCode == System.Net.HttpStatusCode.Forbidden
                 || response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
             {
-                uploadUrl.MarkProtectedEndpointCapabilitiesRequired();
-                uploadUrl.InvalidateProtectedEndpointCapability(
+                leaseSession.MarkProtectedEndpointCapabilitiesRequired();
+                leaseSession.InvalidateProtectedEndpointCapability(
                     ProtectedEndpointCapabilityKind.FflogsLeasesAbandon);
             }
 

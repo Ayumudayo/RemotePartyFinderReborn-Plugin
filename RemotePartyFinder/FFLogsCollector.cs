@@ -106,6 +106,7 @@ public class FFLogsCollector : IDisposable
     private FFLogsCollectorSeams Seams { get; set; }
     private FFLogsSubmitBuffer SubmitBuffer { get; set; }
     private FFLogsWorkerPolicy WorkerPolicy { get; set; }
+    private FFLogsResultSubmitter ResultSubmitter { get; set; }
     private FFLogsLeaseAbandoner LeaseAbandoner { get; set; }
     private FFLogsJobLeaseClient JobLeaseClient { get; set; }
     private IReadOnlyList<IDisposable> OwnedDisposables { get; set; } = [];
@@ -128,7 +129,8 @@ public class FFLogsCollector : IDisposable
         FFLogsCollectorSeams seams,
         FFLogsSubmitBuffer submitBuffer,
         FFLogsWorkerPolicy workerPolicy,
-        FFLogsJobLeaseClient jobLeaseClient = null)
+        FFLogsJobLeaseClient jobLeaseClient = null,
+        FFLogsResultSubmitter resultSubmitter = null)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentNullException.ThrowIfNull(seams);
@@ -147,6 +149,7 @@ public class FFLogsCollector : IDisposable
             seams,
             submitBuffer,
             workerPolicy,
+            resultSubmitter ?? new FFLogsResultSubmitter(seams, submitBuffer),
             new FFLogsLeaseAbandoner(seams),
             jobLeaseClient ?? new FFLogsJobLeaseClient(seams),
             [],
@@ -171,6 +174,7 @@ public class FFLogsCollector : IDisposable
             new HttpClientIngestHttpSender(httpClient),
             new FFLogsApiClientAdapter(ffLogsClient),
             new SystemFFLogsTimeProvider());
+        var submitBuffer = new FFLogsSubmitBuffer();
         Initialize(
             plugin.Configuration,
             handler => plugin.Framework.Update += handler,
@@ -180,8 +184,9 @@ public class FFLogsCollector : IDisposable
             message => Plugin.Log.Error(message),
             message => Plugin.Log.Debug(message),
             seams,
-            new FFLogsSubmitBuffer(),
+            submitBuffer,
             new FFLogsWorkerPolicy(plugin.Configuration, message => Plugin.Log.Warning(message), seams.TimeProvider),
+            new FFLogsResultSubmitter(seams, submitBuffer),
             new FFLogsLeaseAbandoner(seams),
             new FFLogsJobLeaseClient(seams),
             [ffLogsClient, httpClient],
@@ -209,6 +214,7 @@ public class FFLogsCollector : IDisposable
         FFLogsCollectorSeams seams,
         FFLogsSubmitBuffer submitBuffer,
         FFLogsWorkerPolicy workerPolicy,
+        FFLogsResultSubmitter resultSubmitter,
         FFLogsLeaseAbandoner leaseAbandoner,
         FFLogsJobLeaseClient jobLeaseClient,
         IReadOnlyList<IDisposable> ownedDisposables,
@@ -224,6 +230,7 @@ public class FFLogsCollector : IDisposable
         Seams = seams ?? throw new ArgumentNullException(nameof(seams));
         SubmitBuffer = submitBuffer ?? throw new ArgumentNullException(nameof(submitBuffer));
         WorkerPolicy = workerPolicy ?? throw new ArgumentNullException(nameof(workerPolicy));
+        ResultSubmitter = resultSubmitter ?? throw new ArgumentNullException(nameof(resultSubmitter));
         LeaseAbandoner = leaseAbandoner ?? throw new ArgumentNullException(nameof(leaseAbandoner));
         JobLeaseClient = jobLeaseClient ?? throw new ArgumentNullException(nameof(jobLeaseClient));
         OwnedDisposables = ownedDisposables ?? throw new ArgumentNullException(nameof(ownedDisposables));
@@ -311,9 +318,6 @@ public class FFLogsCollector : IDisposable
         return new List<ParseJobCandidateServer>();
     }
 
-    private List<ParseResult> BuildSubmitBatch(List<ParseResult> freshResults)
-        => SubmitBuffer.BuildSubmitBatch(freshResults);
-
     public bool TryGetRateLimitCooldownRemaining(out TimeSpan remaining)
         => Seams.ApiClient.TryGetRateLimitRemaining(out remaining);
 
@@ -322,25 +326,6 @@ public class FFLogsCollector : IDisposable
 
     public void ResetRateLimitCooldown()
         => Seams.ApiClient.ResetRateLimitCooldown();
-
-    private static bool TryParseResultsSubmitResponse(string content, out ContributeFflogsResultsResponse parsed)
-    {
-        parsed = null;
-        if (string.IsNullOrWhiteSpace(content))
-        {
-            return false;
-        }
-
-        try
-        {
-            parsed = JsonConvert.DeserializeObject<ContributeFflogsResultsResponse>(content);
-            return parsed != null;
-        }
-        catch
-        {
-            return false;
-        }
-    }
 
     private async Task WorkerLoop()
     {
@@ -635,95 +620,27 @@ public class FFLogsCollector : IDisposable
                     var shouldAbandonRemainingLeases = hitRateLimitCooldown;
 
                     // 3. Submit Results (retry-safe)
-                    var submitBatch = SubmitBuffer.BuildSubmitBatch(results);
-                    if (submitBatch.Count > 0)
+                    var submitAttempt = await ResultSubmitter.TrySubmitResultsAsync(
+                        Configuration,
+                        leaseSession,
+                        results,
+                        Cts.Token,
+                        InfoLog,
+                        WarningLog,
+                        ErrorLog);
+                    hadTransientFailure |= submitAttempt.HadTransientFailure;
+                    if (submitAttempt.ShouldUseBaseDelayBeforeNextPoll)
                     {
-                        if (!leaseSession.TryBuildEndpointUrl("/contribute/fflogs/results", out var submitUrl))
-                        {
-                            SubmitBuffer.RequeueSubmitBatch(submitBatch);
-                            consecutiveFailures = 0;
-                            await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
-                            continue;
-                        }
-
-                        if (leaseSession.ShouldDeferProtectedEndpointRequest(
-                            ProtectedEndpointCapabilityKind.FflogsResults))
-                        {
-                            SubmitBuffer.RequeueSubmitBatch(submitBatch);
-                            consecutiveFailures = 0;
-                            await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
-                            continue;
-                        }
-
-                        var jsonContent = JsonConvert.SerializeObject(submitBatch);
-                        try
-                        {
-                            var submitCapability = leaseSession.TryGetProtectedEndpointCapability(
-                                ProtectedEndpointCapabilityKind.FflogsResults,
-                                out var cachedCapability)
-                                ? cachedCapability
-                                : null;
-                            using var submitRequest = IngestRequestFactory.CreatePostJsonRequest(
-                                Configuration,
-                                submitUrl,
-                                "/contribute/fflogs/results",
-                                jsonContent,
-                                submitCapability
-                            );
-                            var submitResp = await Seams.IngestHttpSender.SendAsync(submitRequest, Cts.Token);
-                            var submitRespBody = await submitResp.Content.ReadAsStringAsync(Cts.Token);
-
-                            if (submitResp.IsSuccessStatusCode)
-                            {
-                                if (TryParseResultsSubmitResponse(submitRespBody, out var parsed))
-                                {
-                                    InfoLog(
-                                        $"Uploaded parse results: updated={parsed.Updated}, accepted={parsed.Accepted}/{parsed.Submitted}, rejected={parsed.Rejected}, status={parsed.Status}.");
-                                }
-                                else
-                                {
-                                    InfoLog($"Uploaded {submitBatch.Count} parse results.");
-                                }
-                            }
-                            else
-                            {
-                                SubmitBuffer.RequeueSubmitBatch(submitBatch);
-                                var isAuthFailure = submitResp.StatusCode == System.Net.HttpStatusCode.Forbidden
-                                    || submitResp.StatusCode == System.Net.HttpStatusCode.Unauthorized;
-                                if (isAuthFailure)
-                                {
-                                    leaseSession.MarkProtectedEndpointCapabilitiesRequired();
-                                    leaseSession.InvalidateProtectedEndpointCapability(
-                                        ProtectedEndpointCapabilityKind.FflogsResults);
-                                }
-                                else
-                                {
-                                    hadTransientFailure = true;
-                                }
-                                if ((int)submitResp.StatusCode == 429)
-                                {
-                                    var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(submitResp);
-                                    if (retryAfter.HasValue)
-                                    {
-                                        WarningLog($"FFLogsCollector: results endpoint rate limited, retry_after={retryAfter.Value}s");
-                                    }
-                                }
-                                ErrorLog($"Failed to upload results: {submitResp.StatusCode} (requeued {submitBatch.Count}) body={submitRespBody}");
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            hadTransientFailure = true;
-                            SubmitBuffer.RequeueSubmitBatch(submitBatch);
-                            ErrorLog($"Failed to upload results (exception): {ex.Message} (requeued {submitBatch.Count})");
-                        }
+                        consecutiveFailures = 0;
+                        await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
+                        continue;
                     }
 
                     if (shouldAbandonRemainingLeases)
                     {
                         await LeaseAbandoner.TryAbandonUnprocessedLeasesAsync(
                             Configuration,
-                            leaseSession.UploadUrl,
+                            leaseSession,
                             jobs,
                             results,
                             "fflogs_rate_limit_cooldown",
