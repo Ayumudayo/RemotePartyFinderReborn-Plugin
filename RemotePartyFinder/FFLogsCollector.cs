@@ -149,6 +149,9 @@ public class FFLogsCollector : IDisposable
         return collector;
     }
 
+    internal Task RunWorkerLoopForTestingAsync()
+        => WorkerLoop();
+
     private FFLogsCollector()
     {
     }

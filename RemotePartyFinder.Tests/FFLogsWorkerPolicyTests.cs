@@ -1,5 +1,7 @@
+using System.Collections.Immutable;
+using System.Net;
+using System.Net.Http;
 using System.Threading;
-using System.Reflection;
 using Xunit;
 
 namespace RemotePartyFinder.Tests;
@@ -79,62 +81,78 @@ public sealed class FFLogsWorkerPolicyTests {
     }
 
     [Fact]
-    public void Collector_factory_uses_injected_seams_submit_buffer_while_worker_policy_owns_scheduling_helpers() {
+    public async Task Collector_worker_loop_uses_worker_policy_delay_for_idle_path() {
         var configuration = new Configuration {
-            FFLogsWorkerBaseDelayMs = 5000,
-            FFLogsWorkerIdleDelayMs = 10000,
-            FFLogsWorkerMaxBackoffDelayMs = 60000,
+            FFLogsClientId = "client-id",
+            FFLogsClientSecret = "client-secret",
+            IngestClientId = Guid.NewGuid().ToString("N"),
+            FFLogsWorkerIdleDelayMs = 250,
             FFLogsWorkerJitterMs = 0,
+            UploadUrls = ImmutableList.Create(new UploadUrl("http://127.0.0.1:8000")),
         };
         var timeProvider = new ManualFFLogsTimeProvider {
             UtcNow = new DateTime(2026, 4, 14, 3, 0, 0, DateTimeKind.Utc),
         };
         var warnings = new RecordingFFLogsWarningSink();
-        var apiClient = new StubFFLogsApiClient {
-            RateLimitCooldownUntilUtc = timeProvider.UtcNow.AddMinutes(5),
-            OnTryGetRateLimitRemaining = static () => (true, TimeSpan.FromMinutes(5)),
+        var delays = new List<int>();
+        var sender = new StubFFLogsIngestHttpSender {
+            OnSendAsync = static (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) {
+                Content = new StringContent("[]"),
+            }),
         };
-        var seams = FFLogsCollector.CreateSeams(new StubFFLogsIngestHttpSender(), apiClient, timeProvider);
-        var submitBuffer = new FFLogsSubmitBuffer();
-        submitBuffer.QueueSubmitResults([
-            new ParseResult {
-                ContentId = 7777,
-                ZoneId = 88,
-                DifficultyId = 5,
-                Partition = 1,
-                MatchedServer = "Injected",
-            },
-        ]);
+        var seams = FFLogsCollector.CreateSeams(sender, new StubFFLogsApiClient(), timeProvider);
         var workerPolicy = new FFLogsWorkerPolicy(
             configuration,
             warnings.Warning,
             timeProvider,
-            static (_, _) => Task.CompletedTask);
+            (delayMs, _) => {
+                delays.Add(delayMs);
+                throw new TaskCanceledException();
+            });
 
-        using var collector = FFLogsCollector.CreateForTesting(configuration, seams, submitBuffer, workerPolicy);
+        using var collector = FFLogsCollector.CreateForTesting(configuration, seams, new FFLogsSubmitBuffer(), workerPolicy);
 
-        Assert.Equal(apiClient.RateLimitCooldownUntilUtc, collector.RateLimitCooldownUntilUtc);
-        Assert.True(collector.TryGetRateLimitCooldownRemaining(out var remaining));
-        Assert.Equal(TimeSpan.FromMinutes(5), remaining);
+        await collector.RunWorkerLoopForTestingAsync();
 
-        var buildSubmitBatch = typeof(FFLogsCollector).GetMethod(
-            "BuildSubmitBatch",
-            BindingFlags.Instance | BindingFlags.NonPublic);
-        Assert.NotNull(buildSubmitBatch);
-        var batch = Assert.IsType<List<ParseResult>>(buildSubmitBatch!.Invoke(collector, new object[] { new List<ParseResult>() }));
-        var queued = Assert.Single(batch);
-        Assert.Equal(7777UL, queued.ContentId);
-        Assert.Equal("Injected", queued.MatchedServer);
         Assert.Empty(warnings.Messages);
+        Assert.Equal([1000], delays);
+    }
 
-        Assert.Null(typeof(FFLogsCollector).GetMethod(
-            "DelayWithJitterAsync",
-            BindingFlags.Instance | BindingFlags.NonPublic));
-        Assert.Null(typeof(FFLogsCollector).GetMethod(
-            "DelayWithBackoffAsync",
-            BindingFlags.Instance | BindingFlags.NonPublic));
-        Assert.Null(typeof(FFLogsCollector).GetMethod(
-            "LogCooldownSkipIfNeeded",
-            BindingFlags.Instance | BindingFlags.NonPublic));
+    [Fact]
+    public async Task Collector_worker_loop_uses_worker_policy_delay_for_backoff_path() {
+        var configuration = new Configuration {
+            FFLogsClientId = "client-id",
+            FFLogsClientSecret = "client-secret",
+            IngestClientId = Guid.NewGuid().ToString("N"),
+            FFLogsWorkerBaseDelayMs = 5000,
+            FFLogsWorkerMaxBackoffDelayMs = 12000,
+            FFLogsWorkerJitterMs = 0,
+            UploadUrls = ImmutableList.Create(new UploadUrl("http://127.0.0.1:8000")),
+        };
+        var timeProvider = new ManualFFLogsTimeProvider {
+            UtcNow = new DateTime(2026, 4, 14, 4, 0, 0, DateTimeKind.Utc),
+        };
+        var delays = new List<int>();
+        var sender = new StubFFLogsIngestHttpSender {
+            OnSendAsync = static (_, _) => Task.FromResult(new HttpResponseMessage(HttpStatusCode.InternalServerError) {
+                Content = new StringContent("jobs failed"),
+            }),
+        };
+        var seams = FFLogsCollector.CreateSeams(sender, new StubFFLogsApiClient(), timeProvider);
+        var workerPolicy = new FFLogsWorkerPolicy(
+            configuration,
+            _ => { },
+            timeProvider,
+            (delayMs, _) => {
+                delays.Add(delayMs);
+                throw new TaskCanceledException();
+            });
+
+        using var collector = FFLogsCollector.CreateForTesting(configuration, seams, new FFLogsSubmitBuffer(), workerPolicy);
+
+        await collector.RunWorkerLoopForTestingAsync();
+
+        Assert.Equal([5000], delays);
+        Assert.Equal(5000, workerPolicy.LastBackoffDelayMs);
     }
 }
