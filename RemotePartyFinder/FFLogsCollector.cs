@@ -396,6 +396,11 @@ public class FFLogsCollector : IDisposable
                     {
                         consecutiveFailures = await WorkerPolicy.DelayWithBackoffAsync(consecutiveFailures, Cts.Token);
                     }
+                    else if (leaseSession.UseBaseDelayWhenNoWork)
+                    {
+                        consecutiveFailures = 0;
+                        await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
+                    }
                     else
                     {
                         consecutiveFailures = 0;

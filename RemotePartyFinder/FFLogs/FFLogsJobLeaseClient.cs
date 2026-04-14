@@ -46,7 +46,9 @@ internal class FFLogsJobLeaseClient
 
         if (uploadUrl.ShouldDeferProtectedEndpointRequest(ProtectedEndpointCapabilityKind.FflogsJobs))
         {
-            return new FFLogsJobLeaseAttempt(emptySession, false);
+            return new FFLogsJobLeaseAttempt(
+                new FFLogsLeaseSession(uploadUrl, [], useBaseDelayWhenNoWork: true),
+                false);
         }
 
         try
