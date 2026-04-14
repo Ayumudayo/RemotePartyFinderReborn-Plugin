@@ -9,10 +9,9 @@ namespace RemotePartyFinder;
 
 internal sealed record FFLogsJobLeaseAttempt(
     FFLogsLeaseSession Session,
-    UploadUrl SelectedUploadUrl,
     bool HadTransientFailure);
 
-internal sealed class FFLogsJobLeaseClient
+internal class FFLogsJobLeaseClient
 {
     private readonly FFLogsCollectorSeams _seams;
 
@@ -21,7 +20,7 @@ internal sealed class FFLogsJobLeaseClient
         _seams = seams ?? throw new ArgumentNullException(nameof(seams));
     }
 
-    public async Task<FFLogsJobLeaseAttempt> TryAcquireSessionAsync(
+    public virtual async Task<FFLogsJobLeaseAttempt> TryAcquireSessionAsync(
         Configuration configuration,
         CancellationToken cancellationToken,
         Action<string> warningLog = null,
@@ -35,17 +34,19 @@ internal sealed class FFLogsJobLeaseClient
         var uploadUrl = SelectUploadUrl(configuration);
         if (uploadUrl == null)
         {
-            return new FFLogsJobLeaseAttempt(null, null, false);
+            return new FFLogsJobLeaseAttempt(null, false);
         }
 
         if (!IngestEndpointResolver.TryBuildEndpointUrl(uploadUrl, "/contribute/fflogs/jobs", out var workUrl))
         {
-            return new FFLogsJobLeaseAttempt(null, null, false);
+            return new FFLogsJobLeaseAttempt(null, false);
         }
+
+        var emptySession = new FFLogsLeaseSession(uploadUrl, []);
 
         if (uploadUrl.ShouldDeferProtectedEndpointRequest(ProtectedEndpointCapabilityKind.FflogsJobs))
         {
-            return new FFLogsJobLeaseAttempt(null, null, false);
+            return new FFLogsJobLeaseAttempt(emptySession, false);
         }
 
         try
@@ -68,7 +69,6 @@ internal sealed class FFLogsJobLeaseClient
                 uploadUrl.FailureCount = 0;
                 return new FFLogsJobLeaseAttempt(
                     new FFLogsLeaseSession(uploadUrl, jobs),
-                    uploadUrl,
                     false);
             }
 
@@ -97,17 +97,17 @@ internal sealed class FFLogsJobLeaseClient
                     }
                 }
 
-                return new FFLogsJobLeaseAttempt(null, uploadUrl, !isAuthFailure);
+                return new FFLogsJobLeaseAttempt(emptySession, !isAuthFailure);
             }
 
-            return new FFLogsJobLeaseAttempt(null, uploadUrl, false);
+            return new FFLogsJobLeaseAttempt(emptySession, false);
         }
         catch (Exception ex)
         {
             uploadUrl.FailureCount++;
             uploadUrl.LastFailureTime = _seams.TimeProvider.UtcNow;
             debugLog($"Error requesting work: {ex.Message}");
-            return new FFLogsJobLeaseAttempt(null, uploadUrl, true);
+            return new FFLogsJobLeaseAttempt(emptySession, true);
         }
     }
 

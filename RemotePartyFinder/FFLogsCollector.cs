@@ -127,7 +127,8 @@ public class FFLogsCollector : IDisposable
         Configuration configuration,
         FFLogsCollectorSeams seams,
         FFLogsSubmitBuffer submitBuffer,
-        FFLogsWorkerPolicy workerPolicy)
+        FFLogsWorkerPolicy workerPolicy,
+        FFLogsJobLeaseClient jobLeaseClient = null)
     {
         ArgumentNullException.ThrowIfNull(configuration);
         ArgumentNullException.ThrowIfNull(seams);
@@ -147,7 +148,7 @@ public class FFLogsCollector : IDisposable
             submitBuffer,
             workerPolicy,
             new FFLogsLeaseAbandoner(seams),
-            new FFLogsJobLeaseClient(seams),
+            jobLeaseClient ?? new FFLogsJobLeaseClient(seams),
             [],
             startWorker: false);
         return collector;
@@ -381,18 +382,16 @@ public class FFLogsCollector : IDisposable
                     DebugLog);
                 hadTransientFailure |= leaseAttempt.HadTransientFailure;
                 var leaseSession = leaseAttempt.Session;
-                var uploadUrl = leaseAttempt.SelectedUploadUrl;
-                var jobs = leaseSession?.Jobs;
 
-                if (jobs == null || jobs.Count == 0)
+                if (leaseSession == null)
                 {
-                    if (uploadUrl == null)
-                    {
-                        consecutiveFailures = 0;
-                        await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
-                        continue;
-                    }
+                    consecutiveFailures = 0;
+                    await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
+                    continue;
+                }
 
+                if (!leaseSession.HasJobs)
+                {
                     if (hadTransientFailure)
                     {
                         consecutiveFailures = await WorkerPolicy.DelayWithBackoffAsync(consecutiveFailures, Cts.Token);
@@ -405,6 +404,7 @@ public class FFLogsCollector : IDisposable
                     continue;
                 }
 
+                var jobs = leaseSession.Jobs;
                 DebugLog($"Received {jobs.Count} players to fetch from FFLogs.");
 
                 // 2. Fetch from FFLogs
@@ -633,7 +633,7 @@ public class FFLogsCollector : IDisposable
                     var submitBatch = SubmitBuffer.BuildSubmitBatch(results);
                     if (submitBatch.Count > 0)
                     {
-                        if (!IngestEndpointResolver.TryBuildEndpointUrl(uploadUrl, "/contribute/fflogs/results", out var submitUrl))
+                        if (!leaseSession.TryBuildEndpointUrl("/contribute/fflogs/results", out var submitUrl))
                         {
                             SubmitBuffer.RequeueSubmitBatch(submitBatch);
                             consecutiveFailures = 0;
@@ -641,7 +641,7 @@ public class FFLogsCollector : IDisposable
                             continue;
                         }
 
-                        if (uploadUrl.ShouldDeferProtectedEndpointRequest(
+                        if (leaseSession.ShouldDeferProtectedEndpointRequest(
                             ProtectedEndpointCapabilityKind.FflogsResults))
                         {
                             SubmitBuffer.RequeueSubmitBatch(submitBatch);
@@ -653,7 +653,7 @@ public class FFLogsCollector : IDisposable
                         var jsonContent = JsonConvert.SerializeObject(submitBatch);
                         try
                         {
-                            var submitCapability = uploadUrl.TryGetProtectedEndpointCapability(
+                            var submitCapability = leaseSession.TryGetProtectedEndpointCapability(
                                 ProtectedEndpointCapabilityKind.FflogsResults,
                                 out var cachedCapability)
                                 ? cachedCapability
@@ -687,8 +687,8 @@ public class FFLogsCollector : IDisposable
                                     || submitResp.StatusCode == System.Net.HttpStatusCode.Unauthorized;
                                 if (isAuthFailure)
                                 {
-                                    uploadUrl.MarkProtectedEndpointCapabilitiesRequired();
-                                    uploadUrl.InvalidateProtectedEndpointCapability(
+                                    leaseSession.MarkProtectedEndpointCapabilitiesRequired();
+                                    leaseSession.InvalidateProtectedEndpointCapability(
                                         ProtectedEndpointCapabilityKind.FflogsResults);
                                 }
                                 else
@@ -718,7 +718,7 @@ public class FFLogsCollector : IDisposable
                     {
                         await LeaseAbandoner.TryAbandonUnprocessedLeasesAsync(
                             Configuration,
-                            uploadUrl,
+                            leaseSession.UploadUrl,
                             jobs,
                             results,
                             "fflogs_rate_limit_cooldown",

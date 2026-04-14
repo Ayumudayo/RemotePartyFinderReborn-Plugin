@@ -29,6 +29,19 @@ public sealed class FFLogsLeaseSessionTests
             job => Assert.Equal("lease-b", job.LeaseToken));
     }
 
+    [Fact]
+    public void Lease_session_proxies_endpoint_owner_operations_without_losing_the_underlying_upload_target()
+    {
+        var uploadUrl = new UploadUrl("https://ingest-a.example/");
+        var session = new FFLogsLeaseSession(uploadUrl, []);
+
+        session.MarkProtectedEndpointCapabilitiesRequired();
+
+        Assert.True(session.ShouldDeferProtectedEndpointRequest(ProtectedEndpointCapabilityKind.FflogsJobs));
+        Assert.True(session.TryBuildEndpointUrl("/contribute/fflogs/results", out var endpointUrl));
+        Assert.Equal("https://ingest-a.example/contribute/fflogs/results", endpointUrl);
+    }
+
     private static ParseJob CreateJob(ulong contentId, string leaseToken)
     {
         return new ParseJob
