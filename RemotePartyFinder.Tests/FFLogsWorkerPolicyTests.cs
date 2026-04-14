@@ -1,4 +1,5 @@
 using System.Threading;
+using System.Reflection;
 using Xunit;
 
 namespace RemotePartyFinder.Tests;
@@ -60,5 +61,61 @@ public sealed class FFLogsWorkerPolicyTests {
         Assert.Same(ingestHttpSender, seams.IngestHttpSender);
         Assert.Same(apiClient, seams.ApiClient);
         Assert.Same(timeProvider, seams.TimeProvider);
+    }
+
+    [Fact]
+    public void Collector_factory_uses_injected_seams_submit_buffer_and_worker_policy_for_live_paths() {
+        var configuration = new Configuration {
+            FFLogsWorkerBaseDelayMs = 5000,
+            FFLogsWorkerIdleDelayMs = 10000,
+            FFLogsWorkerMaxBackoffDelayMs = 60000,
+            FFLogsWorkerJitterMs = 0,
+        };
+        var timeProvider = new ManualFFLogsTimeProvider {
+            UtcNow = new DateTime(2026, 4, 14, 3, 0, 0, DateTimeKind.Utc),
+        };
+        var warnings = new RecordingFFLogsWarningSink();
+        var apiClient = new StubFFLogsApiClient {
+            RateLimitCooldownUntilUtc = timeProvider.UtcNow.AddMinutes(5),
+            OnTryGetRateLimitRemaining = static () => (true, TimeSpan.FromMinutes(5)),
+        };
+        var seams = FFLogsCollector.CreateSeams(new StubFFLogsIngestHttpSender(), apiClient, timeProvider);
+        var submitBuffer = new FFLogsSubmitBuffer();
+        submitBuffer.QueueSubmitResults([
+            new ParseResult {
+                ContentId = 7777,
+                ZoneId = 88,
+                DifficultyId = 5,
+                Partition = 1,
+                MatchedServer = "Injected",
+            },
+        ]);
+        var workerPolicy = new FFLogsWorkerPolicy(
+            configuration,
+            warnings.Warning,
+            timeProvider,
+            static (_, _) => Task.CompletedTask);
+
+        using var collector = FFLogsCollector.CreateForTesting(configuration, seams, submitBuffer, workerPolicy);
+
+        Assert.Equal(apiClient.RateLimitCooldownUntilUtc, collector.RateLimitCooldownUntilUtc);
+        Assert.True(collector.TryGetRateLimitCooldownRemaining(out var remaining));
+        Assert.Equal(TimeSpan.FromMinutes(5), remaining);
+
+        var buildSubmitBatch = typeof(FFLogsCollector).GetMethod(
+            "BuildSubmitBatch",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(buildSubmitBatch);
+        var batch = Assert.IsType<List<ParseResult>>(buildSubmitBatch!.Invoke(collector, new object[] { new List<ParseResult>() }));
+        var queued = Assert.Single(batch);
+        Assert.Equal(7777UL, queued.ContentId);
+        Assert.Equal("Injected", queued.MatchedServer);
+
+        var logCooldownSkipIfNeeded = typeof(FFLogsCollector).GetMethod(
+            "LogCooldownSkipIfNeeded",
+            BindingFlags.Instance | BindingFlags.NonPublic);
+        Assert.NotNull(logCooldownSkipIfNeeded);
+        logCooldownSkipIfNeeded!.Invoke(collector, new object[] { TimeSpan.FromMinutes(5) });
+        Assert.Single(warnings.Messages);
     }
 }

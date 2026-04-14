@@ -96,14 +96,19 @@ public class FFLogsCollector : IDisposable
             => DateTime.UtcNow;
     }
 
-    private Plugin Plugin { get; }
-    private FFLogsClient FFLogsClient { get; }
-    private HttpClient HttpClient { get; } = new();
-    private FFLogsCollectorSeams Seams { get; }
-    private Dictionary<string, ParseResult> PendingSubmitResults { get; } = new();
+    private Configuration Configuration { get; set; }
+    private Action<IFramework.OnUpdateDelegate> SubscribeFrameworkUpdate { get; set; } = static _ => { };
+    private Action<IFramework.OnUpdateDelegate> UnsubscribeFrameworkUpdate { get; set; } = static _ => { };
+    private Action<string> InfoLog { get; set; } = static _ => { };
+    private Action<string> WarningLog { get; set; } = static _ => { };
+    private Action<string> ErrorLog { get; set; } = static _ => { };
+    private Action<string> DebugLog { get; set; } = static _ => { };
+    private FFLogsCollectorSeams Seams { get; set; }
+    private FFLogsSubmitBuffer SubmitBuffer { get; set; }
+    private FFLogsWorkerPolicy WorkerPolicy { get; set; }
+    private IReadOnlyList<IDisposable> OwnedDisposables { get; set; } = [];
     private bool IsRunning { get; set; }
     private System.Threading.CancellationTokenSource Cts { get; set; } = new();
-    private DateTime _lastCooldownSkipLogUtc = DateTime.MinValue;
 
     internal static FFLogsCollectorSeams CreateSeams(
         IFFLogsIngestHttpSender ingestHttpSender,
@@ -116,24 +121,103 @@ public class FFLogsCollector : IDisposable
         return new FFLogsCollectorSeams(ingestHttpSender, apiClient, timeProvider);
     }
 
+    internal static FFLogsCollector CreateForTesting(
+        Configuration configuration,
+        FFLogsCollectorSeams seams,
+        FFLogsSubmitBuffer submitBuffer,
+        FFLogsWorkerPolicy workerPolicy)
+    {
+        ArgumentNullException.ThrowIfNull(configuration);
+        ArgumentNullException.ThrowIfNull(seams);
+        ArgumentNullException.ThrowIfNull(submitBuffer);
+        ArgumentNullException.ThrowIfNull(workerPolicy);
+
+        var collector = new FFLogsCollector();
+        collector.Initialize(
+            configuration,
+            static _ => { },
+            static _ => { },
+            static _ => { },
+            static _ => { },
+            static _ => { },
+            static _ => { },
+            seams,
+            submitBuffer,
+            workerPolicy,
+            [],
+            startWorker: false);
+        return collector;
+    }
+
+    private FFLogsCollector()
+    {
+    }
+
     public FFLogsCollector(Plugin plugin)
     {
-        Plugin = plugin;
-        FFLogsClient = new FFLogsClient(plugin.Configuration);
-        Seams = CreateSeams(
-            new HttpClientIngestHttpSender(HttpClient),
-            new FFLogsApiClientAdapter(FFLogsClient),
+        ArgumentNullException.ThrowIfNull(plugin);
+
+        var httpClient = new HttpClient();
+        var ffLogsClient = new FFLogsClient(plugin.Configuration);
+        var seams = CreateSeams(
+            new HttpClientIngestHttpSender(httpClient),
+            new FFLogsApiClientAdapter(ffLogsClient),
             new SystemFFLogsTimeProvider());
-        Plugin.Framework.Update += OnUpdate;
-        StartWorker();
+        Initialize(
+            plugin.Configuration,
+            handler => plugin.Framework.Update += handler,
+            handler => plugin.Framework.Update -= handler,
+            message => Plugin.Log.Info(message),
+            message => Plugin.Log.Warning(message),
+            message => Plugin.Log.Error(message),
+            message => Plugin.Log.Debug(message),
+            seams,
+            new FFLogsSubmitBuffer(),
+            new FFLogsWorkerPolicy(plugin.Configuration, message => Plugin.Log.Warning(message), seams.TimeProvider),
+            [ffLogsClient, httpClient],
+            startWorker: true);
     }
 
     public void Dispose()
     {
-        Plugin.Framework.Update -= OnUpdate;
+        UnsubscribeFrameworkUpdate(OnUpdate);
         Cts.Cancel();
-        FFLogsClient.Dispose();
-        HttpClient.Dispose();
+        foreach (var disposable in OwnedDisposables)
+        {
+            disposable.Dispose();
+        }
+    }
+
+    private void Initialize(
+        Configuration configuration,
+        Action<IFramework.OnUpdateDelegate> subscribeFrameworkUpdate,
+        Action<IFramework.OnUpdateDelegate> unsubscribeFrameworkUpdate,
+        Action<string> infoLog,
+        Action<string> warningLog,
+        Action<string> errorLog,
+        Action<string> debugLog,
+        FFLogsCollectorSeams seams,
+        FFLogsSubmitBuffer submitBuffer,
+        FFLogsWorkerPolicy workerPolicy,
+        IReadOnlyList<IDisposable> ownedDisposables,
+        bool startWorker)
+    {
+        Configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
+        SubscribeFrameworkUpdate = subscribeFrameworkUpdate ?? throw new ArgumentNullException(nameof(subscribeFrameworkUpdate));
+        UnsubscribeFrameworkUpdate = unsubscribeFrameworkUpdate ?? throw new ArgumentNullException(nameof(unsubscribeFrameworkUpdate));
+        InfoLog = infoLog ?? throw new ArgumentNullException(nameof(infoLog));
+        WarningLog = warningLog ?? throw new ArgumentNullException(nameof(warningLog));
+        ErrorLog = errorLog ?? throw new ArgumentNullException(nameof(errorLog));
+        DebugLog = debugLog ?? throw new ArgumentNullException(nameof(debugLog));
+        Seams = seams ?? throw new ArgumentNullException(nameof(seams));
+        SubmitBuffer = submitBuffer ?? throw new ArgumentNullException(nameof(submitBuffer));
+        WorkerPolicy = workerPolicy ?? throw new ArgumentNullException(nameof(workerPolicy));
+        OwnedDisposables = ownedDisposables ?? throw new ArgumentNullException(nameof(ownedDisposables));
+        SubscribeFrameworkUpdate(OnUpdate);
+        if (startWorker)
+        {
+            StartWorker();
+        }
     }
 
     private void OnUpdate(IFramework framework)
@@ -259,49 +343,25 @@ public class FFLogsCollector : IDisposable
     }
 
     private void QueueSubmitResults(IEnumerable<ParseResult> freshResults)
-    {
-        foreach (var result in freshResults)
-        {
-            this.PendingSubmitResults[ParseResultKey(result)] = result;
-        }
-    }
+        => SubmitBuffer.QueueSubmitResults(freshResults);
 
     private List<ParseResult> BuildSubmitBatch(List<ParseResult> freshResults)
-    {
-        QueueSubmitResults(freshResults);
-
-        if (this.PendingSubmitResults.Count == 0)
-        {
-            return new List<ParseResult>();
-        }
-
-        var batch = this.PendingSubmitResults.Values.ToList();
-        this.PendingSubmitResults.Clear();
-        return batch;
-    }
+        => SubmitBuffer.BuildSubmitBatch(freshResults);
 
     private void RequeueSubmitBatch(IEnumerable<ParseResult> failedBatch)
-    {
-        foreach (var result in failedBatch)
-        {
-            this.PendingSubmitResults[ParseResultKey(result)] = result;
-        }
-    }
+        => SubmitBuffer.RequeueSubmitBatch(failedBatch);
 
     private int WorkerBaseDelayMs
-        => Math.Clamp(Plugin.Configuration.FFLogsWorkerBaseDelayMs, 1000, 120000);
+        => WorkerPolicy.WorkerBaseDelayMs;
 
     private int WorkerIdleDelayMs
-        => Math.Clamp(Plugin.Configuration.FFLogsWorkerIdleDelayMs, 1000, 300000);
+        => WorkerPolicy.WorkerIdleDelayMs;
 
     private int WorkerJitterMs
-        => Math.Clamp(Plugin.Configuration.FFLogsWorkerJitterMs, 0, 30000);
+        => WorkerPolicy.WorkerJitterMs;
 
     private int WorkerMaxBackoffDelayMs
-        => Math.Clamp(
-            Plugin.Configuration.FFLogsWorkerMaxBackoffDelayMs,
-            WorkerBaseDelayMs,
-            600000);
+        => WorkerPolicy.WorkerMaxBackoffDelayMs;
 
     private static int JitteredDelayMs(int baseDelayMs, int jitterMs = 1000)
     {
@@ -326,23 +386,12 @@ public class FFLogsCollector : IDisposable
         => Seams.ApiClient.ResetRateLimitCooldown();
 
     private void LogCooldownSkipIfNeeded(TimeSpan remaining)
-    {
-        var now = Seams.TimeProvider.UtcNow;
-        if ((now - _lastCooldownSkipLogUtc) < TimeSpan.FromMinutes(1))
-        {
-            return;
-        }
-
-        _lastCooldownSkipLogUtc = now;
-        var minutesRemaining = Math.Max(1, (int)Math.Ceiling(remaining.TotalMinutes));
-        Plugin.Log.Warning($"FFLogsCollector: FFLogs cooldown active; skipping server polling for about {minutesRemaining} minute(s).");
-    }
+        => WorkerPolicy.LogCooldownSkipIfNeeded(remaining);
 
     private async Task<int> DelayWithBackoffAsync(int consecutiveFailures)
     {
-        var nextFailures = Math.Min(consecutiveFailures + 1, 16);
-        var exponent = Math.Min(nextFailures - 1, 4);
-        var backoffDelay = Math.Min(WorkerMaxBackoffDelayMs, WorkerBaseDelayMs * (1 << exponent));
+        var nextFailures = WorkerPolicy.ComputeNextBackoffFailures(consecutiveFailures);
+        var backoffDelay = WorkerPolicy.ComputeBackoffDelayMs(consecutiveFailures);
         await DelayWithJitterAsync(backoffDelay, WorkerJitterMs);
         return nextFailures;
     }
@@ -418,7 +467,7 @@ public class FFLogsCollector : IDisposable
         try
         {
             using var abandonRequest = IngestRequestFactory.CreatePostJsonRequest(
-                Plugin.Configuration,
+                Configuration,
                 abandonUrl,
                 "/contribute/fflogs/leases/abandon",
                 jsonContent,
@@ -431,12 +480,12 @@ public class FFLogsCollector : IDisposable
             {
                 if (TryParseLeaseAbandonResponse(responseBody, out var parsed))
                 {
-                    Plugin.Log.Warning(
+                    WarningLog(
                         $"FFLogsCollector: released abandoned leases {parsed.Released}/{parsed.Submitted} (rejected={parsed.Rejected}).");
                 }
                 else
                 {
-                    Plugin.Log.Warning(
+                    WarningLog(
                         $"FFLogsCollector: released abandoned leases request succeeded (submitted={abandonBatch.Count}).");
                 }
 
@@ -453,17 +502,17 @@ public class FFLogsCollector : IDisposable
 
             if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
             {
-                Plugin.Log.Debug(
+                DebugLog(
                     "FFLogsCollector: lease abandon endpoint is unavailable on this server version.");
                 return;
             }
 
-            Plugin.Log.Warning(
+            WarningLog(
                 $"FFLogsCollector: failed to release abandoned leases ({response.StatusCode}) body={responseBody}");
         }
         catch (Exception ex)
         {
-            Plugin.Log.Debug($"FFLogsCollector: lease abandon request error: {ex.Message}");
+            DebugLog($"FFLogsCollector: lease abandon request error: {ex.Message}");
         }
     }
  
@@ -476,15 +525,15 @@ public class FFLogsCollector : IDisposable
             {
                 var hadTransientFailure = false;
 
-                if (!Plugin.Configuration.EnableFFLogsWorker)
+                if (!Configuration.EnableFFLogsWorker)
                 {
                     consecutiveFailures = 0;
                     await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
                     continue;
                 }
 
-                if (string.IsNullOrEmpty(Plugin.Configuration.FFLogsClientId) || 
-                    string.IsNullOrEmpty(Plugin.Configuration.FFLogsClientSecret))
+                if (string.IsNullOrEmpty(Configuration.FFLogsClientId) || 
+                    string.IsNullOrEmpty(Configuration.FFLogsClientSecret))
                 {
                     consecutiveFailures = 0;
                     await DelayWithJitterAsync(WorkerBaseDelayMs, WorkerJitterMs);
@@ -501,11 +550,11 @@ public class FFLogsCollector : IDisposable
 
                 // Get first enabled upload URL that is not circuit-broken and passes transport policy.
                 UploadUrl uploadUrl = null;
-                foreach (var candidate in Plugin.Configuration.UploadUrls.Where(u => u.IsEnabled))
+                foreach (var candidate in Configuration.UploadUrls.Where(u => u.IsEnabled))
                 {
-                    if (candidate.FailureCount >= Plugin.Configuration.CircuitBreakerFailureThreshold
+                    if (candidate.FailureCount >= Configuration.CircuitBreakerFailureThreshold
                         && (DateTime.UtcNow - candidate.LastFailureTime).TotalMinutes
-                            < Plugin.Configuration.CircuitBreakerBreakDurationMinutes)
+                            < Configuration.CircuitBreakerBreakDurationMinutes)
                     {
                         continue;
                     }
@@ -552,7 +601,7 @@ public class FFLogsCollector : IDisposable
                         ? cachedCapability
                         : null;
                     using var workRequest = IngestRequestFactory.CreateGetRequest(
-                        Plugin.Configuration,
+                        Configuration,
                         workUrl,
                         "/contribute/fflogs/jobs",
                         workCapability
@@ -589,7 +638,7 @@ public class FFLogsCollector : IDisposable
                                 var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);
                                 if (retryAfter.HasValue)
                                 {
-                                    Plugin.Log.Warning($"FFLogsCollector: jobs endpoint rate limited, retry_after={retryAfter.Value}s");
+                                    WarningLog($"FFLogsCollector: jobs endpoint rate limited, retry_after={retryAfter.Value}s");
                                 }
                             }
                         }
@@ -600,7 +649,7 @@ public class FFLogsCollector : IDisposable
                     hadTransientFailure = true;
                     uploadUrl.FailureCount++;
                     uploadUrl.LastFailureTime = DateTime.UtcNow;
-                    Plugin.Log.Debug($"Error requesting work: {ex.Message}");
+                    DebugLog($"Error requesting work: {ex.Message}");
                 }
 
                 if (jobs == null || jobs.Count == 0)
@@ -617,7 +666,7 @@ public class FFLogsCollector : IDisposable
                     continue;
                 }
 
-                Plugin.Log.Debug($"Received {jobs.Count} players to fetch from FFLogs.");
+                DebugLog($"Received {jobs.Count} players to fetch from FFLogs.");
 
                 // 2. Fetch from FFLogs
                 // Group by Zone (+ criteria)
@@ -871,7 +920,7 @@ public class FFLogsCollector : IDisposable
                                 ? cachedCapability
                                 : null;
                             using var submitRequest = IngestRequestFactory.CreatePostJsonRequest(
-                                Plugin.Configuration,
+                                Configuration,
                                 submitUrl,
                                 "/contribute/fflogs/results",
                                 jsonContent,
@@ -884,12 +933,12 @@ public class FFLogsCollector : IDisposable
                             {
                                 if (TryParseResultsSubmitResponse(submitRespBody, out var parsed))
                                 {
-                                    Plugin.Log.Info(
+                                    InfoLog(
                                         $"Uploaded parse results: updated={parsed.Updated}, accepted={parsed.Accepted}/{parsed.Submitted}, rejected={parsed.Rejected}, status={parsed.Status}.");
                                 }
                                 else
                                 {
-                                    Plugin.Log.Info($"Uploaded {submitBatch.Count} parse results.");
+                                    InfoLog($"Uploaded {submitBatch.Count} parse results.");
                                 }
                             }
                             else
@@ -912,17 +961,17 @@ public class FFLogsCollector : IDisposable
                                     var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(submitResp);
                                     if (retryAfter.HasValue)
                                     {
-                                        Plugin.Log.Warning($"FFLogsCollector: results endpoint rate limited, retry_after={retryAfter.Value}s");
+                                        WarningLog($"FFLogsCollector: results endpoint rate limited, retry_after={retryAfter.Value}s");
                                     }
                                 }
-                                Plugin.Log.Error($"Failed to upload results: {submitResp.StatusCode} (requeued {submitBatch.Count}) body={submitRespBody}");
+                                ErrorLog($"Failed to upload results: {submitResp.StatusCode} (requeued {submitBatch.Count}) body={submitRespBody}");
                             }
                         }
                         catch (Exception ex)
                         {
                             hadTransientFailure = true;
                             RequeueSubmitBatch(submitBatch);
-                            Plugin.Log.Error($"Failed to upload results (exception): {ex.Message} (requeued {submitBatch.Count})");
+                            ErrorLog($"Failed to upload results (exception): {ex.Message} (requeued {submitBatch.Count})");
                         }
                     }
 
@@ -961,7 +1010,7 @@ public class FFLogsCollector : IDisposable
             }
             catch (Exception ex)
             {
-                Plugin.Log.Error($"FFLogsCollector Loop Error: {ex.Message}");
+                ErrorLog($"FFLogsCollector Loop Error: {ex.Message}");
                 consecutiveFailures = await DelayWithBackoffAsync(consecutiveFailures);
             }
         }
