@@ -27,7 +27,7 @@ public sealed class PartyDetailCaptureStateTests {
     }
 
     [Fact]
-    public void ConsumeAck_rejects_stale_or_manual_generation_for_scanner_target() {
+    public void IsScannerAckReady_rejects_manual_generation_for_scanner_target() {
         var state = new PartyDetailCaptureState();
         var scanner = state.BeginRequest(PartyDetailRequestOwner.Scanner, 9001U, 44UL);
         var manual = state.BeginRequest(PartyDetailRequestOwner.Manual, 9002U, 55UL);
@@ -39,7 +39,21 @@ public sealed class PartyDetailCaptureStateTests {
     }
 
     [Fact]
-    public void MarkConsumed_accepts_new_generation_once() {
+    public void IsScannerAckReady_rejects_stale_generation_after_consume() {
+        var state = new PartyDetailCaptureState();
+        var cycle = state.BeginRequest(PartyDetailRequestOwner.Scanner, 9001U, 44UL);
+        var snapshot = CreateSnapshot(9001U, 44UL);
+
+        Assert.True(state.TryRecordArrival(cycle.RequestSerial, snapshot));
+        Assert.True(state.IsScannerAckReady(cycle.RequestSerial, 9001U, 44UL));
+
+        Assert.True(state.TryMarkConsumed(state.LatestArrivalGeneration));
+        Assert.Equal(1L, state.LastConsumedGeneration);
+        Assert.False(state.IsScannerAckReady(cycle.RequestSerial, 9001U, 44UL));
+    }
+
+    [Fact]
+    public void TryMarkConsumed_accepts_new_generation_once() {
         var state = new PartyDetailCaptureState();
         var cycle = state.BeginRequest(PartyDetailRequestOwner.Scanner, 9001U, 44UL);
         var snapshot = CreateSnapshot(9001U, 44UL);
@@ -47,6 +61,7 @@ public sealed class PartyDetailCaptureStateTests {
         Assert.True(state.TryRecordArrival(cycle.RequestSerial, snapshot));
 
         Assert.True(state.TryMarkConsumed(1L));
+        Assert.Equal(1L, state.LastConsumedGeneration);
         Assert.False(state.TryMarkConsumed(1L));
         Assert.False(state.TryMarkConsumed(0L));
     }

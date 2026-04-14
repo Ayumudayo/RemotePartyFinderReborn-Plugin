@@ -21,7 +21,7 @@ internal sealed class PartyDetailCaptureState {
         }
     }
 
-    internal long LatestConsumedGeneration {
+    internal long LastConsumedGeneration {
         get {
             lock (_gate) {
                 return _latestConsumedGeneration;
