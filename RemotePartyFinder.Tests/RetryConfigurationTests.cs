@@ -38,4 +38,18 @@ public sealed class RetryConfigurationTests {
     public void Chara_card_retry_count_maps_to_total_attempt_budget(int configuredRetries, int expectedAttempts) {
         Assert.Equal(expectedAttempts, CharaCardResolver.ResolveMaxAttemptsFromRetryCount(configuredRetries));
     }
+
+    [Theory]
+    [InlineData(0, false, true)]
+    [InlineData(0, true, false)]
+    [InlineData(1, false, false)]
+    [InlineData(2, true, false)]
+    public void Debug_scanner_completes_once_targets_are_queued_without_waiting_for_detail_upload_queue(
+        int pendingTargets,
+        bool hasIncomingListings,
+        bool shouldComplete) {
+        Assert.Equal(
+            shouldComplete,
+            DebugPfScanner.ShouldCompleteRunWhenNoReadyTarget(pendingTargets, hasIncomingListings));
+    }
 }

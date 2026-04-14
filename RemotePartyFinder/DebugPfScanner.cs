@@ -275,21 +275,16 @@ internal sealed class DebugPfScanner : IDisposable {
 
         if (!TryTakeNextReadyTarget(out var nextTarget)) {
             var now = DateTime.UtcNow;
+            var hasIncomingListings = !_runFromCollectedListings && !_incoming.IsEmpty;
 
-            if (_pending.Count > 0 || (!_runFromCollectedListings && !_incoming.IsEmpty)) {
+            if (!ShouldCompleteRunWhenNoReadyTarget(_pending.Count, hasIncomingListings)) {
                 _nextActionAtUtc = now.AddMilliseconds(250);
                 _state = ScanState.Cooldown;
                 return;
             }
 
-            if (_detailCollector.PendingQueueCount == 0) {
-                var completionReason = _runFromCollectedListings ? "collected_batch_complete" : "current_page_complete";
-                CompleteRun(completionReason);
-                return;
-            }
-
-            _nextActionAtUtc = now.AddMilliseconds(250);
-            _state = ScanState.Cooldown;
+            var completionReason = _runFromCollectedListings ? "collected_batch_complete" : "current_page_complete";
+            CompleteRun(completionReason);
             return;
         }
 
@@ -542,6 +537,10 @@ internal sealed class DebugPfScanner : IDisposable {
 
     internal static bool ShouldRetryTargetAfterFailure(int attemptsMade, int configuredRetries) {
         return attemptsMade <= PartyDetailCollector.NormalizeRetryCount(configuredRetries);
+    }
+
+    internal static bool ShouldCompleteRunWhenNoReadyTarget(int pendingTargets, bool hasIncomingListings) {
+        return pendingTargets <= 0 && !hasIncomingListings;
     }
 
     private void RebuildPendingQueue() {

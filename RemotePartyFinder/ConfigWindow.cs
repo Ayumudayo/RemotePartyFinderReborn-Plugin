@@ -2,10 +2,10 @@ using System;
 using System.Linq;
 using System.Numerics;
 using System.Threading.Tasks;
+using Dalamud.Bindings.ImGui;
 using Dalamud.Interface.Components;
 using Dalamud.Interface.Utility.Raii;
 using Dalamud.Interface.Windowing;
-using Dalamud.Bindings.ImGui;
 
 namespace RemotePartyFinder;
 
@@ -59,34 +59,50 @@ public class ConfigWindow : Window, IDisposable
 
     private void DrawSettingsTab()
     {
-        // FFLogs API Settings (접기 가능)
-        if (ImGui.CollapsingHeader("FFLogs API Settings", ImGuiTreeNodeFlags.DefaultOpen))
+        DrawFFLogsApiSettingsSection();
+        DrawSeparatorSpacing();
+        DrawEndpointSettingsSection();
+        DrawSeparatorSpacing();
+        DrawUploadBehaviorSection();
+        DrawSeparatorSpacing();
+        DrawFFLogsWorkerSection();
+        DrawSeparatorSpacing();
+        DrawMaintenanceSection();
+    }
+
+    private void DrawDebugTab()
+    {
+        DrawPfDetailAutoScannerSection();
+    }
+
+    private void DrawFFLogsApiSettingsSection()
+    {
+        ImGui.TextColored(new Vector4(0.4f, 1.0f, 0.4f, 1.0f), "[FFLogs API Settings]");
+        ImGui.Spacing();
+
+        var clientId = _configuration.FFLogsClientId;
+        if (ImGui.InputText("Client ID", ref clientId, 100))
         {
-            ImGui.Indent();
-            
-            var clientId = _configuration.FFLogsClientId;
-            if (ImGui.InputText("Client ID", ref clientId, 100))
-            {
-                _configuration.FFLogsClientId = clientId;
-                _configuration.Save();
-            }
+            _configuration.FFLogsClientId = clientId;
+            _configuration.Save();
+        }
 
-            var clientSecret = _configuration.FFLogsClientSecret;
-            if (ImGui.InputText("Client Secret", ref clientSecret, 100, ImGuiInputTextFlags.Password))
-            {
-                _configuration.FFLogsClientSecret = clientSecret;
-                _configuration.Save();
-            }
+        var clientSecret = _configuration.FFLogsClientSecret;
+        if (ImGui.InputText("Client Secret", ref clientSecret, 100, ImGuiInputTextFlags.Password))
+        {
+            _configuration.FFLogsClientSecret = clientSecret;
+            _configuration.Save();
+        }
 
-            var enableWorker = _configuration.EnableFFLogsWorker;
-            if (ImGui.Checkbox("Enable FFLogs background worker", ref enableWorker))
-            {
-                _configuration.EnableFFLogsWorker = enableWorker;
-                _configuration.Save();
-            }
+        var enableWorker = _configuration.EnableFFLogsWorker;
+        if (ImGui.Checkbox("Enable FFLogs background worker", ref enableWorker))
+        {
+            _configuration.EnableFFLogsWorker = enableWorker;
+            _configuration.Save();
+        }
 
-            if (ImGui.CollapsingHeader("How to get a client ID and a client secret:"))
-            {
+        if (ImGui.CollapsingHeader("How to get a client ID and a client secret:"))
+        {
             ImGui.AlignTextToFramePadding();
             ImGui.Bullet();
             ImGui.Text("Open https://www.fflogs.com/api/clients/ or");
@@ -129,48 +145,23 @@ public class ConfigWindow : Window, IDisposable
             ImGui.AlignTextToFramePadding();
             ImGui.Bullet();
             ImGui.Text("Paste both client ID and secret above");
-            }
-            
-            ImGui.Unindent();
         }
+    }
 
+    private void DrawEndpointSettingsSection()
+    {
+        ImGui.TextColored(new Vector4(0.4f, 1.0f, 0.4f, 1.0f), "[Endpoint Settings]");
         ImGui.Spacing();
-        ImGui.Separator();
+        ImGui.TextWrapped("Configure which endpoints receive party finder data.");
         ImGui.Spacing();
 
-        // Advanced Settings (접기 가능)
-        if (ImGui.CollapsingHeader("Advanced Settings"))
-        {
-            ImGui.Indent();
-            
-            ImGui.TextWrapped(
-                "This section is for advanced users to configure which services to send party finder data to. " +
-                "Only enable if you know what you are doing.");
-            
-            ImGui.Spacing();
-            
-            var isAdvanced = _configuration.AdvancedSettingsEnabled;
-            if (ImGui.Checkbox("Enable Advanced Settings", ref isAdvanced))
-            {
-                _configuration.AdvancedSettingsEnabled = isAdvanced;
-                _configuration.Save();
-            }
-
-            if (!isAdvanced) {
-                ImGui.Unindent();
-                return;
-            }
-
-            ImGui.Separator();
-            ImGui.Spacing();
-        
         using (ImRaii.Table((ImU8String)"uploadUrls", 3, ImGuiTableFlags.SizingFixedFit | ImGuiTableFlags.Borders))
         {
             ImGui.TableSetupColumn("#", ImGuiTableColumnFlags.WidthFixed);
             ImGui.TableSetupColumn("URL", ImGuiTableColumnFlags.WidthStretch);
             ImGui.TableSetupColumn("Enabled", ImGuiTableColumnFlags.WidthFixed);
             ImGui.TableHeadersRow();
-            
+
             using var id = ImRaii.PushId((ImU8String)"urls");
             foreach (var (uploadUrl, index) in _configuration.UploadUrls.Select((url, index) => (url, index + 1)))
             {
@@ -179,7 +170,7 @@ public class ConfigWindow : Window, IDisposable
                 ImGui.TableNextRow();
                 ImGui.TableSetColumnIndex(0);
                 ImGui.TextUnformatted(index.ToString());
-                
+
                 ImGui.TableSetColumnIndex(1);
                 ImGui.TextUnformatted(uploadUrl.Url);
 
@@ -198,10 +189,10 @@ public class ConfigWindow : Window, IDisposable
                         _configuration.UploadUrls = _configuration.UploadUrls.Remove(uploadUrl);
                     }
                 }
-                
+
                 id.Pop();
             }
-            
+
             ImGui.TableNextRow();
             ImGui.TableSetColumnIndex(1);
             ImGui.SetNextItemWidth(-1);
@@ -217,12 +208,12 @@ public class ConfigWindow : Window, IDisposable
                         string.Equals(r.Url, _uploadUrlTempString, StringComparison.InvariantCultureIgnoreCase)))
                 {
                     _uploadUrlError = "Endpoint already exists.";
-                    Task.Delay(5000).ContinueWith(t => _uploadUrlError = string.Empty);
+                    Task.Delay(5000).ContinueWith(_ => _uploadUrlError = string.Empty);
                 }
                 else if (!IngestEndpointResolver.IsValidUploadUrl(_uploadUrlTempString, out var validationError))
                 {
-                    this._uploadUrlError = validationError;
-                    Task.Delay(5000).ContinueWith(t => _uploadUrlError = string.Empty);
+                    _uploadUrlError = validationError;
+                    Task.Delay(5000).ContinueWith(_ => _uploadUrlError = string.Empty);
                 }
                 else
                 {
@@ -232,23 +223,72 @@ public class ConfigWindow : Window, IDisposable
             }
         }
 
-        ImGui.Dummy(new (0, 5));
+        ImGui.Dummy(new Vector2(0, 5));
 
         if (ImGui.Button("Reset To Default##uploadUrlDefault"))
         {
             ResetToDefault();
         }
 
-            ImGui.SameLine();
-            ImGui.TextColored(new Vector4(1, 0, 0, 1), _uploadUrlError);
-            
-            ImGui.Unindent();
+        ImGui.SameLine();
+        ImGui.TextColored(new Vector4(1, 0, 0, 1), _uploadUrlError);
+
+        DrawSeparatorSpacing();
+
+        ImGui.Text("Endpoint Status:");
+
+        if (ImGui.BeginTable("cbStatusTable", 4, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable))
+        {
+            ImGui.TableSetupColumn("URL", ImGuiTableColumnFlags.WidthStretch);
+            ImGui.TableSetupColumn("Failures", ImGuiTableColumnFlags.WidthFixed, 60);
+            ImGui.TableSetupColumn("Status", ImGuiTableColumnFlags.WidthFixed, 80);
+            ImGui.TableSetupColumn("Action", ImGuiTableColumnFlags.WidthFixed, 60);
+            ImGui.TableHeadersRow();
+
+            foreach (var url in _configuration.UploadUrls)
+            {
+                ImGui.TableNextRow();
+
+                ImGui.TableSetColumnIndex(0);
+                ImGui.Text(url.Url);
+
+                ImGui.TableSetColumnIndex(1);
+                ImGui.Text($"{url.FailureCount} / {_configuration.CircuitBreakerFailureThreshold}");
+
+                ImGui.TableSetColumnIndex(2);
+                bool isOpen = url.FailureCount >= _configuration.CircuitBreakerFailureThreshold;
+                if (isOpen)
+                {
+                    var timeLeft = TimeSpan.FromMinutes(_configuration.CircuitBreakerBreakDurationMinutes) - (DateTime.UtcNow - url.LastFailureTime);
+                    if (timeLeft.TotalSeconds > 0)
+                    {
+                        ImGui.TextColored(new Vector4(1, 0, 0, 1), $"OPEN ({timeLeft.TotalSeconds:F0}s)");
+                    }
+                    else
+                    {
+                        ImGui.TextColored(new Vector4(1, 1, 0, 1), "HALF-OPEN");
+                    }
+                }
+                else
+                {
+                    ImGui.TextColored(new Vector4(0, 1, 0, 1), "CLOSED");
+                }
+
+                ImGui.TableSetColumnIndex(3);
+                if (ImGui.Button($"Reset##{url.GetHashCode()}"))
+                {
+                    url.FailureCount = 0;
+                    url.LastFailureTime = DateTime.MinValue;
+                }
+            }
+
+            ImGui.EndTable();
         }
     }
 
-    private void DrawDebugTab()
+    private void DrawUploadBehaviorSection()
     {
-        ImGui.TextColored(new Vector4(0.4f, 1.0f, 0.4f, 1.0f), "[Circuit Breaker Configuration]");
+        ImGui.TextColored(new Vector4(0.4f, 1.0f, 0.4f, 1.0f), "[Upload Behavior]");
         ImGui.Spacing();
 
         var threshold = _configuration.CircuitBreakerFailureThreshold;
@@ -273,13 +313,6 @@ public class ConfigWindow : Window, IDisposable
             ImGui.SetTooltip("Duration to pause uploads after threshold is reached.");
         }
 
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        ImGui.TextColored(new Vector4(0.4f, 1.0f, 0.4f, 1.0f), "[Retry Counts]");
-        ImGui.Spacing();
-
         var detailUploadRetryCount = _configuration.DetailUploadRetryCount;
         if (ImGui.SliderInt("Detail Upload Retries", ref detailUploadRetryCount, 0, 5, "%d"))
         {
@@ -303,21 +336,20 @@ public class ConfigWindow : Window, IDisposable
         }
 
         var autoDetailScanRetryCount = _configuration.AutoDetailScanRetryCount;
-        if (ImGui.SliderInt("Auto Detail Open Retries", ref autoDetailScanRetryCount, 0, 5, "%d"))
+        if (ImGui.SliderInt("Auto Scanner Retries", ref autoDetailScanRetryCount, 0, 5, "%d"))
         {
             _configuration.AutoDetailScanRetryCount = autoDetailScanRetryCount;
             _configuration.Save();
         }
         if (ImGui.IsItemHovered())
         {
-            ImGui.SetTooltip("Additional retries after the initial PF detail open/ready attempt in the debug scanner.");
+            ImGui.SetTooltip("Additional retries after the initial PF auto scanner interaction attempt.");
         }
+    }
 
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        ImGui.TextColored(new Vector4(0.4f, 1.0f, 0.4f, 1.0f), "[FFLogs Worker Timing]");
+    private void DrawFFLogsWorkerSection()
+    {
+        ImGui.TextColored(new Vector4(0.4f, 1.0f, 0.4f, 1.0f), "[FFLogs Worker]");
         ImGui.Spacing();
 
         var workerBaseDelay = _configuration.FFLogsWorkerBaseDelayMs;
@@ -363,9 +395,11 @@ public class ConfigWindow : Window, IDisposable
         {
             ImGui.SetTooltip("Random jitter added to worker delays to reduce synchronized polling spikes.");
         }
+    }
 
-        ImGui.Spacing();
-        ImGui.Separator();
+    private void DrawMaintenanceSection()
+    {
+        ImGui.TextColored(new Vector4(0.4f, 1.0f, 0.4f, 1.0f), "[Maintenance]");
         ImGui.Spacing();
 
         ImGui.TextColored(new Vector4(0.4f, 1.0f, 0.4f, 1.0f), "[FFLogs API Rate-Limit Lockout]");
@@ -397,10 +431,38 @@ public class ConfigWindow : Window, IDisposable
             ImGui.TextWrapped(_fflogsCooldownStatus);
         }
 
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
+        DrawSeparatorSpacing();
 
+        ImGui.TextColored(new Vector4(0.4f, 1.0f, 0.4f, 1.0f), "[Player Cache Manual Sync]");
+        ImGui.TextUnformatted($"Pending Player Cache Rows: {_plugin.PendingPlayerUploadCount}");
+        ImGui.TextUnformatted($"Player Upload Worker: {(_plugin.IsPlayerUploadInProgress ? "BUSY" : "IDLE")}");
+
+        if (ImGui.Button("Upload Pending Players Now"))
+        {
+            _plugin.TriggerPlayerUploadNow();
+            _playerManualUploadStatus = $"Triggered pending upload at {DateTime.Now:HH:mm:ss} (Local)";
+        }
+
+        ImGui.SameLine();
+        if (ImGui.Button("Requeue All Cached Players + Upload"))
+        {
+            var requeued = _plugin.TriggerPlayerFullResyncUploadNow();
+            _playerManualUploadStatus = $"Requeued {requeued} cached rows and triggered upload at {DateTime.Now:HH:mm:ss} (Local)";
+        }
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Marks every row in player_cache.db as dirty, then starts upload immediately.");
+        }
+
+        ImGui.TextWrapped("Chat commands: /rpr players-upload, /rpr players-resync");
+        if (!string.IsNullOrEmpty(_playerManualUploadStatus))
+        {
+            ImGui.TextWrapped(_playerManualUploadStatus);
+        }
+    }
+
+    private void DrawPfDetailAutoScannerSection()
+    {
         ImGui.TextColored(new Vector4(0.4f, 1.0f, 0.4f, 1.0f), "[PF Detail Auto Scanner (Debug)]");
         ImGui.Spacing();
 
@@ -512,91 +574,13 @@ public class ConfigWindow : Window, IDisposable
             _plugin.DebugPfScanner.ResetSession();
             _scannerCollectionStatus = $"[{DateTime.Now:HH:mm:ss}] scanner stopped and session reset";
         }
+    }
 
+    private static void DrawSeparatorSpacing()
+    {
         ImGui.Spacing();
         ImGui.Separator();
         ImGui.Spacing();
-
-        ImGui.TextColored(new Vector4(0.4f, 1.0f, 0.4f, 1.0f), "[Player Cache Manual Sync]");
-        ImGui.TextUnformatted($"Pending Player Cache Rows: {_plugin.PendingPlayerUploadCount}");
-        ImGui.TextUnformatted($"Player Upload Worker: {(_plugin.IsPlayerUploadInProgress ? "BUSY" : "IDLE")}");
-
-        if (ImGui.Button("Upload Pending Players Now"))
-        {
-            _plugin.TriggerPlayerUploadNow();
-            _playerManualUploadStatus = $"Triggered pending upload at {DateTime.Now:HH:mm:ss} (Local)";
-        }
-
-        ImGui.SameLine();
-        if (ImGui.Button("Requeue All Cached Players + Upload"))
-        {
-            var requeued = _plugin.TriggerPlayerFullResyncUploadNow();
-            _playerManualUploadStatus = $"Requeued {requeued} cached rows and triggered upload at {DateTime.Now:HH:mm:ss} (Local)";
-        }
-        if (ImGui.IsItemHovered())
-        {
-            ImGui.SetTooltip("Marks every row in player_cache.db as dirty, then starts upload immediately.");
-        }
-
-        ImGui.TextWrapped("Chat commands: /rpr players-upload, /rpr players-resync");
-        if (!string.IsNullOrEmpty(_playerManualUploadStatus))
-        {
-            ImGui.TextWrapped(_playerManualUploadStatus);
-        }
-
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.Spacing();
-
-        ImGui.Text("Endpoint Status:");
-
-        if (ImGui.BeginTable("cbStatusTable", 4, ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.Resizable))
-        {
-            ImGui.TableSetupColumn("URL", ImGuiTableColumnFlags.WidthStretch);
-            ImGui.TableSetupColumn("Failures", ImGuiTableColumnFlags.WidthFixed, 60);
-            ImGui.TableSetupColumn("Status", ImGuiTableColumnFlags.WidthFixed, 80);
-            ImGui.TableSetupColumn("Action", ImGuiTableColumnFlags.WidthFixed, 60);
-            ImGui.TableHeadersRow();
-
-            foreach (var url in _configuration.UploadUrls)
-            {
-                ImGui.TableNextRow();
-                
-                ImGui.TableSetColumnIndex(0);
-                ImGui.Text(url.Url);
-
-                ImGui.TableSetColumnIndex(1);
-                ImGui.Text($"{url.FailureCount} / {_configuration.CircuitBreakerFailureThreshold}");
-
-                ImGui.TableSetColumnIndex(2);
-                bool isOpen = url.FailureCount >= _configuration.CircuitBreakerFailureThreshold;
-                if (isOpen)
-                {
-                    // Check if waiting period is over
-                    var timeLeft = TimeSpan.FromMinutes(_configuration.CircuitBreakerBreakDurationMinutes) - (DateTime.UtcNow - url.LastFailureTime);
-                    if (timeLeft.TotalSeconds > 0)
-                    {
-                        ImGui.TextColored(new Vector4(1, 0, 0, 1), $"OPEN ({timeLeft.TotalSeconds:F0}s)");
-                    }
-                    else
-                    {
-                        ImGui.TextColored(new Vector4(1, 1, 0, 1), "HALF-OPEN");
-                    }
-                }
-                else
-                {
-                    ImGui.TextColored(new Vector4(0, 1, 0, 1), "CLOSED");
-                }
-
-                ImGui.TableSetColumnIndex(3);
-                if (ImGui.Button($"Reset##{url.GetHashCode()}"))
-                {
-                    url.FailureCount = 0;
-                    url.LastFailureTime = DateTime.MinValue;
-                }
-            }
-            ImGui.EndTable();
-        }
     }
 
     private void ResetToDefault()
