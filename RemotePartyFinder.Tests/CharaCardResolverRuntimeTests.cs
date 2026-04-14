@@ -489,7 +489,7 @@ public sealed class CharaCardResolverRuntimeTests {
     }
 
     [Fact]
-    public void Failed_tracked_banner_helper_response_is_suppressed_and_marks_request_failed() {
+    public void Response_dispatcher_failure_is_handled_without_banner_helper_specific_runtime_hooks() {
         using var harness = new TempPlayerCacheDatabase();
         using var database = new PlayerLocalDatabase(harness.DatabasePath);
 
@@ -506,18 +506,51 @@ public sealed class CharaCardResolverRuntimeTests {
 
         resolver.EnqueueMany([2323UL]);
         resolver.Pump();
-        Assert.False(runtime.DeliverBannerHelperResponse(new BannerHelperResponseModel(0, 1)));
+        Assert.False(runtime.DeliverResponseDispatcher(new BannerHelperResponseModel(0, 1)));
 
         Assert.Equal(ResolveState.FailedTransient, resolver.GetResolveState(2323UL));
         Assert.Contains(
             debugLogs,
-            message => message.Contains("suppressed BannerHelper failure response", StringComparison.Ordinal)
+            message => message.Contains("suppressed CharaCard update failure response", StringComparison.Ordinal)
                 && message.Contains("contentId=2323", StringComparison.Ordinal)
         );
     }
 
     [Fact]
-    public void Banner_helper_failure_without_inflight_request_is_not_suppressed() {
+    public void Suppression_state_consumes_budgets_without_needing_the_full_resolver() {
+        var observedAtUtc = new DateTime(2026, 4, 13, 9, 36, 0, DateTimeKind.Utc);
+        var state = new PlateFailureSuppressionState(
+            gameLogSuppressionBudget: 2,
+            selectOkSuppressionBudget: 2,
+            gameLogSuppressionWindow: TimeSpan.FromSeconds(3),
+            selectOkSuppressionWindow: TimeSpan.FromSeconds(1)
+        );
+
+        state.TrackUiOpenBudget(9001UL);
+        state.TrackSelectOkDialogBudget(9001UL);
+        state.ArmFailureSuppression(observedAtUtc);
+
+        Assert.True(state.TryConsumeSuppressedUiOpen(9001UL));
+        Assert.True(state.TryConsumeSuppressedUiOpen(9001UL));
+        Assert.False(state.TryConsumeSuppressedUiOpen(9001UL));
+
+        Assert.True(state.TryConsumeSuppressedSelectOkDialog(9001UL));
+        Assert.True(state.TryConsumeSuppressedSelectOkDialog(9001UL));
+        Assert.False(state.TryConsumeSuppressedSelectOkDialog(9001UL));
+
+        Assert.Equal(SuppressionConsumption.WindowBudget, state.GetGameUiSuppression(observedAtUtc, hasInFlightRequest: false));
+        Assert.Equal(SuppressionConsumption.WindowBudget, state.GetGameUiSuppression(observedAtUtc, hasInFlightRequest: false));
+        Assert.Equal(SuppressionConsumption.InFlightRequest, state.GetGameUiSuppression(observedAtUtc.AddSeconds(4), hasInFlightRequest: true));
+        Assert.Equal(SuppressionConsumption.None, state.GetGameUiSuppression(observedAtUtc.AddSeconds(4), hasInFlightRequest: false));
+
+        Assert.Equal(SuppressionConsumption.WindowBudget, state.GetSelectOkSuppression(observedAtUtc, hasInFlightRequest: false));
+        Assert.Equal(SuppressionConsumption.WindowBudget, state.GetSelectOkSuppression(observedAtUtc, hasInFlightRequest: false));
+        Assert.Equal(SuppressionConsumption.InFlightRequest, state.GetSelectOkSuppression(observedAtUtc.AddSeconds(2), hasInFlightRequest: true));
+        Assert.Equal(SuppressionConsumption.None, state.GetSelectOkSuppression(observedAtUtc.AddSeconds(2), hasInFlightRequest: false));
+    }
+
+    [Fact]
+    public void Response_dispatcher_failure_without_inflight_request_is_not_suppressed() {
         using var harness = new TempPlayerCacheDatabase();
         using var database = new PlayerLocalDatabase(harness.DatabasePath);
 
@@ -530,7 +563,7 @@ public sealed class CharaCardResolverRuntimeTests {
             () => nowUtc
         );
 
-        Assert.True(runtime.DeliverBannerHelperResponse(new BannerHelperResponseModel(0, 1)));
+        Assert.True(runtime.DeliverResponseDispatcher(new BannerHelperResponseModel(0, 1)));
     }
 
     [Fact]
@@ -658,7 +691,7 @@ public sealed class CharaCardResolverRuntimeTests {
 
         resolver.EnqueueMany([2828UL]);
         resolver.Pump();
-        Assert.False(runtime.DeliverBannerHelperResponse(new BannerHelperResponseModel(0, 1)));
+        Assert.False(runtime.DeliverResponseDispatcher(new BannerHelperResponseModel(0, 1)));
 
         Assert.False(runtime.DeliverSelectOkStateTransition(new SelectOkStateTransitionModel(
             2828UL,
@@ -763,8 +796,7 @@ public sealed class CharaCardResolverRuntimeTests {
     private sealed class FakeCharaCardResolverRuntime : ICharaCardResolverRuntime {
         private Func<CharaCardPacketModel, bool>? _packetHandler;
         private Func<CharaCardPacketModel, bool>? _agentPacketHandler;
-        private Func<BannerHelperResponseModel, bool>? _bannerHelperResponseHandler;
-        private Func<CharaCardPacketModel, bool>? _bannerHelperPacketHandler;
+        private Func<BannerHelperResponseModel, bool>? _responseDispatcherHandler;
         private Func<SelectOkStateTransitionModel, bool>? _selectOkStateTransitionHandler;
         private Func<GameUiMessageModel, bool>? _simpleGameUiMessageHandler;
         private Func<GameUiMessageModel, bool>? _parameterizedGameUiMessageHandler;
@@ -785,8 +817,7 @@ public sealed class CharaCardResolverRuntimeTests {
         public void Initialize(
             Func<CharaCardPacketModel, bool> packetHandler,
             Func<CharaCardPacketModel, bool> agentPacketHandler,
-            Func<BannerHelperResponseModel, bool> bannerHelperResponseHandler,
-            Func<CharaCardPacketModel, bool> bannerHelperPacketHandler,
+            Func<BannerHelperResponseModel, bool> responseDispatcherHandler,
             Func<SelectOkStateTransitionModel, bool> selectOkStateTransitionHandler,
             Func<GameUiMessageModel, bool> simpleGameUiMessageHandler,
             Func<GameUiMessageModel, bool> parameterizedGameUiMessageHandler,
@@ -798,8 +829,7 @@ public sealed class CharaCardResolverRuntimeTests {
 
             _packetHandler = packetHandler;
             _agentPacketHandler = agentPacketHandler;
-            _bannerHelperResponseHandler = bannerHelperResponseHandler;
-            _bannerHelperPacketHandler = bannerHelperPacketHandler;
+            _responseDispatcherHandler = responseDispatcherHandler;
             _selectOkStateTransitionHandler = selectOkStateTransitionHandler;
             _simpleGameUiMessageHandler = simpleGameUiMessageHandler;
             _parameterizedGameUiMessageHandler = parameterizedGameUiMessageHandler;
@@ -819,12 +849,8 @@ public sealed class CharaCardResolverRuntimeTests {
             return _agentPacketHandler?.Invoke(packet) ?? true;
         }
 
-        public bool DeliverBannerHelperResponse(BannerHelperResponseModel response) {
-            return !(_bannerHelperResponseHandler?.Invoke(response) ?? false);
-        }
-
-        public bool DeliverBannerHelperPacket(CharaCardPacketModel packet) {
-            return _bannerHelperPacketHandler?.Invoke(packet) ?? true;
+        public bool DeliverResponseDispatcher(BannerHelperResponseModel response) {
+            return !(_responseDispatcherHandler?.Invoke(response) ?? false);
         }
 
         public bool DeliverSelectOkDialogRequest(SelectOkDialogRequestModel request) {
@@ -847,8 +873,7 @@ public sealed class CharaCardResolverRuntimeTests {
             IsDisposed = true;
             _packetHandler = null;
             _agentPacketHandler = null;
-            _bannerHelperResponseHandler = null;
-            _bannerHelperPacketHandler = null;
+            _responseDispatcherHandler = null;
             _selectOkStateTransitionHandler = null;
             _simpleGameUiMessageHandler = null;
             _parameterizedGameUiMessageHandler = null;

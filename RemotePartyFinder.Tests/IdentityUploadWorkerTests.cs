@@ -165,7 +165,7 @@ public sealed class IdentityUploadWorkerTests {
 
         resolver.Pump();
         await WaitUntilAsync(() => Volatile.Read(ref attempts) == 1);
-        await WaitUntilAsync(() => GetPrivateIntField(resolver, "_identityUploadWorkerBusy") == 0);
+        await Task.Delay(50);
 
         resolver.Pump();
         resolver.Pump();
@@ -176,6 +176,49 @@ public sealed class IdentityUploadWorkerTests {
 
         nowUtc = nowUtc.AddSeconds(10);
         resolver.Pump();
+        await WaitUntilAsync(() => Volatile.Read(ref attempts) == 2);
+    }
+
+    [Fact]
+    public async Task Identity_upload_backoff_can_be_exercised_without_chara_card_runtime() {
+        using var harness = new TempPlayerCacheDatabase();
+        using var database = new PlayerLocalDatabase(harness.DatabasePath);
+
+        var snapshot = new CharacterIdentitySnapshot(
+            2222UL,
+            "Direct Pump Player",
+            21,
+            "Ravana",
+            new DateTime(2026, 4, 13, 11, 10, 0, DateTimeKind.Utc)
+        );
+        database.UpsertResolvedIdentity(snapshot);
+
+        var nowUtc = new DateTime(2026, 4, 13, 11, 11, 0, DateTimeKind.Utc);
+        var attempts = 0;
+        using var disposeCts = new CancellationTokenSource();
+        var pump = new IdentityUploadPump(
+            database,
+            () => nowUtc,
+            (payloads, cancellationToken) => {
+                Interlocked.Increment(ref attempts);
+                return Task.FromResult(false);
+            },
+            disposeCts.Token
+        );
+
+        pump.PumpPendingIdentityUploads();
+        await WaitUntilAsync(() => Volatile.Read(ref attempts) == 1);
+        await WaitUntilAsync(() => !pump.IsWorkerBusy);
+
+        Assert.Equal(1, pump.FailureCount);
+        Assert.Equal(nowUtc.AddSeconds(10), pump.NextAttemptAtUtc);
+
+        pump.PumpPendingIdentityUploads();
+        pump.PumpPendingIdentityUploads();
+        Assert.Equal(1, Volatile.Read(ref attempts));
+
+        nowUtc = nowUtc.AddSeconds(10);
+        pump.PumpPendingIdentityUploads();
         await WaitUntilAsync(() => Volatile.Read(ref attempts) == 2);
     }
 
@@ -283,8 +326,7 @@ public sealed class IdentityUploadWorkerTests {
         public void Initialize(
             Func<CharaCardPacketModel, bool> packetHandler,
             Func<CharaCardPacketModel, bool> agentPacketHandler,
-            Func<BannerHelperResponseModel, bool> bannerHelperResponseHandler,
-            Func<CharaCardPacketModel, bool> bannerHelperPacketHandler,
+            Func<BannerHelperResponseModel, bool> responseDispatcherHandler,
             Func<SelectOkStateTransitionModel, bool> selectOkStateTransitionHandler,
             Func<GameUiMessageModel, bool> simpleGameUiMessageHandler,
             Func<GameUiMessageModel, bool> parameterizedGameUiMessageHandler,
@@ -374,11 +416,5 @@ public sealed class IdentityUploadWorkerTests {
         }
 
         return condition();
-    }
-
-    private static int GetPrivateIntField(object instance, string fieldName) {
-        var field = instance.GetType().GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic);
-        Assert.NotNull(field);
-        return (int)field!.GetValue(instance)!;
     }
 }
