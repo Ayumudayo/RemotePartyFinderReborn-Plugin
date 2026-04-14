@@ -106,6 +106,7 @@ public class FFLogsCollector : IDisposable
     private FFLogsCollectorSeams Seams { get; set; }
     private FFLogsSubmitBuffer SubmitBuffer { get; set; }
     private FFLogsWorkerPolicy WorkerPolicy { get; set; }
+    private FFLogsLeaseAbandoner LeaseAbandoner { get; set; }
     private IReadOnlyList<IDisposable> OwnedDisposables { get; set; } = [];
     private bool IsRunning { get; set; }
     private System.Threading.CancellationTokenSource Cts { get; set; } = new();
@@ -144,6 +145,7 @@ public class FFLogsCollector : IDisposable
             seams,
             submitBuffer,
             workerPolicy,
+            new FFLogsLeaseAbandoner(seams),
             [],
             startWorker: false);
         return collector;
@@ -177,6 +179,7 @@ public class FFLogsCollector : IDisposable
             seams,
             new FFLogsSubmitBuffer(),
             new FFLogsWorkerPolicy(plugin.Configuration, message => Plugin.Log.Warning(message), seams.TimeProvider),
+            new FFLogsLeaseAbandoner(seams),
             [ffLogsClient, httpClient],
             startWorker: true);
     }
@@ -202,6 +205,7 @@ public class FFLogsCollector : IDisposable
         FFLogsCollectorSeams seams,
         FFLogsSubmitBuffer submitBuffer,
         FFLogsWorkerPolicy workerPolicy,
+        FFLogsLeaseAbandoner leaseAbandoner,
         IReadOnlyList<IDisposable> ownedDisposables,
         bool startWorker)
     {
@@ -215,6 +219,7 @@ public class FFLogsCollector : IDisposable
         Seams = seams ?? throw new ArgumentNullException(nameof(seams));
         SubmitBuffer = submitBuffer ?? throw new ArgumentNullException(nameof(submitBuffer));
         WorkerPolicy = workerPolicy ?? throw new ArgumentNullException(nameof(workerPolicy));
+        LeaseAbandoner = leaseAbandoner ?? throw new ArgumentNullException(nameof(leaseAbandoner));
         OwnedDisposables = ownedDisposables ?? throw new ArgumentNullException(nameof(ownedDisposables));
         SubscribeFrameworkUpdate(OnUpdate);
         if (startWorker)
@@ -300,48 +305,6 @@ public class FFLogsCollector : IDisposable
         return new List<ParseJobCandidateServer>();
     }
 
-    private static string ParseJobKey(ParseJob job)
-        => $"{job.ContentId}:{job.ZoneId}:{job.DifficultyId}:{job.Partition}";
-
-    private static List<AbandonFflogsLease> BuildAbandonLeaseBatch(
-        IEnumerable<ParseJob> leasedJobs,
-        IEnumerable<ParseResult> processedResults,
-        string reason)
-    {
-        var processedKeys = new HashSet<string>(
-            processedResults.Select(FFLogsSubmitBuffer.GetParseResultKey),
-            StringComparer.Ordinal);
-
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-        var batch = new List<AbandonFflogsLease>();
-
-        foreach (var job in leasedJobs)
-        {
-            if (string.IsNullOrWhiteSpace(job.LeaseToken))
-            {
-                continue;
-            }
-
-            var key = ParseJobKey(job);
-            if (processedKeys.Contains(key) || !seen.Add(key))
-            {
-                continue;
-            }
-
-            batch.Add(new AbandonFflogsLease
-            {
-                ContentId = job.ContentId,
-                ZoneId = job.ZoneId,
-                DifficultyId = job.DifficultyId,
-                Partition = job.Partition,
-                LeaseToken = job.LeaseToken,
-                Reason = reason,
-            });
-        }
-
-        return batch;
-    }
-
     private List<ParseResult> BuildSubmitBatch(List<ParseResult> freshResults)
         => SubmitBuffer.BuildSubmitBatch(freshResults);
 
@@ -373,107 +336,6 @@ public class FFLogsCollector : IDisposable
         }
     }
 
-    private static bool TryParseLeaseAbandonResponse(string content, out ContributeFflogsLeaseAbandonResponse parsed)
-    {
-        parsed = null;
-        if (string.IsNullOrWhiteSpace(content))
-        {
-            return false;
-        }
-
-        try
-        {
-            parsed = JsonConvert.DeserializeObject<ContributeFflogsLeaseAbandonResponse>(content);
-            return parsed != null;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private async Task TryAbandonUnprocessedLeasesAsync(
-        UploadUrl uploadUrl,
-        IEnumerable<ParseJob> leasedJobs,
-        IEnumerable<ParseResult> processedResults,
-        string reason)
-    {
-        var abandonBatch = BuildAbandonLeaseBatch(leasedJobs, processedResults, reason);
-        if (abandonBatch.Count == 0)
-        {
-            return;
-        }
-
-        if (!IngestEndpointResolver.TryBuildEndpointUrl(uploadUrl, "/contribute/fflogs/leases/abandon", out var abandonUrl))
-        {
-            return;
-        }
-
-        if (uploadUrl.ShouldDeferProtectedEndpointRequest(
-            ProtectedEndpointCapabilityKind.FflogsLeasesAbandon))
-        {
-            return;
-        }
-
-        var jsonContent = JsonConvert.SerializeObject(abandonBatch);
-        var capabilityToken = uploadUrl.TryGetProtectedEndpointCapability(
-            ProtectedEndpointCapabilityKind.FflogsLeasesAbandon,
-            out var cachedCapability)
-            ? cachedCapability
-            : null;
-
-        try
-        {
-            using var abandonRequest = IngestRequestFactory.CreatePostJsonRequest(
-                Configuration,
-                abandonUrl,
-                "/contribute/fflogs/leases/abandon",
-                jsonContent,
-                capabilityToken
-            );
-            var response = await Seams.IngestHttpSender.SendAsync(abandonRequest, Cts.Token);
-            var responseBody = await response.Content.ReadAsStringAsync(Cts.Token);
-
-            if (response.IsSuccessStatusCode)
-            {
-                if (TryParseLeaseAbandonResponse(responseBody, out var parsed))
-                {
-                    WarningLog(
-                        $"FFLogsCollector: released abandoned leases {parsed.Released}/{parsed.Submitted} (rejected={parsed.Rejected}).");
-                }
-                else
-                {
-                    WarningLog(
-                        $"FFLogsCollector: released abandoned leases request succeeded (submitted={abandonBatch.Count}).");
-                }
-
-                return;
-            }
-
-            if (response.StatusCode == System.Net.HttpStatusCode.Forbidden
-                || response.StatusCode == System.Net.HttpStatusCode.Unauthorized)
-            {
-                uploadUrl.MarkProtectedEndpointCapabilitiesRequired();
-                uploadUrl.InvalidateProtectedEndpointCapability(
-                    ProtectedEndpointCapabilityKind.FflogsLeasesAbandon);
-            }
-
-            if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
-            {
-                DebugLog(
-                    "FFLogsCollector: lease abandon endpoint is unavailable on this server version.");
-                return;
-            }
-
-            WarningLog(
-                $"FFLogsCollector: failed to release abandoned leases ({response.StatusCode}) body={responseBody}");
-        }
-        catch (Exception ex)
-        {
-            DebugLog($"FFLogsCollector: lease abandon request error: {ex.Message}");
-        }
-    }
- 
     private async Task WorkerLoop()
     {
         var consecutiveFailures = 0;
@@ -935,11 +797,15 @@ public class FFLogsCollector : IDisposable
 
                     if (shouldAbandonRemainingLeases)
                     {
-                        await TryAbandonUnprocessedLeasesAsync(
+                        await LeaseAbandoner.TryAbandonUnprocessedLeasesAsync(
+                            Configuration,
                             uploadUrl,
                             jobs,
                             results,
-                            "fflogs_rate_limit_cooldown"
+                            "fflogs_rate_limit_cooldown",
+                            Cts.Token,
+                            WarningLog,
+                            DebugLog
                         );
                     }
 
