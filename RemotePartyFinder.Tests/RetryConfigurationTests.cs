@@ -25,9 +25,66 @@ public sealed class RetryConfigurationTests {
     [InlineData(1, 1, true)]
     [InlineData(2, 1, false)]
     [InlineData(1, 0, false)]
-    [InlineData(3, 3, true)]
-    public void Debug_scanner_retry_budget_allows_initial_try_plus_configured_retries(int attemptsMade, int configuredRetries, bool shouldRetry) {
-        Assert.Equal(shouldRetry, DebugPfScanner.ShouldRetryTargetAfterFailure(attemptsMade, configuredRetries));
+    public void Scanner_retry_helper_uses_configured_retry_budget(int attemptsMade, int configuredRetries, bool shouldRetry) {
+        Assert.Equal(
+            shouldRetry,
+            DebugPfScanStateMachine.ShouldRetryTargetAfterFailure(attemptsMade, configuredRetries));
+    }
+
+    [Fact]
+    public void Scanner_retry_budget_uses_configured_retry_count() {
+        var nowUtc = new DateTime(2026, 4, 14, 0, 0, 0, DateTimeKind.Utc);
+        var queue = new DebugPfListingQueue();
+        var stateMachine = new DebugPfScanStateMachine(queue);
+        var target = new DebugPfListingCandidate(9001U, 33UL, nowUtc, 1);
+        stateMachine.UpsertVisibleCandidate(target);
+
+        stateMachine.SyncQueue(
+            nowUtc,
+            [],
+            hasIncomingListings: false,
+            maxPerRun: 0,
+            dedupTtlSeconds: 600,
+            runFromCollectedListings: false
+        );
+
+        Assert.Equal(DebugPfScanState.OpenTarget, stateMachine.State);
+        Assert.Equal(target.ListingId, stateMachine.CurrentTargetListingId);
+
+        stateMachine.HandleOpenAttemptResult(
+            nowUtc,
+            opened: false,
+            actionIntervalMs: 400,
+            detailReadyTimeoutMs: 3500,
+            configuredRetries: 1,
+            postListingCooldownMs: 300,
+            ackSnapshot: default
+        );
+
+        Assert.Equal(DebugPfScanState.Cooldown, stateMachine.State);
+        Assert.Equal(target.ListingId, stateMachine.CurrentTargetListingId);
+        Assert.Equal(0, stateMachine.ConsecutiveFailures);
+
+        stateMachine.AdvanceCooldown(nowUtc.AddMilliseconds(401));
+
+        Assert.Equal(DebugPfScanState.OpenTarget, stateMachine.State);
+        Assert.Equal(target.ListingId, stateMachine.CurrentTargetListingId);
+
+        stateMachine.HandleOpenAttemptResult(
+            nowUtc.AddMilliseconds(401),
+            opened: false,
+            actionIntervalMs: 400,
+            detailReadyTimeoutMs: 3500,
+            configuredRetries: 1,
+            postListingCooldownMs: 300,
+            ackSnapshot: default
+        );
+
+        Assert.Equal(DebugPfScanState.Cooldown, stateMachine.State);
+        Assert.Equal(0U, stateMachine.CurrentTargetListingId);
+        Assert.Equal(1, stateMachine.ConsecutiveFailures);
+        Assert.Equal("open_failed", stateMachine.LastAttemptReason);
+        Assert.False(stateMachine.LastAttemptSuccess);
     }
 
     [Theory]
@@ -43,13 +100,105 @@ public sealed class RetryConfigurationTests {
     [InlineData(0, false, true)]
     [InlineData(0, true, false)]
     [InlineData(1, false, false)]
-    [InlineData(2, true, false)]
-    public void Debug_scanner_completes_once_targets_are_queued_without_waiting_for_detail_upload_queue(
+    public void Scanner_completion_helper_requires_no_pending_targets_and_no_incoming_listings(
         int pendingTargets,
         bool hasIncomingListings,
         bool shouldComplete) {
         Assert.Equal(
             shouldComplete,
-            DebugPfScanner.ShouldCompleteRunWhenNoReadyTarget(pendingTargets, hasIncomingListings));
+            DebugPfScanStateMachine.ShouldCompleteRunWhenNoReadyTarget(pendingTargets, hasIncomingListings));
+    }
+
+    [Fact]
+    public void Scanner_completes_once_targets_are_queued_for_collection() {
+        var nowUtc = new DateTime(2026, 4, 14, 1, 0, 0, DateTimeKind.Utc);
+        var queue = new DebugPfListingQueue();
+        var stateMachine = new DebugPfScanStateMachine(queue);
+        var target = new DebugPfListingCandidate(9101U, 44UL, nowUtc, 1);
+        var detailSnapshot = new DebugPfDetailSnapshot(
+            target.ListingId,
+            target.ContentId,
+            NonZeroMembers: 4,
+            TotalSlots: 8
+        );
+        stateMachine.UpsertVisibleCandidate(target);
+
+        var completionReason = stateMachine.SyncQueue(
+            nowUtc,
+            [],
+            hasIncomingListings: false,
+            maxPerRun: 0,
+            dedupTtlSeconds: 600,
+            runFromCollectedListings: false
+        );
+
+        Assert.Null(completionReason);
+        Assert.Equal(DebugPfScanState.OpenTarget, stateMachine.State);
+
+        stateMachine.HandleOpenAttemptResult(
+            nowUtc,
+            opened: true,
+            actionIntervalMs: 400,
+            detailReadyTimeoutMs: 3500,
+            configuredRetries: 1,
+            postListingCooldownMs: 300,
+            ackSnapshot: default
+        );
+
+        Assert.Equal(DebugPfScanState.WaitDetailReady, stateMachine.State);
+
+        stateMachine.HandleDetailReadyState(
+            nowUtc.AddMilliseconds(10),
+            detailSnapshot,
+            minDwellMs: 800,
+            detailReadyTimeoutMs: 3500,
+            configuredRetries: 1,
+            postListingCooldownMs: 300
+        );
+        Assert.Equal(DebugPfScanState.WaitDetailReady, stateMachine.State);
+
+        stateMachine.HandleDetailReadyState(
+            nowUtc.AddMilliseconds(20),
+            detailSnapshot,
+            minDwellMs: 800,
+            detailReadyTimeoutMs: 3500,
+            configuredRetries: 1,
+            postListingCooldownMs: 300
+        );
+
+        Assert.Equal(DebugPfScanState.WaitCollected, stateMachine.State);
+
+        stateMachine.HandleCollectedState(
+            nowUtc.AddMilliseconds(30),
+            new DebugPfCollectorAckSnapshot(
+                QueueAckVersion: 1,
+                QueuedListingId: target.ListingId,
+                SuccessfulAckVersion: 0,
+                SuccessfulListingId: 0,
+                TerminalAckVersion: 0,
+                TerminalListingId: 0
+            ),
+            postListingCooldownMs: 300
+        );
+
+        Assert.Equal(DebugPfScanState.Cooldown, stateMachine.State);
+        Assert.Equal(1, stateMachine.ProcessedCount);
+        Assert.Equal("queued", stateMachine.LastAttemptReason);
+        Assert.True(stateMachine.LastAttemptSuccess);
+
+        stateMachine.AdvanceCooldown(nowUtc.AddMilliseconds(331));
+        Assert.Equal(DebugPfScanState.SyncQueue, stateMachine.State);
+
+        completionReason = stateMachine.SyncQueue(
+            nowUtc.AddMilliseconds(331),
+            [],
+            hasIncomingListings: false,
+            maxPerRun: 0,
+            dedupTtlSeconds: 600,
+            runFromCollectedListings: false
+        );
+
+        Assert.Equal("current_page_complete", completionReason);
+        Assert.Equal(DebugPfScanState.SyncQueue, stateMachine.State);
     }
 }

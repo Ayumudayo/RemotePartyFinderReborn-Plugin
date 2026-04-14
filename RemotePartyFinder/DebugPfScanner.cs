@@ -10,38 +10,16 @@ using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 namespace RemotePartyFinder;
 
 internal sealed class DebugPfScanner : IDisposable {
-    private const int MinCollectionTimeoutMs = 1500;
-    private const int CollectionTimeoutExtraBudgetMs = 700;
-
     private readonly Plugin _plugin;
     private readonly PartyDetailCollector _detailCollector;
 
-    private readonly ConcurrentQueue<ListingCandidate> _incoming = new();
-    private readonly Dictionary<uint, ListingCandidate> _latestVisible = new();
-    private readonly Dictionary<uint, ListingCandidate> _collectedListings = new();
-    private readonly Dictionary<uint, DateTime> _attemptedAt = new();
-    private readonly Queue<ListingCandidate> _pending = new();
-    private readonly List<ListingCandidate> _collectedRunSnapshot = new();
+    private readonly ConcurrentQueue<DebugPfListingCandidate> _incoming = new();
+    private readonly Dictionary<uint, DebugPfListingCandidate> _collectedListings = new();
+    private readonly List<DebugPfListingCandidate> _collectedRunSnapshot = new();
     private readonly object _collectionLock = new();
     private readonly Stopwatch _tickGate = new();
+    private readonly DebugPfScanStateMachine _stateMachine = new(new DebugPfListingQueue());
 
-    private ScanState _state = ScanState.Idle;
-    private ListingCandidate _target;
-    private bool _hasTarget;
-    private bool _retryTargetAfterCooldown;
-    private int _openAttemptsForTarget;
-    private int _consecutiveFailures;
-    private int _processedCount;
-    private DateTime _nextActionAtUtc = DateTime.MinValue;
-    private DateTime _stateDeadlineUtc = DateTime.MinValue;
-    private long _waitForQueueAckVersion = -1;
-    private long _waitForAckVersion = -1;
-    private long _waitForTerminalAckVersion = -1;
-    private DetailSnapshot _lastReadySnapshot;
-    private int _readyStableTicks;
-    private string _lastAttemptReason = "none";
-    private bool _lastAttemptSuccess;
-    private uint _lastAttemptListingId;
     private bool _wasEnabled;
     private bool _runFromCollectedListings;
 
@@ -55,12 +33,12 @@ internal sealed class DebugPfScanner : IDisposable {
     }
 
     internal bool Enabled => _plugin.Configuration.EnableAutoDetailScanDebug;
-    internal string StateName => _state.ToString();
-    internal uint CurrentTargetListingId => _hasTarget ? _target.ListingId : 0;
-    internal int PendingCount => _pending.Count;
-    internal int ProcessedCount => _processedCount;
-    internal int ConsecutiveFailures => _consecutiveFailures;
-    internal int VisibleListingCount => _latestVisible.Count;
+    internal string StateName => _stateMachine.StateName;
+    internal uint CurrentTargetListingId => _stateMachine.CurrentTargetListingId;
+    internal int PendingCount => _stateMachine.PendingCount;
+    internal int ProcessedCount => _stateMachine.ProcessedCount;
+    internal int ConsecutiveFailures => _stateMachine.ConsecutiveFailures;
+    internal int VisibleListingCount => _stateMachine.VisibleListingCount;
     internal int CollectedListingCount {
         get {
             lock (_collectionLock) {
@@ -68,9 +46,9 @@ internal sealed class DebugPfScanner : IDisposable {
             }
         }
     }
-    internal string LastAttemptReason => _lastAttemptReason;
-    internal bool LastAttemptSuccess => _lastAttemptSuccess;
-    internal uint LastAttemptListingId => _lastAttemptListingId;
+    internal string LastAttemptReason => _stateMachine.LastAttemptReason;
+    internal bool LastAttemptSuccess => _stateMachine.LastAttemptSuccess;
+    internal uint LastAttemptListingId => _stateMachine.LastAttemptListingId;
 
     internal int ClearCollectedListings() {
         lock (_collectionLock) {
@@ -97,7 +75,7 @@ internal sealed class DebugPfScanner : IDisposable {
                 }
 
                 var listingId = (uint)rawListingId;
-                var candidate = new ListingCandidate(listingId, 0, now.AddMilliseconds(index), 1000 - index);
+                var candidate = new DebugPfListingCandidate(listingId, 0, now.AddMilliseconds(index), 1000 - index);
                 if (UpsertCollectedCandidate(candidate)) {
                     added++;
                 }
@@ -142,26 +120,7 @@ internal sealed class DebugPfScanner : IDisposable {
 
     internal void ResetSession() {
         _incoming.Clear();
-        _latestVisible.Clear();
-        _attemptedAt.Clear();
-        _pending.Clear();
-
-        _state = ScanState.Idle;
-        _hasTarget = false;
-        _retryTargetAfterCooldown = false;
-        _openAttemptsForTarget = 0;
-        _consecutiveFailures = 0;
-        _processedCount = 0;
-        _nextActionAtUtc = DateTime.MinValue;
-        _stateDeadlineUtc = DateTime.MinValue;
-        _waitForQueueAckVersion = -1;
-        _waitForAckVersion = -1;
-        _waitForTerminalAckVersion = -1;
-        _lastReadySnapshot = default;
-        _readyStableTicks = 0;
-        _lastAttemptReason = "none";
-        _lastAttemptSuccess = false;
-        _lastAttemptListingId = 0;
+        _stateMachine.Reset();
     }
 
     private void OnListing(IPartyFinderListing listing, IPartyFinderListingEventArgs args) {
@@ -169,7 +128,7 @@ internal sealed class DebugPfScanner : IDisposable {
             return;
         }
 
-        var candidate = new ListingCandidate(
+        var candidate = new DebugPfListingCandidate(
             listing.Id,
             listing.ContentId,
             DateTime.UtcNow,
@@ -195,7 +154,10 @@ internal sealed class DebugPfScanner : IDisposable {
         _tickGate.Restart();
 
         if (!Enabled) {
-            if (_state != ScanState.Idle || _pending.Count > 0 || _processedCount > 0 || _consecutiveFailures > 0) {
+            if (_stateMachine.State != DebugPfScanState.Idle
+                || _stateMachine.PendingCount > 0
+                || _stateMachine.ProcessedCount > 0
+                || _stateMachine.ConsecutiveFailures > 0) {
                 ResetSession();
             }
 
@@ -219,40 +181,33 @@ internal sealed class DebugPfScanner : IDisposable {
         }
 
         var maxFailures = Math.Max(_plugin.Configuration.AutoDetailScanMaxConsecutiveFailures, 1);
-        if (_consecutiveFailures >= maxFailures) {
+        if (_stateMachine.ConsecutiveFailures >= maxFailures) {
             return;
         }
 
-        switch (_state) {
-            case ScanState.Idle:
-                _state = ScanState.SyncQueue;
+        switch (_stateMachine.State) {
+            case DebugPfScanState.Idle:
+                _stateMachine.StartSyncQueue();
                 break;
 
-            case ScanState.SyncQueue:
+            case DebugPfScanState.SyncQueue:
                 SyncQueue();
                 break;
 
-            case ScanState.OpenTarget:
+            case DebugPfScanState.OpenTarget:
                 OpenTarget();
                 break;
 
-            case ScanState.WaitDetailReady:
+            case DebugPfScanState.WaitDetailReady:
                 WaitDetailReady();
                 break;
 
-            case ScanState.WaitCollected:
+            case DebugPfScanState.WaitCollected:
                 WaitCollected();
                 break;
 
-            case ScanState.Cooldown:
-                if (DateTime.UtcNow >= _nextActionAtUtc) {
-                    if (_retryTargetAfterCooldown && _hasTarget) {
-                        _retryTargetAfterCooldown = false;
-                        _state = ScanState.OpenTarget;
-                    } else {
-                        _state = ScanState.SyncQueue;
-                    }
-                }
+            case DebugPfScanState.Cooldown:
+                _stateMachine.AdvanceCooldown(DateTime.UtcNow);
                 break;
         }
     }
@@ -261,95 +216,50 @@ internal sealed class DebugPfScanner : IDisposable {
         if (!_runFromCollectedListings) {
             DrainIncoming();
         }
-        PruneCaches();
 
-        if (_plugin.Configuration.AutoDetailScanMaxPerRun > 0
-            && _processedCount >= _plugin.Configuration.AutoDetailScanMaxPerRun) {
-            CompleteRun("max_per_run");
-            return;
-        }
+        var nowUtc = DateTime.UtcNow;
+        var hasIncomingListings = !_runFromCollectedListings && !_incoming.IsEmpty;
+        var completionReason = _stateMachine.SyncQueue(
+            nowUtc,
+            _runFromCollectedListings ? GetCollectedRunSnapshot() : Array.Empty<DebugPfListingCandidate>(),
+            hasIncomingListings,
+            _plugin.Configuration.AutoDetailScanMaxPerRun,
+            _plugin.Configuration.AutoDetailScanDedupTtlSeconds,
+            _runFromCollectedListings
+        );
 
-        if (_pending.Count == 0) {
-            RebuildPendingQueue();
-        }
-
-        if (!TryTakeNextReadyTarget(out var nextTarget)) {
-            var now = DateTime.UtcNow;
-            var hasIncomingListings = !_runFromCollectedListings && !_incoming.IsEmpty;
-
-            if (!ShouldCompleteRunWhenNoReadyTarget(_pending.Count, hasIncomingListings)) {
-                _nextActionAtUtc = now.AddMilliseconds(250);
-                _state = ScanState.Cooldown;
-                return;
-            }
-
-            var completionReason = _runFromCollectedListings ? "collected_batch_complete" : "current_page_complete";
+        if (completionReason is not null) {
             CompleteRun(completionReason);
-            return;
         }
-
-        _target = nextTarget;
-        _hasTarget = true;
-        _openAttemptsForTarget = 0;
-        _retryTargetAfterCooldown = false;
-        _state = ScanState.OpenTarget;
-    }
-
-    private bool TryTakeNextReadyTarget(out ListingCandidate target) {
-        var remaining = _pending.Count;
-        while (remaining-- > 0) {
-            var candidate = _pending.Dequeue();
-
-            if (IsRecentlyAttempted(candidate.ListingId)) {
-                continue;
-            }
-
-            target = candidate;
-            return true;
-        }
-
-        target = default;
-        return false;
     }
 
     private void OpenTarget() {
-        if (!_hasTarget) {
-            _state = ScanState.SyncQueue;
+        var target = _stateMachine.CurrentTarget;
+        if (target.ListingId == 0) {
+            _stateMachine.StartSyncQueue();
             return;
         }
 
-        if (DateTime.UtcNow < _nextActionAtUtc) {
+        var nowUtc = DateTime.UtcNow;
+        if (!_stateMachine.IsActionReady(nowUtc)) {
             return;
         }
 
-        var opened = TryOpenTarget(_target);
-        _openAttemptsForTarget++;
-
-        var actionIntervalMs = Math.Clamp(_plugin.Configuration.AutoDetailScanActionIntervalMs, 100, 2000);
-        _nextActionAtUtc = DateTime.UtcNow.AddMilliseconds(actionIntervalMs);
-
-        if (opened) {
-            var timeoutMs = GetDetailReadyTimeoutMs();
-            _stateDeadlineUtc = DateTime.UtcNow.AddMilliseconds(timeoutMs);
-            _readyStableTicks = 0;
-            _lastReadySnapshot = default;
-            _waitForQueueAckVersion = _detailCollector.LastQueuedAckVersion;
-            _waitForAckVersion = _detailCollector.LastSuccessfulUploadAckVersion;
-            _waitForTerminalAckVersion = _detailCollector.LastTerminalUploadAckVersion;
-            _state = ScanState.WaitDetailReady;
-            return;
-        }
-
-        if (ShouldRetryTargetAfterFailure(_openAttemptsForTarget, _plugin.Configuration.AutoDetailScanRetryCount)) {
-            _retryTargetAfterCooldown = true;
-            _state = ScanState.Cooldown;
-            return;
-        }
-
-        MarkAttempt(false, "open_failed");
+        var beforeAttempt = CaptureAttemptLogState();
+        var opened = TryOpenTarget(target);
+        _stateMachine.HandleOpenAttemptResult(
+            nowUtc,
+            opened,
+            _plugin.Configuration.AutoDetailScanActionIntervalMs,
+            _plugin.Configuration.AutoDetailScanDetailTimeoutMs,
+            _plugin.Configuration.AutoDetailScanRetryCount,
+            _plugin.Configuration.AutoDetailScanPostListingCooldownMs,
+            GetCollectorAckSnapshot()
+        );
+        LogAttemptIfChanged(beforeAttempt);
     }
 
-    private unsafe bool TryOpenTarget(ListingCandidate target) {
+    private unsafe bool TryOpenTarget(DebugPfListingCandidate target) {
         var agent = AgentLookingForGroup.Instance();
         if (agent == null) {
             return false;
@@ -363,125 +273,30 @@ internal sealed class DebugPfScanner : IDisposable {
     }
 
     private void WaitDetailReady() {
-        if (!_hasTarget) {
-            _state = ScanState.SyncQueue;
-            return;
-        }
-
-        var snapshot = GetCurrentDetailSnapshot();
-        var listingMatches = snapshot.ListingId == _target.ListingId;
-        var leaderMatches = _target.ContentId == 0 || snapshot.LeaderContentId == _target.ContentId;
-        var hasMembers = snapshot.NonZeroMembers > 0;
-
-        if (listingMatches && leaderMatches && hasMembers) {
-            if (_readyStableTicks > 0 && snapshot.Equals(_lastReadySnapshot)) {
-                _readyStableTicks++;
-            } else {
-                _lastReadySnapshot = snapshot;
-                _readyStableTicks = 1;
-            }
-
-            var requiredStableTicks = _target.ContentId == 0 ? 4 : 2;
-            if (_readyStableTicks >= requiredStableTicks) {
-                var minDwellMs = Math.Clamp(_plugin.Configuration.AutoDetailScanMinDwellMs, 100, 5000);
-                var timeoutMs = GetDetailCollectionTimeoutMs(minDwellMs);
-                _stateDeadlineUtc = DateTime.UtcNow.AddMilliseconds(timeoutMs);
-                _state = ScanState.WaitCollected;
-                return;
-            }
-        } else {
-            _readyStableTicks = 0;
-            _lastReadySnapshot = default;
-        }
-
-        if (DateTime.UtcNow <= _stateDeadlineUtc) {
-            return;
-        }
-
-        if (ShouldRetryTargetAfterFailure(_openAttemptsForTarget, _plugin.Configuration.AutoDetailScanRetryCount)) {
-            _retryTargetAfterCooldown = true;
-            _state = ScanState.Cooldown;
-            return;
-        }
-
-        MarkAttempt(false, "detail_timeout");
+        var beforeAttempt = CaptureAttemptLogState();
+        _stateMachine.HandleDetailReadyState(
+            DateTime.UtcNow,
+            GetCurrentDetailSnapshot(),
+            _plugin.Configuration.AutoDetailScanMinDwellMs,
+            _plugin.Configuration.AutoDetailScanDetailTimeoutMs,
+            _plugin.Configuration.AutoDetailScanRetryCount,
+            _plugin.Configuration.AutoDetailScanPostListingCooldownMs
+        );
+        LogAttemptIfChanged(beforeAttempt);
     }
 
     private void WaitCollected() {
-        if (!_hasTarget) {
-            _state = ScanState.SyncQueue;
-            return;
-        }
-
-        var queueAckVersion = _detailCollector.LastQueuedAckVersion;
-        var hasQueuedAck = queueAckVersion > _waitForQueueAckVersion
-                           && _detailCollector.LastUploadedListingId == _target.ListingId;
-
-        if (hasQueuedAck) {
-            MarkAttempt(true, "queued");
-            return;
-        }
-
-        var ackVersion = _detailCollector.LastSuccessfulUploadAckVersion;
-        var hasAppliedAck = ackVersion > _waitForAckVersion
-                            && _detailCollector.LastSuccessfulUploadListingId == _target.ListingId;
-        var terminalAckVersion = _detailCollector.LastTerminalUploadAckVersion;
-        var hasTerminalAck = terminalAckVersion > _waitForTerminalAckVersion
-                             && _detailCollector.LastTerminalUploadListingId == _target.ListingId;
-
-        if (hasAppliedAck) {
-            MarkAttempt(true, "collected");
-            return;
-        }
-
-        if (hasTerminalAck) {
-            MarkAttempt(true, "listing_missing");
-            return;
-        }
-
-        if (DateTime.UtcNow <= _stateDeadlineUtc) {
-            return;
-        }
-
-        MarkAttempt(false, "collector_timeout");
-    }
-
-    private void MarkAttempt(bool success, string reason) {
-        if (_hasTarget) {
-            _attemptedAt[_target.ListingId] = DateTime.UtcNow;
-            Plugin.Log.Debug($"DebugPfScanner: listing={_target.ListingId} success={success} reason={reason}");
-            _lastAttemptListingId = _target.ListingId;
-        }
-
-        _lastAttemptReason = reason;
-        _lastAttemptSuccess = success;
-
-        if (success) {
-            _processedCount++;
-            _consecutiveFailures = 0;
-        } else {
-            _consecutiveFailures++;
-        }
-
-        _hasTarget = false;
-        _retryTargetAfterCooldown = false;
-        _openAttemptsForTarget = 0;
-        _waitForQueueAckVersion = -1;
-        _waitForAckVersion = -1;
-        _waitForTerminalAckVersion = -1;
-        _readyStableTicks = 0;
-        _lastReadySnapshot = default;
-
-        var cooldownMs = Math.Clamp(_plugin.Configuration.AutoDetailScanPostListingCooldownMs, 50, 3000);
-        _nextActionAtUtc = DateTime.UtcNow.AddMilliseconds(cooldownMs);
-        _state = ScanState.Cooldown;
+        var beforeAttempt = CaptureAttemptLogState();
+        _stateMachine.HandleCollectedState(
+            DateTime.UtcNow,
+            GetCollectorAckSnapshot(),
+            _plugin.Configuration.AutoDetailScanPostListingCooldownMs
+        );
+        LogAttemptIfChanged(beforeAttempt);
     }
 
     private void SetIdle() {
-        _state = ScanState.Idle;
-        _hasTarget = false;
-        _retryTargetAfterCooldown = false;
-        _openAttemptsForTarget = 0;
+        _stateMachine.SetIdle();
         _runFromCollectedListings = false;
         lock (_collectionLock) {
             _collectedRunSnapshot.Clear();
@@ -489,7 +304,7 @@ internal sealed class DebugPfScanner : IDisposable {
     }
 
     private void CompleteRun(string reason) {
-        Plugin.Log.Debug($"DebugPfScanner: complete reason={reason} processed={_processedCount} failures={_consecutiveFailures}");
+        Plugin.Log.Debug($"DebugPfScanner: complete reason={reason} processed={_stateMachine.ProcessedCount} failures={_stateMachine.ConsecutiveFailures}");
         SetIdle();
 
         if (!_plugin.Configuration.EnableAutoDetailScanDebug) {
@@ -502,96 +317,14 @@ internal sealed class DebugPfScanner : IDisposable {
 
     private void DrainIncoming() {
         while (_incoming.TryDequeue(out var listing)) {
-            UpsertVisibleCandidate(listing);
+            _stateMachine.UpsertVisibleCandidate(listing);
         }
     }
 
-    private void PruneCaches() {
-        var now = DateTime.UtcNow;
-
-        var visibleTtl = TimeSpan.FromSeconds(30);
-        foreach (var staleId in _latestVisible
-                     .Where(kvp => now - kvp.Value.SeenAtUtc > visibleTtl)
-                     .Select(kvp => kvp.Key)
-                     .ToList()) {
-            _latestVisible.Remove(staleId);
-        }
-
-        var dedupTtl = TimeSpan.FromSeconds(Math.Clamp(_plugin.Configuration.AutoDetailScanDedupTtlSeconds, 30, 3600));
-        foreach (var staleId in _attemptedAt
-                     .Where(kvp => now - kvp.Value > dedupTtl)
-                     .Select(kvp => kvp.Key)
-                     .ToList()) {
-            _attemptedAt.Remove(staleId);
-        }
-    }
-
-    private bool IsRecentlyAttempted(uint listingId) {
-        if (!_attemptedAt.TryGetValue(listingId, out var lastAttemptUtc)) {
-            return false;
-        }
-
-        var dedupTtl = TimeSpan.FromSeconds(Math.Clamp(_plugin.Configuration.AutoDetailScanDedupTtlSeconds, 30, 3600));
-        return DateTime.UtcNow - lastAttemptUtc < dedupTtl;
-    }
-
-    internal static bool ShouldRetryTargetAfterFailure(int attemptsMade, int configuredRetries) {
-        return attemptsMade <= PartyDetailCollector.NormalizeRetryCount(configuredRetries);
-    }
-
-    internal static bool ShouldCompleteRunWhenNoReadyTarget(int pendingTargets, bool hasIncomingListings) {
-        return pendingTargets <= 0 && !hasIncomingListings;
-    }
-
-    private void RebuildPendingQueue() {
-        _pending.Clear();
-
-        if (_runFromCollectedListings) {
-            List<ListingCandidate> snapshot;
-            lock (_collectionLock) {
-                snapshot = _collectedRunSnapshot.ToList();
-            }
-
-            foreach (var listing in snapshot) {
-                if (IsRecentlyAttempted(listing.ListingId)) {
-                    continue;
-                }
-
-                _pending.Enqueue(listing);
-            }
-
-            return;
-        }
-
-        foreach (var listing in _latestVisible.Values
-                     .OrderBy(value => value.SeenAtUtc)
-                     .ThenByDescending(value => value.BatchNumber)) {
-            if (IsRecentlyAttempted(listing.ListingId)) {
-                continue;
-            }
-
-            _pending.Enqueue(listing);
-        }
-    }
-
-    private void UpsertVisibleCandidate(ListingCandidate incoming) {
-        if (_latestVisible.TryGetValue(incoming.ListingId, out var existing)) {
-            _latestVisible[incoming.ListingId] = new ListingCandidate(
-                incoming.ListingId,
-                incoming.ContentId != 0 ? incoming.ContentId : existing.ContentId,
-                existing.SeenAtUtc,
-                Math.Max(existing.BatchNumber, incoming.BatchNumber)
-            );
-            return;
-        }
-
-        _latestVisible[incoming.ListingId] = incoming;
-    }
-
-    private bool UpsertCollectedCandidate(ListingCandidate incoming) {
+    private bool UpsertCollectedCandidate(DebugPfListingCandidate incoming) {
         lock (_collectionLock) {
             if (_collectedListings.TryGetValue(incoming.ListingId, out var existing)) {
-                _collectedListings[incoming.ListingId] = new ListingCandidate(
+                _collectedListings[incoming.ListingId] = new DebugPfListingCandidate(
                     incoming.ListingId,
                     incoming.ContentId != 0 ? incoming.ContentId : existing.ContentId,
                     existing.SeenAtUtc,
@@ -605,51 +338,55 @@ internal sealed class DebugPfScanner : IDisposable {
         }
     }
 
-    private int SeedPendingFromCollectedListings() {
-        List<ListingCandidate> snapshot;
+    private IReadOnlyCollection<DebugPfListingCandidate> GetCollectedRunSnapshot() {
+        lock (_collectionLock) {
+            return _collectedRunSnapshot.ToList();
+        }
+    }
+
+    private DebugPfCollectorAckSnapshot GetCollectorAckSnapshot() {
+        return new DebugPfCollectorAckSnapshot(
+            _detailCollector.LastQueuedAckVersion,
+            _detailCollector.LastUploadedListingId,
+            _detailCollector.LastSuccessfulUploadAckVersion,
+            _detailCollector.LastSuccessfulUploadListingId,
+            _detailCollector.LastTerminalUploadAckVersion,
+            _detailCollector.LastTerminalUploadListingId
+        );
+    }
+
+    private void StartRunFromFirstPage() {
+        ResetSession();
+        if (_runFromCollectedListings) {
+            var seeded = SeedVisibleCandidatesFromCollectedListings();
+            if (seeded == 0) {
+                CompleteRun("collected_batch_empty");
+                return;
+            }
+
+            _stateMachine.StartSyncQueue();
+            Plugin.Log.Debug($"DebugPfScanner: starting deferred batch run from collected listings (seeded_listings={seeded}).");
+            return;
+        }
+
+        var currentPageSeeded = SeedVisibleCandidatesFromCurrentPage();
+        _stateMachine.StartSyncQueue();
+        Plugin.Log.Debug($"DebugPfScanner: starting run from current PF page only (seeded_listings={currentPageSeeded}).");
+    }
+
+    private int SeedVisibleCandidatesFromCollectedListings() {
+        List<DebugPfListingCandidate> snapshot;
         lock (_collectionLock) {
             snapshot = _collectedRunSnapshot.ToList();
         }
 
         var seeded = 0;
         foreach (var listing in snapshot) {
-            _pending.Enqueue(listing);
-            _latestVisible[listing.ListingId] = listing;
+            _stateMachine.UpsertVisibleCandidate(listing);
             seeded++;
         }
 
         return seeded;
-    }
-
-    private int GetDetailReadyTimeoutMs() {
-        return Math.Clamp(_plugin.Configuration.AutoDetailScanDetailTimeoutMs, 500, 10000);
-    }
-
-    private int GetDetailCollectionTimeoutMs(int minDwellMs) {
-        var configuredTimeoutMs = GetDetailReadyTimeoutMs();
-        var timeoutFloorFromDwellMs = minDwellMs + CollectionTimeoutExtraBudgetMs;
-        return Math.Clamp(Math.Max(configuredTimeoutMs, timeoutFloorFromDwellMs), MinCollectionTimeoutMs, 10000);
-    }
-
-    private void StartRunFromFirstPage() {
-        ResetSession();
-        if (_runFromCollectedListings) {
-            var seeded = SeedPendingFromCollectedListings();
-            if (seeded == 0) {
-                CompleteRun("collected_batch_empty");
-                return;
-            }
-
-            _state = ScanState.SyncQueue;
-            _nextActionAtUtc = DateTime.UtcNow;
-            Plugin.Log.Debug($"DebugPfScanner: starting deferred batch run from collected listings (seeded_listings={seeded}).");
-            return;
-        }
-
-        var currentPageSeeded = SeedVisibleCandidatesFromCurrentPage();
-        _state = ScanState.SyncQueue;
-        _nextActionAtUtc = DateTime.UtcNow;
-        Plugin.Log.Debug($"DebugPfScanner: starting run from current PF page only (seeded_listings={currentPageSeeded}).");
     }
 
     private int SeedVisibleCandidatesFromCurrentPage() {
@@ -670,7 +407,7 @@ internal sealed class DebugPfScanner : IDisposable {
                 var listingId = (uint)rawListingId;
                 var seenAtUtc = now.AddMilliseconds(index);
                 var batchNumber = 1000 - index;
-                UpsertVisibleCandidate(new ListingCandidate(listingId, 0, seenAtUtc, batchNumber));
+                _stateMachine.UpsertVisibleCandidate(new DebugPfListingCandidate(listingId, 0, seenAtUtc, batchNumber));
                 seeded++;
             }
 
@@ -682,7 +419,7 @@ internal sealed class DebugPfScanner : IDisposable {
         return _plugin.GameGui.GetAddonByName("LookingForGroup", 1) != 0;
     }
 
-    private unsafe DetailSnapshot GetCurrentDetailSnapshot() {
+    private unsafe DebugPfDetailSnapshot GetCurrentDetailSnapshot() {
         if (_plugin.GameGui.GetAddonByName("LookingForGroupDetail", 1) == 0) {
             return default;
         }
@@ -704,7 +441,7 @@ internal sealed class DebugPfScanner : IDisposable {
             }
         }
 
-        return new DetailSnapshot(
+        return new DebugPfDetailSnapshot(
             detailed.ListingId,
             detailed.LeaderContentId,
             nonZeroMembers,
@@ -712,15 +449,26 @@ internal sealed class DebugPfScanner : IDisposable {
         );
     }
 
-    private readonly record struct DetailSnapshot(uint ListingId, ulong LeaderContentId, int NonZeroMembers, int TotalSlots);
-    private readonly record struct ListingCandidate(uint ListingId, ulong ContentId, DateTime SeenAtUtc, int BatchNumber);
-
-    private enum ScanState {
-        Idle,
-        SyncQueue,
-        OpenTarget,
-        WaitDetailReady,
-        WaitCollected,
-        Cooldown,
+    internal static bool ShouldRetryTargetAfterFailure(int attemptsMade, int configuredRetries) {
+        return DebugPfScanStateMachine.ShouldRetryTargetAfterFailure(attemptsMade, configuredRetries);
     }
+
+    internal static bool ShouldCompleteRunWhenNoReadyTarget(int pendingTargets, bool hasIncomingListings) {
+        return DebugPfScanStateMachine.ShouldCompleteRunWhenNoReadyTarget(pendingTargets, hasIncomingListings);
+    }
+
+    private AttemptLogState CaptureAttemptLogState() {
+        return new AttemptLogState(_stateMachine.LastAttemptListingId, _stateMachine.LastAttemptSuccess, _stateMachine.LastAttemptReason);
+    }
+
+    private void LogAttemptIfChanged(AttemptLogState before) {
+        var after = CaptureAttemptLogState();
+        if (after.Equals(before) || after.ListingId == 0) {
+            return;
+        }
+
+        Plugin.Log.Debug($"DebugPfScanner: listing={after.ListingId} success={after.Success} reason={after.Reason}");
+    }
+
+    private readonly record struct AttemptLogState(uint ListingId, bool Success, string Reason);
 }
