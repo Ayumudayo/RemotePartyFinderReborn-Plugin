@@ -107,6 +107,7 @@ public class FFLogsCollector : IDisposable
     private FFLogsSubmitBuffer SubmitBuffer { get; set; }
     private FFLogsWorkerPolicy WorkerPolicy { get; set; }
     private FFLogsLeaseAbandoner LeaseAbandoner { get; set; }
+    private FFLogsJobLeaseClient JobLeaseClient { get; set; }
     private IReadOnlyList<IDisposable> OwnedDisposables { get; set; } = [];
     private bool IsRunning { get; set; }
     private System.Threading.CancellationTokenSource Cts { get; set; } = new();
@@ -146,6 +147,7 @@ public class FFLogsCollector : IDisposable
             submitBuffer,
             workerPolicy,
             new FFLogsLeaseAbandoner(seams),
+            new FFLogsJobLeaseClient(seams),
             [],
             startWorker: false);
         return collector;
@@ -180,6 +182,7 @@ public class FFLogsCollector : IDisposable
             new FFLogsSubmitBuffer(),
             new FFLogsWorkerPolicy(plugin.Configuration, message => Plugin.Log.Warning(message), seams.TimeProvider),
             new FFLogsLeaseAbandoner(seams),
+            new FFLogsJobLeaseClient(seams),
             [ffLogsClient, httpClient],
             startWorker: true);
     }
@@ -206,6 +209,7 @@ public class FFLogsCollector : IDisposable
         FFLogsSubmitBuffer submitBuffer,
         FFLogsWorkerPolicy workerPolicy,
         FFLogsLeaseAbandoner leaseAbandoner,
+        FFLogsJobLeaseClient jobLeaseClient,
         IReadOnlyList<IDisposable> ownedDisposables,
         bool startWorker)
     {
@@ -220,6 +224,7 @@ public class FFLogsCollector : IDisposable
         SubmitBuffer = submitBuffer ?? throw new ArgumentNullException(nameof(submitBuffer));
         WorkerPolicy = workerPolicy ?? throw new ArgumentNullException(nameof(workerPolicy));
         LeaseAbandoner = leaseAbandoner ?? throw new ArgumentNullException(nameof(leaseAbandoner));
+        JobLeaseClient = jobLeaseClient ?? throw new ArgumentNullException(nameof(jobLeaseClient));
         OwnedDisposables = ownedDisposables ?? throw new ArgumentNullException(nameof(ownedDisposables));
         SubscribeFrameworkUpdate(OnUpdate);
         if (startWorker)
@@ -368,112 +373,26 @@ public class FFLogsCollector : IDisposable
                     continue;
                 }
 
-                // Get first enabled upload URL that is not circuit-broken and passes transport policy.
-                UploadUrl uploadUrl = null;
-                foreach (var candidate in Configuration.UploadUrls.Where(u => u.IsEnabled))
-                {
-                    if (candidate.FailureCount >= Configuration.CircuitBreakerFailureThreshold
-                        && (DateTime.UtcNow - candidate.LastFailureTime).TotalMinutes
-                            < Configuration.CircuitBreakerBreakDurationMinutes)
-                    {
-                        continue;
-                    }
-
-                    if (!IngestEndpointResolver.TryBuildEndpointUrl(candidate, string.Empty, out _))
-                    {
-                        continue;
-                    }
-
-                    uploadUrl = candidate;
-                    break;
-                }
-
-                if (uploadUrl == null)
-                {
-                    consecutiveFailures = 0;
-                    await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
-                    continue;
-                }
-
                 // 1. Request Work
-                if (!IngestEndpointResolver.TryBuildEndpointUrl(uploadUrl, "/contribute/fflogs/jobs", out var workUrl))
-                {
-                    consecutiveFailures = 0;
-                    await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
-                    continue;
-                }
-
-                if (uploadUrl.ShouldDeferProtectedEndpointRequest(
-                    ProtectedEndpointCapabilityKind.FflogsJobs))
-                {
-                    consecutiveFailures = 0;
-                    await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
-                    continue;
-                }
-
-                List<ParseJob> jobs = null;
-                
-                try 
-                {
-                    var workCapability = uploadUrl.TryGetProtectedEndpointCapability(
-                        ProtectedEndpointCapabilityKind.FflogsJobs,
-                        out var cachedCapability)
-                        ? cachedCapability
-                        : null;
-                    using var workRequest = IngestRequestFactory.CreateGetRequest(
-                        Configuration,
-                        workUrl,
-                        "/contribute/fflogs/jobs",
-                        workCapability
-                    );
-                    var response = await Seams.IngestHttpSender.SendAsync(workRequest, Cts.Token);
-                    if (response.IsSuccessStatusCode)
-                    {
-                        var json = await response.Content.ReadAsStringAsync(Cts.Token);
-                        jobs = JsonConvert.DeserializeObject<List<ParseJob>>(json);
-                        uploadUrl.FailureCount = 0;
-                    }
-                    else
-                    {
-                        // 404 or other error means server might not support this or is down
-                         // Log only if not 404 to avoid spam on old servers
-                        if (response.StatusCode != System.Net.HttpStatusCode.NotFound)
-                        {
-                            var isAuthFailure = response.StatusCode == System.Net.HttpStatusCode.Forbidden
-                                || response.StatusCode == System.Net.HttpStatusCode.Unauthorized;
-                            if (isAuthFailure)
-                            {
-                                uploadUrl.MarkProtectedEndpointCapabilitiesRequired();
-                                uploadUrl.InvalidateProtectedEndpointCapability(
-                                    ProtectedEndpointCapabilityKind.FflogsJobs);
-                            }
-                            else
-                            {
-                                hadTransientFailure = true;
-                                uploadUrl.FailureCount++;
-                                uploadUrl.LastFailureTime = DateTime.UtcNow;
-                            }
-                            if ((int)response.StatusCode == 429)
-                            {
-                                var retryAfter = IngestRequestFactory.ReadRetryAfterSeconds(response);
-                                if (retryAfter.HasValue)
-                                {
-                                    WarningLog($"FFLogsCollector: jobs endpoint rate limited, retry_after={retryAfter.Value}s");
-                                }
-                            }
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    hadTransientFailure = true;
-                    uploadUrl.FailureCount++;
-                    uploadUrl.LastFailureTime = DateTime.UtcNow;
-                    DebugLog($"Error requesting work: {ex.Message}");
-                }
+                var leaseAttempt = await JobLeaseClient.TryAcquireSessionAsync(
+                    Configuration,
+                    Cts.Token,
+                    WarningLog,
+                    DebugLog);
+                hadTransientFailure |= leaseAttempt.HadTransientFailure;
+                var leaseSession = leaseAttempt.Session;
+                var uploadUrl = leaseAttempt.SelectedUploadUrl;
+                var jobs = leaseSession?.Jobs;
 
                 if (jobs == null || jobs.Count == 0)
                 {
+                    if (uploadUrl == null)
+                    {
+                        consecutiveFailures = 0;
+                        await WorkerPolicy.DelayAsync(WorkerPolicy.WorkerBaseDelayMs, Cts.Token);
+                        continue;
+                    }
+
                     if (hadTransientFailure)
                     {
                         consecutiveFailures = await WorkerPolicy.DelayWithBackoffAsync(consecutiveFailures, Cts.Token);
