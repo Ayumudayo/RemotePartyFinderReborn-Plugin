@@ -161,6 +161,17 @@ public sealed class PartyDetailCollectorCaptureTests {
         Assert.Equal(1L, state.LastConsumedGeneration);
     }
 
+    [Fact]
+    public void Runtime_and_collector_keep_the_same_shared_capture_state_instance() {
+        var state = new PartyDetailCaptureState();
+        using var runtime = new FakePartyDetailCaptureRuntime(state);
+        var harness = new CollectorHarness(state);
+        var collector = harness.CreateCollector();
+
+        Assert.Same(state, runtime.CaptureState);
+        Assert.Same(state, collector.CaptureState);
+    }
+
     private static UploadablePartyDetail CreateCompleteSnapshot() {
         return new UploadablePartyDetail {
             ListingId = 9001U,
@@ -246,6 +257,8 @@ public sealed class PartyDetailCollectorCaptureTests {
         internal void Tick(UploadablePartyDetail? snapshot) {
             _runtime.TestFrameworkTick(snapshot);
         }
+
+        internal PartyDetailCaptureState CaptureState => _runtime.CaptureState;
 
         public void Dispose() {
             _runtime.Dispose();
