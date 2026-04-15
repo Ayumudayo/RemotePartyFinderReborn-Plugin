@@ -194,8 +194,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         ObserveFrameworkTick(TryBuildSnapshotFromAgent(out var snapshot) ? snapshot : null);
     }
 
-    internal void TestObservePopulatedSnapshot(UploadablePartyDetail snapshot) {
-        ArgumentNullException.ThrowIfNull(snapshot);
+    internal void TestObservePopulationEvent() {
         RaisePostRequestPopulationSignal();
     }
 

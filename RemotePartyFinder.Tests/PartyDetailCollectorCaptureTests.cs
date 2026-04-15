@@ -56,12 +56,12 @@ public sealed class PartyDetailCollectorCaptureTests {
         var snapshot = CreateCompleteSnapshot();
 
         runtime.BeginManualCycle(9001U, 44UL);
-        runtime.ObservePopulatedSnapshot(snapshot);
+        runtime.ObservePopulationEvent();
         runtime.Tick(snapshot);
         collector.Update();
 
         runtime.BeginManualCycle(9001U, 44UL);
-        runtime.ObservePopulatedSnapshot(snapshot);
+        runtime.ObservePopulationEvent();
         runtime.Tick(snapshot);
         collector.Update();
 
@@ -86,7 +86,7 @@ public sealed class PartyDetailCollectorCaptureTests {
         Assert.Empty(harness.CapturedPayloads);
         Assert.Equal(0L, state.LastConsumedGeneration);
 
-        runtime.ObservePopulatedSnapshot(snapshot);
+        runtime.ObservePopulationEvent();
         collector.Update();
 
         Assert.Empty(harness.CapturedPayloads);
@@ -108,7 +108,7 @@ public sealed class PartyDetailCollectorCaptureTests {
         var snapshot = CreateCompleteSnapshot();
 
         runtime.BeginManualCycle(9001U, 44UL);
-        runtime.ObservePopulatedSnapshot(snapshot);
+        runtime.ObservePopulationEvent();
         collector.Update();
 
         Assert.Empty(harness.CapturedPayloads);
@@ -131,7 +131,7 @@ public sealed class PartyDetailCollectorCaptureTests {
         var completeSnapshot = CreateCompleteSnapshot();
 
         runtime.BeginManualCycle(9001U, 44UL);
-        runtime.ObservePopulatedSnapshot(incompleteSnapshot);
+        runtime.ObservePopulationEvent();
         runtime.Tick(incompleteSnapshot);
         collector.Update();
 
@@ -223,8 +223,8 @@ public sealed class PartyDetailCollectorCaptureTests {
             _runtime.TestBeginManualRequestCycle(listingId, contentId);
         }
 
-        internal void ObservePopulatedSnapshot(UploadablePartyDetail snapshot) {
-            _runtime.TestObservePopulatedSnapshot(snapshot);
+        internal void ObservePopulationEvent() {
+            _runtime.TestObservePopulationEvent();
         }
 
         internal void Tick(UploadablePartyDetail? snapshot) {
