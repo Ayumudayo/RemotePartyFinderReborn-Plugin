@@ -6,6 +6,19 @@ using Dalamud.Plugin.Services;
 
 namespace RemotePartyFinder;
 
+internal enum PartyDetailScannerAttemptOutcome {
+    OpenFailed,
+    TimedOut,
+    Succeeded,
+}
+
+internal interface IPartyDetailCaptureHookFactory {
+    IDisposable CreateHooks(
+        Func<nint, ulong, bool> openListingDetour,
+        Func<nint, ulong, bool> openListingByContentIdDetour
+    );
+}
+
 internal sealed class PartyDetailCaptureRuntime : IDisposable {
     private const string OpenListingSignature =
         "48 89 5C 24 ?? 57 48 83 EC ?? 48 8B FA 48 8B D9 E8 ?? ?? ?? ?? 48 8B 8B ?? ?? ?? ?? 48 85 C9";
@@ -14,12 +27,9 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
 
     private readonly PartyDetailCaptureState _state;
     private readonly object _gate = new();
-    private Hook<OpenListingDelegate>? _openListingHook;
-    private Hook<OpenListingByContentIdDelegate>? _openListingByContentIdHook;
-    private ScannerArm? _currentScannerArm;
-
-    private delegate bool OpenListingDelegate(nint agent, ulong listingId);
-    private delegate bool OpenListingByContentIdDelegate(nint agent, ulong contentId);
+    private IDisposable? _hookScope;
+    private ScannerAttempt? _scannerAttempt;
+    private ActiveScannerIntercept? _activeScannerIntercept;
 
     internal PartyDetailCaptureRuntime(PartyDetailCaptureState state) {
         _state = state ?? throw new ArgumentNullException(nameof(state));
@@ -29,81 +39,104 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         PartyDetailCaptureState state,
         IGameInteropProvider interopProvider,
         Action<string>? warningSink = null
+    ) : this(state, new DalamudPartyDetailCaptureHookFactory(interopProvider), warningSink) {
+    }
+
+    private PartyDetailCaptureRuntime(
+        PartyDetailCaptureState state,
+        IPartyDetailCaptureHookFactory hookFactory,
+        Action<string>? warningSink = null
     ) : this(state) {
-        ArgumentNullException.ThrowIfNull(interopProvider);
+        ArgumentNullException.ThrowIfNull(hookFactory);
 
         try {
-            _openListingHook = interopProvider.HookFromSignature<OpenListingDelegate>(
-                OpenListingSignature,
-                OpenListingDetour
-            );
-            _openListingByContentIdHook = interopProvider.HookFromSignature<OpenListingByContentIdDelegate>(
-                OpenListingByContentIdSignature,
-                OpenListingByContentIdDetour
-            );
-            _openListingHook.Enable();
-            _openListingByContentIdHook.Enable();
+            _hookScope = hookFactory.CreateHooks(OpenListingDetour, OpenListingByContentIdDetour);
         } catch (Exception exception) {
             warningSink?.Invoke($"PartyDetailCaptureRuntime: failed to initialize hooks. {exception.Message}");
-            Dispose();
-            throw;
+            _hookScope = null;
         }
     }
 
+    internal static PartyDetailCaptureRuntime CreateForTesting(
+        PartyDetailCaptureState state,
+        IPartyDetailCaptureHookFactory hookFactory,
+        Action<string>? warningSink = null
+    ) {
+        return new PartyDetailCaptureRuntime(state, hookFactory, warningSink);
+    }
+
     public void Dispose() {
-        _openListingHook?.Dispose();
-        _openListingHook = null;
-        _openListingByContentIdHook?.Dispose();
-        _openListingByContentIdHook = null;
+        _hookScope?.Dispose();
+        _hookScope = null;
 
         lock (_gate) {
-            _currentScannerArm = null;
+            _scannerAttempt = null;
+            _activeScannerIntercept = null;
         }
     }
 
     public void ArmScannerRequest(Guid attemptId, uint listingId, ulong contentId) {
         lock (_gate) {
-            if (_currentScannerArm is { AttemptId: var armedAttemptId } existing && armedAttemptId == attemptId) {
-                _currentScannerArm = existing with {
+            if (_scannerAttempt is { AttemptId: var existingAttemptId } existing && existingAttemptId == attemptId) {
+                _scannerAttempt = existing with {
                     ListingId = listingId,
                     ContentId = contentId,
                 };
                 return;
             }
 
-            _currentScannerArm = new ScannerArm(attemptId, listingId, contentId, null);
+            _scannerAttempt = new ScannerAttempt(attemptId, listingId, contentId, null);
         }
     }
 
     public long? GetArmedScannerRequestSerial(Guid attemptId) {
         lock (_gate) {
-            return _currentScannerArm is { AttemptId: var armedAttemptId } arm && armedAttemptId == attemptId
-                ? arm.RequestSerial
+            return _scannerAttempt is { AttemptId: var armedAttemptId } attempt && armedAttemptId == attemptId
+                ? attempt.RequestSerial
                 : null;
+        }
+    }
+
+    internal void BeginScannerOpenAttempt(Guid attemptId) {
+        lock (_gate) {
+            if (_scannerAttempt is not { AttemptId: var armedAttemptId } attempt || armedAttemptId != attemptId) {
+                return;
+            }
+
+            _activeScannerIntercept = new ActiveScannerIntercept(attempt.AttemptId, attempt.ListingId, attempt.ContentId);
+        }
+    }
+
+    internal void EndScannerOpenAttempt(Guid attemptId) {
+        lock (_gate) {
+            if (_activeScannerIntercept is { AttemptId: var activeAttemptId } && activeAttemptId == attemptId) {
+                _activeScannerIntercept = null;
+            }
         }
     }
 
     internal void ClearScannerRequest(Guid attemptId) {
         lock (_gate) {
-            if (_currentScannerArm is { AttemptId: var armedAttemptId } && armedAttemptId == attemptId) {
-                _currentScannerArm = null;
+            if (_scannerAttempt is { AttemptId: var armedAttemptId } && armedAttemptId == attemptId) {
+                _scannerAttempt = null;
+            }
+
+            if (_activeScannerIntercept is { AttemptId: var activeAttemptId } && activeAttemptId == attemptId) {
+                _activeScannerIntercept = null;
             }
         }
     }
 
-    internal void CompleteScannerRequest(Guid attemptId, bool success, string reason) {
-        ArgumentException.ThrowIfNullOrEmpty(reason);
-
-        if (!ShouldClearScannerRequest(success, reason)) {
-            return;
+    internal void CompleteScannerRequest(Guid attemptId, PartyDetailScannerAttemptOutcome outcome) {
+        if (ShouldClearScannerRequest(outcome)) {
+            ClearScannerRequest(attemptId);
         }
-
-        ClearScannerRequest(attemptId);
     }
 
     internal void ResetScannerRequest() {
         lock (_gate) {
-            _currentScannerArm = null;
+            _scannerAttempt = null;
+            _activeScannerIntercept = null;
         }
     }
 
@@ -118,25 +151,28 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
 
     private bool OpenListingDetour(nint agent, ulong listingId) {
         EnsureRequestCycleForIntercept(NormalizeListingId(listingId), 0UL);
-        return _openListingHook?.Original(agent, listingId) ?? false;
+        return true;
     }
 
     private bool OpenListingByContentIdDetour(nint agent, ulong contentId) {
         EnsureRequestCycleForIntercept(0U, contentId);
-        return _openListingByContentIdHook?.Original(agent, contentId) ?? false;
+        return true;
     }
 
     private void EnsureRequestCycleForIntercept(uint listingId, ulong contentId) {
         lock (_gate) {
-            if (_currentScannerArm is { } arm && IsCompatibleArm(arm, listingId, contentId)) {
-                if (!arm.RequestSerial.HasValue) {
+            if (_scannerAttempt is { } attempt
+                && _activeScannerIntercept is { } activeIntercept
+                && activeIntercept.AttemptId == attempt.AttemptId
+                && IsCompatible(activeIntercept.ListingId, activeIntercept.ContentId, listingId, contentId)) {
+                if (!attempt.RequestSerial.HasValue) {
                     var cycle = _state.BeginRequest(
                         PartyDetailRequestOwner.Scanner,
-                        arm.ListingId != 0 ? arm.ListingId : listingId,
-                        arm.ContentId != 0 ? arm.ContentId : contentId
+                        attempt.ListingId != 0 ? attempt.ListingId : listingId,
+                        attempt.ContentId != 0 ? attempt.ContentId : contentId
                     );
 
-                    _currentScannerArm = arm with {
+                    _scannerAttempt = attempt with {
                         ListingId = cycle.ListingId,
                         ContentId = cycle.ContentId,
                         RequestSerial = cycle.RequestSerial,
@@ -154,21 +190,83 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         return listingId <= uint.MaxValue ? (uint)listingId : 0U;
     }
 
-    private static bool IsCompatibleArm(ScannerArm arm, uint listingId, ulong contentId) {
-        if (arm.ListingId != 0 && listingId != 0 && arm.ListingId != listingId) {
+    private static bool IsCompatible(uint armedListingId, ulong armedContentId, uint listingId, ulong contentId) {
+        if (armedListingId != 0 && listingId != 0 && armedListingId != listingId) {
             return false;
         }
 
-        if (arm.ContentId != 0 && contentId != 0 && arm.ContentId != contentId) {
+        if (armedContentId != 0 && contentId != 0 && armedContentId != contentId) {
             return false;
         }
 
         return true;
     }
 
-    private static bool ShouldClearScannerRequest(bool success, string reason) {
-        return success || reason.EndsWith("timeout", StringComparison.Ordinal);
+    private static bool ShouldClearScannerRequest(PartyDetailScannerAttemptOutcome outcome) {
+        return outcome switch {
+            PartyDetailScannerAttemptOutcome.OpenFailed => false,
+            PartyDetailScannerAttemptOutcome.TimedOut => true,
+            PartyDetailScannerAttemptOutcome.Succeeded => true,
+            _ => false,
+        };
     }
 
-    private sealed record ScannerArm(Guid AttemptId, uint ListingId, ulong ContentId, long? RequestSerial);
+    private sealed record ScannerAttempt(Guid AttemptId, uint ListingId, ulong ContentId, long? RequestSerial);
+    private sealed record ActiveScannerIntercept(Guid AttemptId, uint ListingId, ulong ContentId);
+
+    private sealed class DalamudPartyDetailCaptureHookFactory : IPartyDetailCaptureHookFactory {
+        private readonly IGameInteropProvider _interopProvider;
+
+        private delegate bool OpenListingDelegate(nint agent, ulong listingId);
+        private delegate bool OpenListingByContentIdDelegate(nint agent, ulong contentId);
+
+        internal DalamudPartyDetailCaptureHookFactory(IGameInteropProvider interopProvider) {
+            _interopProvider = interopProvider ?? throw new ArgumentNullException(nameof(interopProvider));
+        }
+
+        public IDisposable CreateHooks(
+            Func<nint, ulong, bool> openListingDetour,
+            Func<nint, ulong, bool> openListingByContentIdDetour
+        ) {
+            ArgumentNullException.ThrowIfNull(openListingDetour);
+            ArgumentNullException.ThrowIfNull(openListingByContentIdDetour);
+
+            Hook<OpenListingDelegate>? openListingHook = null;
+            Hook<OpenListingByContentIdDelegate>? openListingByContentIdHook = null;
+
+            openListingHook = _interopProvider.HookFromSignature<OpenListingDelegate>(
+                OpenListingSignature,
+                (agent, listingId) => {
+                    _ = openListingDetour(agent, listingId);
+                    return openListingHook!.Original(agent, listingId);
+                }
+            );
+            openListingByContentIdHook = _interopProvider.HookFromSignature<OpenListingByContentIdDelegate>(
+                OpenListingByContentIdSignature,
+                (agent, contentId) => {
+                    _ = openListingByContentIdDetour(agent, contentId);
+                    return openListingByContentIdHook!.Original(agent, contentId);
+                }
+            );
+
+            openListingHook.Enable();
+            openListingByContentIdHook.Enable();
+            return new HookScope(openListingHook, openListingByContentIdHook);
+        }
+    }
+
+    private sealed class HookScope : IDisposable {
+        private readonly IDisposable _openListingHook;
+        private readonly IDisposable _openListingByContentIdHook;
+
+        internal HookScope(IDisposable openListingHook, IDisposable openListingByContentIdHook) {
+            _openListingHook = openListingHook;
+            _openListingByContentIdHook = openListingByContentIdHook;
+        }
+
+        public void Dispose() {
+            _openListingByContentIdHook.Dispose();
+            _openListingHook.Dispose();
+        }
+    }
 }

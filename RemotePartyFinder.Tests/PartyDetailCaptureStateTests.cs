@@ -23,7 +23,9 @@ public sealed class PartyDetailCaptureStateTests {
         var attemptId = Guid.NewGuid();
 
         runtime.ArmScannerRequest(attemptId, listingId: 9001U, contentId: 44UL);
+        runtime.BeginScannerOpenAttempt(attemptId);
         runtime.RaiseOpenListing(listingId: 9001U, contentId: 44UL);
+        runtime.EndScannerOpenAttempt(attemptId);
 
         Assert.Equal(PartyDetailRequestOwner.Scanner, state.CurrentOwner);
         Assert.Equal(9001U, state.CurrentListingId);
@@ -37,10 +39,12 @@ public sealed class PartyDetailCaptureStateTests {
         var attemptId = Guid.NewGuid();
 
         runtime.ArmScannerRequest(attemptId, listingId: 9001U, contentId: 44UL);
+        runtime.BeginScannerOpenAttempt(attemptId);
         runtime.RaiseOpenListing(listingId: 9001U, contentId: 44UL);
         var firstRequestSerial = state.CurrentRequestSerial;
 
         runtime.RaiseOpenListingByContentId(contentId: 44UL);
+        runtime.EndScannerOpenAttempt(attemptId);
 
         Assert.Equal(firstRequestSerial, state.CurrentRequestSerial);
         Assert.Equal(firstRequestSerial, runtime.GetArmedScannerRequestSerial(attemptId));
@@ -48,18 +52,21 @@ public sealed class PartyDetailCaptureStateTests {
     }
 
     [Fact]
-    public void Armed_scanner_open_failed_does_not_clear_arm() {
+    public void Later_manual_open_of_same_listing_is_not_misclassified_as_scanner() {
         var state = new PartyDetailCaptureState();
         using var runtime = new FakePartyDetailCaptureRuntime(state);
         var attemptId = Guid.NewGuid();
 
         runtime.ArmScannerRequest(attemptId, listingId: 9001U, contentId: 44UL);
+        runtime.BeginScannerOpenAttempt(attemptId);
         runtime.RaiseOpenListing(listingId: 9001U, contentId: 44UL);
-        var requestSerial = state.CurrentRequestSerial;
+        runtime.EndScannerOpenAttempt(attemptId);
+        var scannerRequestSerial = state.CurrentRequestSerial;
 
-        runtime.CompleteScannerAttempt(attemptId, success: false, reason: "open_failed");
+        runtime.RaiseOpenListing(listingId: 9001U, contentId: 44UL);
 
-        Assert.Equal(requestSerial, runtime.GetArmedScannerRequestSerial(attemptId));
+        Assert.NotEqual(scannerRequestSerial, state.CurrentRequestSerial);
+        Assert.Equal(PartyDetailRequestOwner.Manual, state.CurrentOwner);
     }
 
     [Fact]
@@ -69,11 +76,47 @@ public sealed class PartyDetailCaptureStateTests {
         var attemptId = Guid.NewGuid();
 
         runtime.ArmScannerRequest(attemptId, listingId: 9001U, contentId: 44UL);
+        runtime.BeginScannerOpenAttempt(attemptId);
         runtime.RaiseOpenListing(listingId: 9001U, contentId: 44UL);
+        runtime.EndScannerOpenAttempt(attemptId);
 
-        runtime.CompleteScannerAttempt(attemptId, success: false, reason: "detail_timeout");
+        runtime.CompleteScannerAttempt(attemptId, PartyDetailScannerAttemptOutcome.TimedOut);
 
         Assert.Null(runtime.GetArmedScannerRequestSerial(attemptId));
+    }
+
+    [Fact]
+    public void Armed_scanner_open_failed_keeps_attempt_request_serial() {
+        var state = new PartyDetailCaptureState();
+        using var runtime = new FakePartyDetailCaptureRuntime(state);
+        var attemptId = Guid.NewGuid();
+
+        runtime.ArmScannerRequest(attemptId, listingId: 9001U, contentId: 44UL);
+        runtime.BeginScannerOpenAttempt(attemptId);
+        runtime.RaiseOpenListing(listingId: 9001U, contentId: 44UL);
+        runtime.EndScannerOpenAttempt(attemptId);
+        var requestSerial = state.CurrentRequestSerial;
+
+        runtime.CompleteScannerAttempt(attemptId, PartyDetailScannerAttemptOutcome.OpenFailed);
+
+        Assert.Equal(requestSerial, runtime.GetArmedScannerRequestSerial(attemptId));
+    }
+
+    [Fact]
+    public void Hook_initialization_failure_degrades_to_passive_mode() {
+        var state = new PartyDetailCaptureState();
+        var warnings = new List<string>();
+        using var runtime = new FakePartyDetailCaptureRuntime(
+            state,
+            new ThrowingHookFactory(),
+            warnings.Add
+        );
+
+        runtime.RaiseOpenListing(listingId: 9001U, contentId: 44UL);
+
+        Assert.Equal(PartyDetailRequestOwner.Manual, state.CurrentOwner);
+        Assert.Single(warnings);
+        Assert.Contains("failed to initialize hooks", warnings[0], StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -179,12 +222,28 @@ public sealed class PartyDetailCaptureStateTests {
             _runtime = new PartyDetailCaptureRuntime(state);
         }
 
+        internal FakePartyDetailCaptureRuntime(
+            PartyDetailCaptureState state,
+            IPartyDetailCaptureHookFactory hookFactory,
+            Action<string> warningSink
+        ) {
+            _runtime = PartyDetailCaptureRuntime.CreateForTesting(state, hookFactory, warningSink);
+        }
+
         internal void ArmScannerRequest(Guid attemptId, uint listingId, ulong contentId) {
             _runtime.ArmScannerRequest(attemptId, listingId, contentId);
         }
 
         internal long? GetArmedScannerRequestSerial(Guid attemptId) {
             return _runtime.GetArmedScannerRequestSerial(attemptId);
+        }
+
+        internal void BeginScannerOpenAttempt(Guid attemptId) {
+            _runtime.BeginScannerOpenAttempt(attemptId);
+        }
+
+        internal void EndScannerOpenAttempt(Guid attemptId) {
+            _runtime.EndScannerOpenAttempt(attemptId);
         }
 
         internal void RaiseOpenListing(uint listingId, ulong contentId) {
@@ -195,12 +254,21 @@ public sealed class PartyDetailCaptureStateTests {
             _runtime.TestInterceptOpenListingByContentId(contentId);
         }
 
-        internal void CompleteScannerAttempt(Guid attemptId, bool success, string reason) {
-            _runtime.CompleteScannerRequest(attemptId, success, reason);
+        internal void CompleteScannerAttempt(Guid attemptId, PartyDetailScannerAttemptOutcome outcome) {
+            _runtime.CompleteScannerRequest(attemptId, outcome);
         }
 
         public void Dispose() {
             // Tests construct the runtime without Dalamud hook initialization.
+        }
+    }
+
+    private sealed class ThrowingHookFactory : IPartyDetailCaptureHookFactory {
+        public IDisposable CreateHooks(
+            Func<nint, ulong, bool> openListingDetour,
+            Func<nint, ulong, bool> openListingByContentIdDetour
+        ) {
+            throw new InvalidOperationException("simulated signature drift");
         }
     }
 }

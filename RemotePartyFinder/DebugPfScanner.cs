@@ -276,11 +276,16 @@ internal sealed class DebugPfScanner : IDisposable {
         }
 
         ArmCaptureRequest(target);
-        if (agent->OpenListing(target.ListingId)) {
-            return true;
-        }
+        _detailCaptureRuntime.BeginScannerOpenAttempt(_currentCaptureAttemptId);
+        try {
+            if (agent->OpenListing(target.ListingId)) {
+                return true;
+            }
 
-        return target.ContentId != 0 && agent->OpenListingByContentId(target.ContentId);
+            return target.ContentId != 0 && agent->OpenListingByContentId(target.ContentId);
+        } finally {
+            _detailCaptureRuntime.EndScannerOpenAttempt(_currentCaptureAttemptId);
+        }
     }
 
     private void WaitDetailReady() {
@@ -480,7 +485,10 @@ internal sealed class DebugPfScanner : IDisposable {
         }
 
         if (_currentCaptureAttemptId != Guid.Empty && _currentCaptureAttemptListingId == after.ListingId) {
-            _detailCaptureRuntime.CompleteScannerRequest(_currentCaptureAttemptId, after.Success, after.Reason);
+            if (TryMapScannerAttemptOutcome(after, out var outcome)) {
+                _detailCaptureRuntime.CompleteScannerRequest(_currentCaptureAttemptId, outcome);
+            }
+
             if (_detailCaptureRuntime.GetArmedScannerRequestSerial(_currentCaptureAttemptId) is null) {
                 _currentCaptureAttemptId = Guid.Empty;
                 _currentCaptureAttemptListingId = 0;
@@ -508,6 +516,20 @@ internal sealed class DebugPfScanner : IDisposable {
 
         _currentCaptureAttemptId = Guid.Empty;
         _currentCaptureAttemptListingId = 0;
+    }
+
+    private static bool TryMapScannerAttemptOutcome(AttemptLogState attempt, out PartyDetailScannerAttemptOutcome outcome) {
+        outcome = attempt.Reason switch {
+            "queued" => PartyDetailScannerAttemptOutcome.Succeeded,
+            "collected" => PartyDetailScannerAttemptOutcome.Succeeded,
+            "listing_missing" => PartyDetailScannerAttemptOutcome.Succeeded,
+            "detail_timeout" => PartyDetailScannerAttemptOutcome.TimedOut,
+            "collector_timeout" => PartyDetailScannerAttemptOutcome.TimedOut,
+            "open_failed" => PartyDetailScannerAttemptOutcome.OpenFailed,
+            _ => default,
+        };
+
+        return attempt.Reason is "queued" or "collected" or "listing_missing" or "detail_timeout" or "collector_timeout" or "open_failed";
     }
 
     private readonly record struct AttemptLogState(uint ListingId, bool Success, string Reason);
