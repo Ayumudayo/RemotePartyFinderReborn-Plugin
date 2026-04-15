@@ -162,7 +162,8 @@ public class Plugin : IDalamudPlugin {
                              ?? new PartyDetailCaptureRuntime(
                                  captureState,
                                  plugin.GameInteropProvider,
-                                 warningSink
+                                 warningSink,
+                                 ScannerHeadlessBackendKind.NativeSuppression
                              );
         var collector = collectorFactory?.Invoke(captureState)
                         ?? new PartyDetailCollector(

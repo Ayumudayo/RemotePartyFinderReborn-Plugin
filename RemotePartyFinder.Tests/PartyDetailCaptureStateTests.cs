@@ -389,7 +389,8 @@ public sealed class PartyDetailCaptureStateTests {
         public IDisposable CreateHooks(
             Func<nint, ulong, bool> openListingDetour,
             Func<nint, ulong, bool> openListingByContentIdDetour,
-            Action<nint, nint> populateListingDataDetour
+            Action<nint, nint> populateListingDataDetour,
+            Func<nint, uint, nint, nint, nint, nint, ushort, int, bool> pfDetailOpenDetour
         ) {
             throw new InvalidOperationException("simulated signature drift");
         }

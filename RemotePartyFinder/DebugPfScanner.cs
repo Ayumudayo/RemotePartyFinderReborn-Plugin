@@ -292,6 +292,16 @@ internal sealed class DebugPfScanner : IDisposable {
 
     private void WaitDetailReady() {
         var beforeAttempt = CaptureAttemptLogState();
+        if (TryCompleteHeadlessConsumedAck(
+                _stateMachine,
+                _plugin.PartyDetailCaptureState,
+                DateTime.UtcNow,
+                _plugin.Configuration.AutoDetailScanPostListingCooldownMs
+            )) {
+            LogAttemptIfChanged(beforeAttempt);
+            return;
+        }
+
         _stateMachine.HandleDetailReadyState(
             DateTime.UtcNow,
             GetCurrentDetailSnapshot(),
@@ -462,6 +472,28 @@ internal sealed class DebugPfScanner : IDisposable {
             nonZeroMembers,
             totalSlots
         );
+    }
+
+    internal static bool TryCompleteHeadlessConsumedAck(
+        DebugPfScanStateMachine stateMachine,
+        PartyDetailCaptureState captureState,
+        DateTime nowUtc,
+        int postListingCooldownMs
+    ) {
+        ArgumentNullException.ThrowIfNull(stateMachine);
+        ArgumentNullException.ThrowIfNull(captureState);
+
+        var target = stateMachine.CurrentTarget;
+        if (target.ListingId == 0 || stateMachine.CurrentRequestSerial is not { } requestSerial) {
+            return false;
+        }
+
+        if (!captureState.IsScannerConsumedAckReady(requestSerial, target.ListingId, target.ContentId)) {
+            return false;
+        }
+
+        stateMachine.HandleCollectedState(nowUtc, hasConsumedAck: true, postListingCooldownMs);
+        return true;
     }
 
     internal static bool ShouldRetryTargetAfterFailure(int attemptsMade, int configuredRetries) {

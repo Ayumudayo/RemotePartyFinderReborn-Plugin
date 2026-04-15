@@ -24,7 +24,8 @@ internal interface IPartyDetailCaptureHookFactory {
     IDisposable CreateHooks(
         Func<nint, ulong, bool> openListingDetour,
         Func<nint, ulong, bool> openListingByContentIdDetour,
-        Action<nint, nint> populateListingDataDetour
+        Action<nint, nint> populateListingDataDetour,
+        Func<nint, uint, nint, nint, nint, nint, ushort, int, bool> pfDetailOpenDetour
     );
 }
 
@@ -33,6 +34,9 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         "48 89 5C 24 ?? 57 48 83 EC ?? 48 8B FA 48 8B D9 E8 ?? ?? ?? ?? 48 8B 8B ?? ?? ?? ?? 48 85 C9";
     private const string OpenListingByContentIdSignature =
         "40 53 48 83 EC 20 48 8B D9 E8 ?? ?? ?? ?? 84 C0 74 07 C6 83 ?? ?? ?? ?? ?? 48 83 C4 20 5B C3 CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC 40 53";
+    private const string OpenAddonSignature =
+        "4C 89 4C 24 20 44 89 44 24 18 53 55 56 57 41 57 48 81 EC ?? ?? ?? ?? 80 B9 ?? ?? ?? ?? ?? 48 8B F9 8B B4 24 ?? ?? ?? ?? 8B DA";
+    private const uint PfDetailAddonId = 275U;
     private readonly PartyDetailCaptureState _state;
     private readonly object _gate = new();
     private readonly ScannerHeadlessBackendKind _scannerHeadlessBackendKind;
@@ -44,11 +48,9 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     private RequestPopulationGate? _requestPopulationGate;
     internal PartyDetailCaptureState CaptureState => _state;
 
-    // Scanner-owned PF detail UI suppression remains deferred. The shared
-    // PopulateCorrelation boundary is in place for scanner-owned arrivals, but
-    // the current PF-specific addon opener candidate (sub_14053DE30) is too
-    // broad because it mutates agent/UI state around PopulateListingData in
-    // addition to opening the detail addon.
+    // Scanner-owned PF detail UI suppression is gated on the unique addon-275
+    // OpenAddon seam. Manual request cycles still flow through the shared
+    // request/populate/capture path unchanged.
 
     internal PartyDetailCaptureRuntime(
         PartyDetailCaptureState state,
@@ -75,7 +77,12 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         ArgumentNullException.ThrowIfNull(hookFactory);
 
         try {
-            _hookScope = hookFactory.CreateHooks(OpenListingDetour, OpenListingByContentIdDetour, PopulateListingDataDetour);
+            _hookScope = hookFactory.CreateHooks(
+                OpenListingDetour,
+                OpenListingByContentIdDetour,
+                PopulateListingDataDetour,
+                PfDetailOpenDetour
+            );
         } catch (Exception exception) {
             warningSink?.Invoke($"PartyDetailCaptureRuntime: failed to initialize hooks. {exception.Message}");
             _hookScope = null;
@@ -119,7 +126,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
             secondaryHook = createSecondaryHook();
             enablePrimaryHook(primaryHook);
             enableSecondaryHook(secondaryHook);
-            return new HookScope(primaryHook, secondaryHook);
+            return new DualHookScope(primaryHook, secondaryHook);
         } catch {
             secondaryHook?.Dispose();
             primaryHook?.Dispose();
@@ -341,6 +348,43 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         RaisePostRequestPopulationSignal();
     }
 
+    private bool PfDetailOpenDetour(
+        nint raptureAtkModule,
+        uint addonId,
+        nint valueCount,
+        nint atkValues,
+        nint parentAgent,
+        nint unk,
+        ushort addonRowId,
+        int openFlags
+    ) {
+        _ = raptureAtkModule;
+        _ = valueCount;
+        _ = atkValues;
+        _ = parentAgent;
+        _ = unk;
+        _ = addonRowId;
+        _ = openFlags;
+        var suppress = ShouldSuppressScannerPfDetailOpen(addonId);
+
+        if (Plugin.Log is not null && (addonId == PfDetailAddonId || _scannerAttempt is not null)) {
+            Plugin.Log.Debug(
+                "PartyDetailCaptureRuntime: pf_detail_open addon={AddonId} suppress={Suppress} backend={Backend} currentOwner={CurrentOwner} currentSerial={CurrentSerial} armedSerial={ArmedSerial} allowHeadless={AllowHeadless} listing={ListingId} content={ContentId}",
+                addonId,
+                suppress,
+                _scannerHeadlessBackendKind,
+                _state.CurrentOwner?.ToString() ?? "none",
+                _state.CurrentRequestSerial?.ToString() ?? "none",
+                _scannerAttempt?.RequestSerial?.ToString() ?? "none",
+                _scannerAttempt?.AllowHeadless ?? false,
+                _scannerAttempt?.ListingId ?? 0U,
+                _scannerAttempt?.ContentId ?? 0UL
+            );
+        }
+
+        return !suppress;
+    }
+
     private void EnsureRequestCycleForIntercept(uint listingId, ulong contentId) {
         lock (_gate) {
             if (_scannerAttempt is { } attempt
@@ -512,6 +556,30 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         }
     }
 
+    private bool ShouldSuppressScannerPfDetailOpen(uint addonId) {
+        if (_scannerHeadlessBackendKind != ScannerHeadlessBackendKind.NativeSuppression || addonId != PfDetailAddonId) {
+            return false;
+        }
+
+        lock (_gate) {
+            if (_scannerAttempt is not { RequestSerial: var requestSerial, AllowHeadless: true } attempt || !requestSerial.HasValue) {
+                return false;
+            }
+
+            if (_state.CurrentRequestSerial != requestSerial.Value) {
+                return false;
+            }
+
+            if (!_state.TryGetCurrentRequestCycle(out var cycle)) {
+                return true;
+            }
+
+            return cycle.Owner == PartyDetailRequestOwner.Scanner
+                   && cycle.RequestSerial == requestSerial.Value
+                   && IsCompatible(attempt.ListingId, attempt.ContentId, cycle.ListingId, cycle.ContentId);
+        }
+    }
+
     private sealed record ScannerAttempt(Guid AttemptId, uint ListingId, ulong ContentId, long? RequestSerial, bool AllowHeadless);
     private sealed record ActiveScannerIntercept(Guid AttemptId, uint ListingId, ulong ContentId);
     private sealed record ActiveScannerHeadlessScope(Guid AttemptId, long RequestSerial, uint ListingId, ulong ContentId);
@@ -523,6 +591,16 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         private delegate bool OpenListingDelegate(nint agent, ulong listingId);
         private delegate bool OpenListingByContentIdDelegate(nint agent, ulong contentId);
         private delegate void PopulateListingDataDelegate(nint agent, nint listingData);
+        private delegate long OpenAddonDelegate(
+            nint raptureAtkModule,
+            uint addonId,
+            nint valueCount,
+            nint atkValues,
+            nint parentAgent,
+            nint unk,
+            ushort addonRowId,
+            int openFlags
+        );
 
         internal DalamudPartyDetailCaptureHookFactory(IGameInteropProvider interopProvider) {
             _interopProvider = interopProvider ?? throw new ArgumentNullException(nameof(interopProvider));
@@ -531,15 +609,18 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         public unsafe IDisposable CreateHooks(
             Func<nint, ulong, bool> openListingDetour,
             Func<nint, ulong, bool> openListingByContentIdDetour,
-            Action<nint, nint> populateListingDataDetour
+            Action<nint, nint> populateListingDataDetour,
+            Func<nint, uint, nint, nint, nint, nint, ushort, int, bool> pfDetailOpenDetour
         ) {
             ArgumentNullException.ThrowIfNull(openListingDetour);
             ArgumentNullException.ThrowIfNull(openListingByContentIdDetour);
             ArgumentNullException.ThrowIfNull(populateListingDataDetour);
+            ArgumentNullException.ThrowIfNull(pfDetailOpenDetour);
 
             Hook<OpenListingDelegate>? openListingHook = null;
             Hook<OpenListingByContentIdDelegate>? openListingByContentIdHook = null;
             Hook<PopulateListingDataDelegate>? populateListingDataHook = null;
+            Hook<OpenAddonDelegate>? openAddonHook = null;
             IDisposable? openListingHookScope = null;
 
             try {
@@ -572,8 +653,43 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
                     }
                 );
                 populateListingDataHook.Enable();
-                return new HookScope(openListingHookScope, populateListingDataHook);
+                openAddonHook = _interopProvider.HookFromSignature<OpenAddonDelegate>(
+                    OpenAddonSignature,
+                    (
+                        raptureAtkModule,
+                        addonId,
+                        valueCount,
+                        atkValues,
+                        parentAgent,
+                        unk,
+                        addonRowId,
+                        openFlags
+                    ) => pfDetailOpenDetour(
+                        raptureAtkModule,
+                        addonId,
+                        valueCount,
+                        atkValues,
+                        parentAgent,
+                        unk,
+                        addonRowId,
+                        openFlags
+                    )
+                        ? openAddonHook!.Original(
+                            raptureAtkModule,
+                            addonId,
+                            valueCount,
+                            atkValues,
+                            parentAgent,
+                            unk,
+                            addonRowId,
+                            openFlags
+                        )
+                        : 0L
+                );
+                openAddonHook.Enable();
+                return new HookScope(openListingHookScope, populateListingDataHook, openAddonHook);
             } catch {
+                openAddonHook?.Dispose();
                 populateListingDataHook?.Dispose();
                 openListingHookScope?.Dispose();
                 throw;
@@ -581,16 +697,34 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         }
     }
 
-    private sealed class HookScope : IDisposable {
-        private readonly IDisposable _openListingHookScope;
-        private readonly IDisposable _populateListingDataHook;
+    private sealed class DualHookScope : IDisposable {
+        private readonly IDisposable _primaryHook;
+        private readonly IDisposable _secondaryHook;
 
-        internal HookScope(IDisposable openListingHookScope, IDisposable populateListingDataHook) {
-            _openListingHookScope = openListingHookScope;
-            _populateListingDataHook = populateListingDataHook;
+        internal DualHookScope(IDisposable primaryHook, IDisposable secondaryHook) {
+            _primaryHook = primaryHook;
+            _secondaryHook = secondaryHook;
         }
 
         public void Dispose() {
+            _secondaryHook.Dispose();
+            _primaryHook.Dispose();
+        }
+    }
+
+    private sealed class HookScope : IDisposable {
+        private readonly IDisposable _openListingHookScope;
+        private readonly IDisposable _populateListingDataHook;
+        private readonly IDisposable _openAddonHook;
+
+        internal HookScope(IDisposable openListingHookScope, IDisposable populateListingDataHook, IDisposable openAddonHook) {
+            _openListingHookScope = openListingHookScope;
+            _populateListingDataHook = populateListingDataHook;
+            _openAddonHook = openAddonHook;
+        }
+
+        public void Dispose() {
+            _openAddonHook.Dispose();
             _populateListingDataHook.Dispose();
             _openListingHookScope.Dispose();
         }

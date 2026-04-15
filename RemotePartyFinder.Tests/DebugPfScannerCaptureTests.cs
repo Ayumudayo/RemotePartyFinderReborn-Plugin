@@ -46,6 +46,52 @@ public sealed class DebugPfScannerCaptureTests {
         Assert.Single(harness.CapturedPayloads);
     }
 
+    [Fact]
+    public void Headless_scanner_consumed_ack_completes_wait_detail_ready_without_visible_detail_addon() {
+        var nowUtc = new DateTime(2026, 4, 16, 3, 0, 0, DateTimeKind.Utc);
+        var target = new DebugPfListingCandidate(9001U, 44UL, nowUtc, 1);
+        var queue = new DebugPfListingQueue();
+        var stateMachine = new DebugPfScanStateMachine(queue);
+        var captureState = new PartyDetailCaptureState();
+        var request = captureState.BeginRequest(PartyDetailRequestOwner.Scanner, target.ListingId, target.ContentId);
+        var snapshot = CreateSnapshot(target.ListingId, target.ContentId);
+
+        stateMachine.UpsertVisibleCandidate(target);
+        Assert.Null(stateMachine.SyncQueue(
+            nowUtc,
+            [],
+            hasIncomingListings: false,
+            maxPerRun: 0,
+            dedupTtlSeconds: 600,
+            runFromCollectedListings: false
+        ));
+        Assert.Equal(DebugPfScanState.OpenTarget, stateMachine.State);
+
+        stateMachine.HandleOpenAttemptResult(
+            nowUtc,
+            opened: true,
+            actionIntervalMs: 400,
+            detailReadyTimeoutMs: 3500,
+            configuredRetries: 1,
+            postListingCooldownMs: 300,
+            request.RequestSerial
+        );
+        Assert.Equal(DebugPfScanState.WaitDetailReady, stateMachine.State);
+
+        Assert.True(captureState.TryRecordArrival(request.RequestSerial, snapshot));
+        Assert.True(captureState.TryMarkConsumed(captureState.LatestArrivalGeneration));
+
+        Assert.True(DebugPfScanner.TryCompleteHeadlessConsumedAck(
+            stateMachine,
+            captureState,
+            nowUtc.AddMilliseconds(10),
+            postListingCooldownMs: 300
+        ));
+        Assert.Equal(DebugPfScanState.Cooldown, stateMachine.State);
+        Assert.Equal("queued", stateMachine.LastAttemptReason);
+        Assert.True(stateMachine.LastAttemptSuccess);
+    }
+
     private static UploadablePartyDetail CreateSnapshot(uint listingId, ulong leaderContentId) {
         return new UploadablePartyDetail {
             ListingId = listingId,

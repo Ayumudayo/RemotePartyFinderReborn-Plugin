@@ -103,6 +103,95 @@ public sealed class PartyDetailCollectorCaptureTests {
     }
 
     [Fact]
+    public void Scanner_owned_request_suppresses_pf_detail_open_but_shared_population_still_captures_once() {
+        using var harness = new NativeSuppressionHarness();
+        var snapshot = CreateCompleteSnapshot();
+
+        harness.BeginScannerTarget(9001U, 44UL, allowHeadless: true);
+
+        Assert.True(harness.RaisePfDetailOpen());
+
+        harness.ObserveSharedPopulate();
+        harness.Tick(snapshot);
+        harness.UpdateCollector();
+
+        Assert.Equal(1, harness.PfDetailOpenInterceptCount);
+        Assert.Equal(0, harness.PfDetailOpenOriginalCallCount);
+        Assert.Single(harness.CapturedPayloads);
+        Assert.Equal(1L, harness.CaptureState.LastConsumedGeneration);
+    }
+
+    [Fact]
+    public void Scanner_attempt_continues_suppressing_repeated_pf_detail_open_until_attempt_completes() {
+        using var harness = new NativeSuppressionHarness();
+        var snapshot = CreateCompleteSnapshot();
+
+        harness.BeginScannerTarget(9001U, 44UL, allowHeadless: true);
+
+        Assert.True(harness.RaisePfDetailOpen());
+
+        harness.ObserveSharedPopulate();
+        harness.Tick(snapshot);
+        harness.UpdateCollector();
+
+        Assert.True(harness.RaisePfDetailOpen());
+
+        harness.CompleteScannerAttempt(PartyDetailScannerAttemptOutcome.Succeeded);
+
+        Assert.False(harness.RaisePfDetailOpen());
+        Assert.Equal(3, harness.PfDetailOpenInterceptCount);
+        Assert.Equal(1, harness.PfDetailOpenOriginalCallCount);
+    }
+
+    [Fact]
+    public void Newer_manual_request_is_not_suppressed_after_scanner_arrival_consumes_request_cycle() {
+        using var harness = new NativeSuppressionHarness();
+        var snapshot = CreateCompleteSnapshot();
+
+        harness.BeginScannerTarget(9001U, 44UL, allowHeadless: true);
+        Assert.True(harness.RaisePfDetailOpen());
+
+        harness.ObserveSharedPopulate();
+        harness.Tick(snapshot);
+        harness.UpdateCollector();
+
+        harness.BeginManualRequest(9002U, 55UL);
+
+        Assert.False(harness.RaisePfDetailOpen());
+        Assert.Equal(2, harness.PfDetailOpenInterceptCount);
+        Assert.Equal(1, harness.PfDetailOpenOriginalCallCount);
+    }
+
+    [Fact]
+    public void Manual_request_never_suppresses_pf_detail_open_and_shared_path_stays_intact() {
+        using var harness = new NativeSuppressionHarness();
+        var snapshot = CreateCompleteSnapshot();
+
+        harness.BeginManualRequest(9001U, 44UL);
+
+        Assert.False(harness.RaisePfDetailOpen());
+
+        harness.ObserveSharedPopulate();
+        harness.Tick(snapshot);
+        harness.UpdateCollector();
+
+        Assert.Equal(1, harness.PfDetailOpenInterceptCount);
+        Assert.Equal(1, harness.PfDetailOpenOriginalCallCount);
+        Assert.Single(harness.CapturedPayloads);
+        Assert.Equal(1L, harness.CaptureState.LastConsumedGeneration);
+    }
+
+    [Fact]
+    public void Scanner_request_with_allowHeadless_false_does_not_suppress_pf_detail_open() {
+        using var harness = new NativeSuppressionHarness();
+
+        harness.BeginScannerTarget(9001U, 44UL, allowHeadless: false);
+
+        Assert.False(harness.RaisePfDetailOpen());
+        Assert.Equal(1, harness.PfDetailOpenOriginalCallCount);
+    }
+
+    [Fact]
     public void ComposePartyDetailCapture_reuses_single_capture_state_for_runtime_and_collector() {
         var composition = Plugin.ComposePartyDetailCapture(
             plugin: null,
@@ -393,6 +482,120 @@ public sealed class PartyDetailCollectorCaptureTests {
                 MemberJobs = [.. payload.MemberJobs],
                 SlotFlags = [.. payload.SlotFlags],
             };
+        }
+    }
+
+    private sealed class NativeSuppressionHarness : IDisposable {
+        private readonly TrackingSuppressionHookFactory _hookFactory;
+        private readonly PartyDetailCaptureRuntime _runtime;
+        private readonly PartyDetailCollector _collector;
+        private readonly Guid _attemptId = Guid.NewGuid();
+
+        internal NativeSuppressionHarness() {
+            CaptureState = new PartyDetailCaptureState();
+            _hookFactory = new TrackingSuppressionHookFactory();
+            _runtime = PartyDetailCaptureRuntime.CreateForTesting(
+                CaptureState,
+                _hookFactory,
+                warningSink: null,
+                scannerHeadlessBackendKind: ScannerHeadlessBackendKind.NativeSuppression
+            );
+            _collector = new PartyDetailCollector(
+                CaptureState,
+                tryQueuePayload: payload => {
+                    CapturedPayloads.Add(ClonePayload(payload));
+                    return true;
+                },
+                pumpPendingUploads: static () => { }
+            );
+        }
+
+        internal PartyDetailCaptureState CaptureState { get; }
+        internal List<UploadablePartyDetail> CapturedPayloads { get; } = new();
+        internal int PfDetailOpenInterceptCount => _hookFactory.PfDetailOpenInterceptCount;
+        internal int PfDetailOpenOriginalCallCount => _hookFactory.PfDetailOpenOriginalCallCount;
+
+        internal void BeginScannerTarget(uint listingId, ulong contentId, bool allowHeadless = true) {
+            _runtime.ArmScannerRequest(_attemptId, listingId, contentId, allowHeadless);
+            _runtime.BeginScannerOpenAttempt(_attemptId);
+            _runtime.TestInterceptOpenListing(listingId, contentId);
+            _runtime.EndScannerOpenAttempt(_attemptId);
+        }
+
+        internal void BeginManualRequest(uint listingId, ulong contentId) {
+            _runtime.TestBeginManualRequestCycle(listingId, contentId);
+        }
+
+        internal void CompleteScannerAttempt(PartyDetailScannerAttemptOutcome outcome) {
+            _runtime.CompleteScannerRequest(_attemptId, outcome);
+        }
+
+        internal bool RaisePfDetailOpen() {
+            return _hookFactory.RaisePfDetailOpen();
+        }
+
+        internal void ObserveSharedPopulate() {
+            _runtime.TestObservePopulationEvent();
+        }
+
+        internal void Tick(UploadablePartyDetail snapshot) {
+            _runtime.TestFrameworkTick(snapshot);
+        }
+
+        internal void UpdateCollector() {
+            _collector.Update();
+        }
+
+        public void Dispose() {
+            _runtime.Dispose();
+        }
+
+        private static UploadablePartyDetail ClonePayload(UploadablePartyDetail payload) {
+            return new UploadablePartyDetail {
+                ListingId = payload.ListingId,
+                LeaderContentId = payload.LeaderContentId,
+                LeaderName = payload.LeaderName,
+                HomeWorld = payload.HomeWorld,
+                MemberContentIds = [.. payload.MemberContentIds],
+                MemberJobs = [.. payload.MemberJobs],
+                SlotFlags = [.. payload.SlotFlags],
+            };
+        }
+    }
+
+    private sealed class TrackingSuppressionHookFactory : IPartyDetailCaptureHookFactory, IDisposable {
+        private Func<nint, uint, nint, nint, nint, nint, ushort, int, bool>? _pfDetailOpenDetour;
+
+        internal int PfDetailOpenInterceptCount { get; private set; }
+        internal int PfDetailOpenOriginalCallCount { get; private set; }
+
+        public IDisposable CreateHooks(
+            Func<nint, ulong, bool> openListingDetour,
+            Func<nint, ulong, bool> openListingByContentIdDetour,
+            Action<nint, nint> populateListingDataDetour,
+            Func<nint, uint, nint, nint, nint, nint, ushort, int, bool> pfDetailOpenDetour
+        ) {
+            _ = openListingDetour;
+            _ = openListingByContentIdDetour;
+            _ = populateListingDataDetour;
+            _pfDetailOpenDetour = pfDetailOpenDetour;
+            return this;
+        }
+
+        internal bool RaisePfDetailOpen() {
+            ArgumentNullException.ThrowIfNull(_pfDetailOpenDetour);
+
+            PfDetailOpenInterceptCount++;
+            var allowOriginal = _pfDetailOpenDetour(0, 275U, 153, 0, 0, 2, 0, 4);
+            if (allowOriginal) {
+                PfDetailOpenOriginalCallCount++;
+                return false;
+            }
+
+            return true;
+        }
+
+        public void Dispose() {
         }
     }
 
