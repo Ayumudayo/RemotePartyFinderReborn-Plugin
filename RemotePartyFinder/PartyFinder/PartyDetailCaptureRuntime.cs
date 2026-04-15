@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using Dalamud.Game.Addon.Lifecycle;
+using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
@@ -26,38 +28,45 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         "48 89 5C 24 ?? 57 48 83 EC ?? 48 8B FA 48 8B D9 E8 ?? ?? ?? ?? 48 8B 8B ?? ?? ?? ?? 48 85 C9";
     private const string OpenListingByContentIdSignature =
         "40 53 48 83 EC 20 48 8B D9 E8 ?? ?? ?? ?? 84 C0 74 07 C6 83 ?? ?? ?? ?? ?? 48 83 C4 20 5B C3 CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC 40 53";
+    private const string DetailAddonName = "LookingForGroupDetail";
+    private static readonly AddonEvent[] FreshnessSignalEvents = [
+        AddonEvent.PreRequestedUpdate,
+        AddonEvent.PreRefresh,
+        AddonEvent.PreOpen,
+        AddonEvent.PreShow,
+    ];
 
     private readonly PartyDetailCaptureState _state;
-    private readonly Func<bool> _isDetailVisible;
+    private readonly IAddonLifecycle? _addonLifecycle;
     private readonly object _gate = new();
     private IDisposable? _hookScope;
     private ScannerAttempt? _scannerAttempt;
     private ActiveScannerIntercept? _activeScannerIntercept;
-    private long _detailVisibleGeneration;
-    private bool _isDetailCurrentlyVisible;
+    private long _postRequestSignalGeneration;
     private RequestFreshnessGate? _requestFreshnessGate;
+    private bool _freshnessListenersRegistered;
 
     internal PartyDetailCaptureRuntime(PartyDetailCaptureState state) {
         _state = state ?? throw new ArgumentNullException(nameof(state));
-        _isDetailVisible = static () => false;
+        _addonLifecycle = null;
     }
 
     internal PartyDetailCaptureRuntime(
         PartyDetailCaptureState state,
         IGameInteropProvider interopProvider,
-        Func<bool>? isDetailVisible = null,
+        IAddonLifecycle? addonLifecycle = null,
         Action<string>? warningSink = null
-    ) : this(state, new DalamudPartyDetailCaptureHookFactory(interopProvider), isDetailVisible, warningSink) {
+    ) : this(state, new DalamudPartyDetailCaptureHookFactory(interopProvider), addonLifecycle, warningSink) {
     }
 
     private PartyDetailCaptureRuntime(
         PartyDetailCaptureState state,
         IPartyDetailCaptureHookFactory hookFactory,
-        Func<bool>? isDetailVisible = null,
+        IAddonLifecycle? addonLifecycle = null,
         Action<string>? warningSink = null
     ) : this(state) {
         ArgumentNullException.ThrowIfNull(hookFactory);
-        _isDetailVisible = isDetailVisible ?? (static () => false);
+        _addonLifecycle = addonLifecycle;
 
         try {
             _hookScope = hookFactory.CreateHooks(OpenListingDetour, OpenListingByContentIdDetour);
@@ -65,21 +74,14 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
             warningSink?.Invoke($"PartyDetailCaptureRuntime: failed to initialize hooks. {exception.Message}");
             _hookScope = null;
         }
+
+        TryRegisterFreshnessListeners(warningSink);
     }
 
     internal static PartyDetailCaptureRuntime CreateForTesting(
         PartyDetailCaptureState state,
         IPartyDetailCaptureHookFactory hookFactory,
-        Func<bool>? isDetailVisible = null,
         Action<string>? warningSink = null
-    ) {
-        return new PartyDetailCaptureRuntime(state, hookFactory, isDetailVisible, warningSink);
-    }
-
-    internal static PartyDetailCaptureRuntime CreateForTesting(
-        PartyDetailCaptureState state,
-        IPartyDetailCaptureHookFactory hookFactory,
-        Action<string>? warningSink
     ) {
         return new PartyDetailCaptureRuntime(state, hookFactory, null, warningSink);
     }
@@ -114,6 +116,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     }
 
     public void Dispose() {
+        UnregisterFreshnessListeners();
         _hookScope?.Dispose();
         _hookScope = null;
 
@@ -206,10 +209,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     }
 
     internal void OnFrameworkUpdate() {
-        ObserveFrameworkTick(
-            _isDetailVisible(),
-            TryBuildSnapshotFromAgent(out var snapshot) ? snapshot : null
-        );
+        ObserveFrameworkTick(TryBuildSnapshotFromAgent(out var snapshot) ? snapshot : null);
     }
 
     internal void TestRecordArrivalFromAgentSnapshot(UploadablePartyDetail snapshot) {
@@ -217,12 +217,12 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         TryRecordArrivalFromAgentSnapshotCore(snapshot, enforceFreshness: false);
     }
 
-    internal void TestSetDetailVisible(bool isVisible) {
-        UpdateDetailVisibility(isVisible);
+    internal void TestFrameworkTick(UploadablePartyDetail? snapshot) {
+        ObserveFrameworkTick(snapshot);
     }
 
-    internal void TestFrameworkTick(UploadablePartyDetail? snapshot) {
-        ObserveFrameworkTick(GetCurrentDetailVisibility(), snapshot);
+    internal void TestRaisePostRequestRefreshSignal() {
+        RaisePostRequestRefreshSignal();
     }
 
     private bool OpenListingDetour(nint agent, ulong listingId) {
@@ -268,8 +268,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         ArmFreshnessGate(cycle.RequestSerial);
     }
 
-    private void ObserveFrameworkTick(bool isDetailVisible, UploadablePartyDetail? snapshot) {
-        UpdateDetailVisibility(isDetailVisible);
+    private void ObserveFrameworkTick(UploadablePartyDetail? snapshot) {
         if (!_state.HasActiveRequest) {
             return;
         }
@@ -381,27 +380,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
 
     private void ArmFreshnessGate(long requestSerial) {
         lock (_gate) {
-            _requestFreshnessGate = new RequestFreshnessGate(
-                requestSerial,
-                _detailVisibleGeneration,
-                _isDetailCurrentlyVisible
-            );
-        }
-    }
-
-    private void UpdateDetailVisibility(bool isVisible) {
-        lock (_gate) {
-            if (!_isDetailCurrentlyVisible && isVisible) {
-                _detailVisibleGeneration++;
-            }
-
-            _isDetailCurrentlyVisible = isVisible;
-        }
-    }
-
-    private bool GetCurrentDetailVisibility() {
-        lock (_gate) {
-            return _isDetailCurrentlyVisible;
+            _requestFreshnessGate = new RequestFreshnessGate(requestSerial, _postRequestSignalGeneration);
         }
     }
 
@@ -409,8 +388,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         lock (_gate) {
             return _requestFreshnessGate is not { } gate
                    || gate.RequestSerial != requestSerial
-                   || !gate.WasDetailVisibleAtRequestStart
-                   || _detailVisibleGeneration > gate.DetailVisibleGenerationAtRequestStart;
+                   || _postRequestSignalGeneration > gate.SignalGenerationAtRequestStart;
         }
     }
 
@@ -422,13 +400,50 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         }
     }
 
+    private void TryRegisterFreshnessListeners(Action<string>? warningSink) {
+        if (_addonLifecycle is null) {
+            return;
+        }
+
+        try {
+            foreach (var addonEvent in FreshnessSignalEvents) {
+                _addonLifecycle.RegisterListener(addonEvent, DetailAddonName, OnDetailLifecycleSignal);
+            }
+
+            _freshnessListenersRegistered = true;
+        } catch (Exception exception) {
+            warningSink?.Invoke($"PartyDetailCaptureRuntime: failed to initialize detail freshness listeners. {exception.Message}");
+            UnregisterFreshnessListeners();
+        }
+    }
+
+    private void UnregisterFreshnessListeners() {
+        if (_addonLifecycle is null || !_freshnessListenersRegistered) {
+            return;
+        }
+
+        foreach (var addonEvent in FreshnessSignalEvents) {
+            _addonLifecycle.UnregisterListener(addonEvent, DetailAddonName, OnDetailLifecycleSignal);
+        }
+
+        _freshnessListenersRegistered = false;
+    }
+
+    private void OnDetailLifecycleSignal(AddonEvent type, AddonArgs args) {
+        _ = type;
+        _ = args;
+        RaisePostRequestRefreshSignal();
+    }
+
+    private void RaisePostRequestRefreshSignal() {
+        lock (_gate) {
+            _postRequestSignalGeneration++;
+        }
+    }
+
     private sealed record ScannerAttempt(Guid AttemptId, uint ListingId, ulong ContentId, long? RequestSerial);
     private sealed record ActiveScannerIntercept(Guid AttemptId, uint ListingId, ulong ContentId);
-    private sealed record RequestFreshnessGate(
-        long RequestSerial,
-        long DetailVisibleGenerationAtRequestStart,
-        bool WasDetailVisibleAtRequestStart
-    );
+    private sealed record RequestFreshnessGate(long RequestSerial, long SignalGenerationAtRequestStart);
 
     private sealed class DalamudPartyDetailCaptureHookFactory : IPartyDetailCaptureHookFactory {
         private readonly IGameInteropProvider _interopProvider;

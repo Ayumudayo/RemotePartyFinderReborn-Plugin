@@ -1,10 +1,17 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using System.Threading;
 using Xunit;
 
 namespace RemotePartyFinder.Tests;
 
 public sealed class PartyDetailCollectorCaptureTests {
+    static PartyDetailCollectorCaptureTests() {
+        DalamudAssemblyResolver.Register();
+    }
+
     [Fact]
     public void Update_enqueues_only_once_for_same_arrival_generation() {
         var state = new PartyDetailCaptureState();
@@ -61,14 +68,13 @@ public sealed class PartyDetailCollectorCaptureTests {
     }
 
     [Fact]
-    public void Reopening_same_listing_does_not_consume_stale_preexisting_snapshot_before_detail_reopens() {
+    public void Reopening_same_listing_does_not_consume_stale_preexisting_snapshot_before_post_request_refresh_signal() {
         var state = new PartyDetailCaptureState();
         using var runtime = new FakePartyDetailCaptureRuntime(state);
         var harness = new CollectorHarness(state);
         var collector = harness.CreateCollector();
         var snapshot = CreateCompleteSnapshot();
 
-        runtime.SetDetailVisible(true);
         runtime.Tick(snapshot);
         runtime.BeginManualCycle(9001U, 44UL);
 
@@ -78,15 +84,7 @@ public sealed class PartyDetailCollectorCaptureTests {
         Assert.Empty(harness.CapturedPayloads);
         Assert.Equal(0L, state.LastConsumedGeneration);
 
-        runtime.SetDetailVisible(false);
-        runtime.Tick(snapshot);
-        collector.Update();
-
-        Assert.Empty(harness.CapturedPayloads);
-        Assert.Equal(0L, state.LastConsumedGeneration);
-
-        runtime.SetDetailVisible(true);
-        runtime.SetDetailVisible(false);
+        runtime.RaisePostRequestRefreshSignal();
         runtime.Tick(snapshot);
         collector.Update();
 
@@ -102,15 +100,13 @@ public sealed class PartyDetailCollectorCaptureTests {
         var collector = harness.CreateCollector();
         var snapshot = CreateCompleteSnapshot();
 
-        runtime.SetDetailVisible(false);
         runtime.BeginManualCycle(9001U, 44UL);
-        runtime.SetDetailVisible(true);
+        runtime.RaisePostRequestRefreshSignal();
         runtime.Tick(snapshot);
         collector.Update();
 
-        runtime.SetDetailVisible(false);
         runtime.BeginManualCycle(9001U, 44UL);
-        runtime.SetDetailVisible(true);
+        runtime.RaisePostRequestRefreshSignal();
         runtime.Tick(snapshot);
         collector.Update();
 
@@ -119,15 +115,15 @@ public sealed class PartyDetailCollectorCaptureTests {
     }
 
     [Fact]
-    public void Valid_snapshot_can_record_without_current_detail_visibility_when_request_started_hidden() {
+    public void Valid_snapshot_can_record_without_visibility_state_after_post_request_refresh_signal() {
         var state = new PartyDetailCaptureState();
         using var runtime = new FakePartyDetailCaptureRuntime(state);
         var harness = new CollectorHarness(state);
         var collector = harness.CreateCollector();
         var snapshot = CreateCompleteSnapshot();
 
-        runtime.SetDetailVisible(false);
         runtime.BeginManualCycle(9001U, 44UL);
+        runtime.RaisePostRequestRefreshSignal();
         runtime.Tick(snapshot);
         collector.Update();
 
@@ -234,16 +230,47 @@ public sealed class PartyDetailCollectorCaptureTests {
             _runtime.TestRecordArrivalFromAgentSnapshot(snapshot);
         }
 
-        internal void SetDetailVisible(bool isVisible) {
-            _runtime.TestSetDetailVisible(isVisible);
-        }
-
         internal void Tick(UploadablePartyDetail? snapshot) {
             _runtime.TestFrameworkTick(snapshot);
         }
 
+        internal void RaisePostRequestRefreshSignal() {
+            _runtime.TestRaisePostRequestRefreshSignal();
+        }
+
         public void Dispose() {
             _runtime.Dispose();
+        }
+    }
+
+    private static class DalamudAssemblyResolver {
+        private static int _registered;
+
+        internal static void Register() {
+            if (Interlocked.Exchange(ref _registered, 1) != 0) {
+                return;
+            }
+
+            AppDomain.CurrentDomain.AssemblyResolve += static (_, args) => {
+                var assemblyName = new AssemblyName(args.Name).Name;
+                if (string.IsNullOrWhiteSpace(assemblyName)) {
+                    return null;
+                }
+
+                var dalamudHome = Environment.GetEnvironmentVariable("DALAMUD_HOME");
+                if (string.IsNullOrWhiteSpace(dalamudHome)) {
+                    dalamudHome = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                        "XIVLauncher",
+                        "addon",
+                        "Hooks",
+                        "dev"
+                    );
+                }
+
+                var candidatePath = Path.Combine(dalamudHome, assemblyName + ".dll");
+                return File.Exists(candidatePath) ? Assembly.LoadFrom(candidatePath) : null;
+            };
         }
     }
 }
