@@ -61,6 +61,31 @@ public sealed class PartyDetailCollectorCaptureTests {
     }
 
     [Fact]
+    public void Reopening_same_listing_does_not_consume_stale_preexisting_snapshot_before_fresh_observation() {
+        var state = new PartyDetailCaptureState();
+        using var runtime = new FakePartyDetailCaptureRuntime(state);
+        var harness = new CollectorHarness(state);
+        var collector = harness.CreateCollector();
+        var snapshot = CreateCompleteSnapshot();
+
+        runtime.ObserveAgentSnapshot(snapshot);
+        runtime.BeginManualCycle(9001U, 44UL);
+
+        runtime.ObserveAgentSnapshot(snapshot);
+        collector.Update();
+
+        Assert.Empty(harness.CapturedPayloads);
+        Assert.Equal(0L, state.LastConsumedGeneration);
+
+        runtime.ObserveNoAgentSnapshot();
+        runtime.ObserveAgentSnapshot(snapshot);
+        collector.Update();
+
+        Assert.Single(harness.CapturedPayloads);
+        Assert.Equal(1L, state.LastConsumedGeneration);
+    }
+
+    [Fact]
     public void Incomplete_snapshot_is_not_consumed_and_retries_on_next_tick() {
         var state = new PartyDetailCaptureState();
         using var runtime = new FakePartyDetailCaptureRuntime(state);
@@ -152,11 +177,19 @@ public sealed class PartyDetailCollectorCaptureTests {
         }
 
         internal void BeginManualCycle(uint listingId, ulong contentId) {
-            _state.BeginRequest(PartyDetailRequestOwner.Manual, listingId, contentId);
+            _runtime.TestBeginManualRequestCycle(listingId, contentId);
         }
 
         internal void RecordArrivalFromAgent(UploadablePartyDetail snapshot) {
             _runtime.TestRecordArrivalFromAgentSnapshot(snapshot);
+        }
+
+        internal void ObserveAgentSnapshot(UploadablePartyDetail snapshot) {
+            _runtime.TestObserveAgentSnapshot(snapshot);
+        }
+
+        internal void ObserveNoAgentSnapshot() {
+            _runtime.TestObserveAgentSnapshot(null);
         }
 
         public void Dispose() {

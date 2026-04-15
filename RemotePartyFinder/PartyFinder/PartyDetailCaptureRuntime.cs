@@ -32,6 +32,9 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     private IDisposable? _hookScope;
     private ScannerAttempt? _scannerAttempt;
     private ActiveScannerIntercept? _activeScannerIntercept;
+    private long _latestObservedStateVersion;
+    private ObservedAgentState _latestObservedState = ObservedAgentState.Unavailable;
+    private RequestFreshnessGate? _requestFreshnessGate;
 
     internal PartyDetailCaptureRuntime(PartyDetailCaptureState state) {
         _state = state ?? throw new ArgumentNullException(nameof(state));
@@ -103,6 +106,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         lock (_gate) {
             _scannerAttempt = null;
             _activeScannerIntercept = null;
+            _requestFreshnessGate = null;
         }
     }
 
@@ -168,6 +172,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         lock (_gate) {
             _scannerAttempt = null;
             _activeScannerIntercept = null;
+            _requestFreshnessGate = null;
         }
     }
 
@@ -180,21 +185,23 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         EnsureRequestCycleForIntercept(0U, contentId);
     }
 
+    internal void TestBeginManualRequestCycle(uint listingId, ulong contentId) {
+        lock (_gate) {
+            BeginManualRequestCycle(listingId, contentId);
+        }
+    }
+
     internal void OnFrameworkUpdate() {
-        if (!_state.HasActiveRequest) {
-            return;
-        }
-
-        if (!TryBuildSnapshotFromAgent(out var snapshot)) {
-            return;
-        }
-
-        TryRecordArrivalFromAgentSnapshotCore(snapshot);
+        ObserveAgentSnapshot(TryBuildSnapshotFromAgent(out var snapshot) ? snapshot : null);
     }
 
     internal void TestRecordArrivalFromAgentSnapshot(UploadablePartyDetail snapshot) {
         ArgumentNullException.ThrowIfNull(snapshot);
-        TryRecordArrivalFromAgentSnapshotCore(snapshot);
+        TryRecordArrivalFromAgentSnapshotCore(snapshot, enforceFreshness: false);
+    }
+
+    internal void TestObserveAgentSnapshot(UploadablePartyDetail? snapshot) {
+        ObserveAgentSnapshot(snapshot);
     }
 
     private bool OpenListingDetour(nint agent, ulong listingId) {
@@ -219,6 +226,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
                         attempt.ListingId != 0 ? attempt.ListingId : listingId,
                         attempt.ContentId != 0 ? attempt.ContentId : contentId
                     );
+                    ArmFreshnessGate(cycle.RequestSerial);
 
                     _scannerAttempt = attempt with {
                         ListingId = cycle.ListingId,
@@ -230,12 +238,35 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
                 return;
             }
 
-            _state.BeginRequest(PartyDetailRequestOwner.Manual, listingId, contentId);
+            BeginManualRequestCycle(listingId, contentId);
         }
     }
 
-    private bool TryRecordArrivalFromAgentSnapshotCore(UploadablePartyDetail snapshot) {
+    private void BeginManualRequestCycle(uint listingId, ulong contentId) {
+        var cycle = _state.BeginRequest(PartyDetailRequestOwner.Manual, listingId, contentId);
+        ArmFreshnessGate(cycle.RequestSerial);
+    }
+
+    private void ObserveAgentSnapshot(UploadablePartyDetail? snapshot) {
+        AdvanceObservedState(CreateObservedAgentState(snapshot));
+
+        if (!_state.HasActiveRequest) {
+            return;
+        }
+
+        if (snapshot is null) {
+            return;
+        }
+
+        TryRecordArrivalFromAgentSnapshotCore(snapshot, enforceFreshness: true);
+    }
+
+    private bool TryRecordArrivalFromAgentSnapshotCore(UploadablePartyDetail snapshot, bool enforceFreshness) {
         if (!_state.TryGetCurrentRequestCycle(out var cycle)) {
+            return false;
+        }
+
+        if (enforceFreshness && !HasFreshObservation(cycle.RequestSerial)) {
             return false;
         }
 
@@ -251,7 +282,12 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
             return false;
         }
 
-        return _state.TryRecordArrival(cycle.RequestSerial, snapshot);
+        if (!_state.TryRecordArrival(cycle.RequestSerial, snapshot)) {
+            return false;
+        }
+
+        ClearFreshnessGate(cycle.RequestSerial);
+        return true;
     }
 
     private static unsafe bool TryBuildSnapshotFromAgent(out UploadablePartyDetail snapshot) {
@@ -323,8 +359,96 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         };
     }
 
+    private void ArmFreshnessGate(long requestSerial) {
+        lock (_gate) {
+            _requestFreshnessGate = new RequestFreshnessGate(requestSerial, _latestObservedStateVersion);
+        }
+    }
+
+    private void AdvanceObservedState(ObservedAgentState nextState) {
+        lock (_gate) {
+            if (_latestObservedState == nextState) {
+                return;
+            }
+
+            _latestObservedState = nextState;
+            _latestObservedStateVersion++;
+        }
+    }
+
+    private bool HasFreshObservation(long requestSerial) {
+        lock (_gate) {
+            return _requestFreshnessGate is not { } gate
+                   || gate.RequestSerial != requestSerial
+                   || _latestObservedStateVersion > gate.ObservedStateVersionAtRequestStart;
+        }
+    }
+
+    private void ClearFreshnessGate(long requestSerial) {
+        lock (_gate) {
+            if (_requestFreshnessGate is { RequestSerial: var gatedRequestSerial } && gatedRequestSerial == requestSerial) {
+                _requestFreshnessGate = null;
+            }
+        }
+    }
+
+    private static ObservedAgentState CreateObservedAgentState(UploadablePartyDetail? snapshot) {
+        if (snapshot is null || !PartyDetailCollector.IsSnapshotReadyForEnqueue(snapshot)) {
+            return ObservedAgentState.Unavailable;
+        }
+
+        return new ObservedAgentState(
+            true,
+            snapshot.ListingId,
+            snapshot.LeaderContentId,
+            snapshot.HomeWorld,
+            ComputeObservationFingerprint(snapshot)
+        );
+    }
+
+    private static ulong ComputeObservationFingerprint(UploadablePartyDetail snapshot) {
+        unchecked {
+            var hash = 1469598103934665603UL;
+            hash = MixObservationHash(hash, snapshot.ListingId);
+            hash = MixObservationHash(hash, snapshot.LeaderContentId);
+            hash = MixObservationHash(hash, snapshot.HomeWorld);
+            hash = MixObservationHash(hash, (ulong)snapshot.MemberContentIds.Count);
+
+            for (var i = 0; i < snapshot.MemberContentIds.Count; i++) {
+                hash = MixObservationHash(hash, snapshot.MemberContentIds[i]);
+                hash = MixObservationHash(hash, snapshot.MemberJobs[i]);
+            }
+
+            foreach (var slotFlag in snapshot.SlotFlags) {
+                foreach (var character in slotFlag) {
+                    hash = MixObservationHash(hash, character);
+                }
+            }
+
+            return hash;
+        }
+    }
+
+    private static ulong MixObservationHash(ulong hash, ulong value) {
+        unchecked {
+            hash ^= value;
+            hash *= 1099511628211UL;
+            return hash;
+        }
+    }
+
     private sealed record ScannerAttempt(Guid AttemptId, uint ListingId, ulong ContentId, long? RequestSerial);
     private sealed record ActiveScannerIntercept(Guid AttemptId, uint ListingId, ulong ContentId);
+    private sealed record RequestFreshnessGate(long RequestSerial, long ObservedStateVersionAtRequestStart);
+    private readonly record struct ObservedAgentState(
+        bool IsAvailable,
+        uint ListingId,
+        ulong LeaderContentId,
+        ushort HomeWorld,
+        ulong Fingerprint
+    ) {
+        internal static ObservedAgentState Unavailable { get; } = new(false, 0U, 0UL, 0, 0UL);
+    }
 
     private sealed class DalamudPartyDetailCaptureHookFactory : IPartyDetailCaptureHookFactory {
         private readonly IGameInteropProvider _interopProvider;
