@@ -12,6 +12,12 @@ using ECommons;
 
 namespace RemotePartyFinder;
 
+internal readonly record struct PartyDetailCaptureComposition(
+    PartyDetailCaptureState CaptureState,
+    PartyDetailCaptureRuntime CaptureRuntime,
+    PartyDetailCollector PartyDetailCollector
+);
+
 public class Plugin : IDalamudPlugin {
     [PluginService]
     internal static IPluginLog Log { get; private set; }
@@ -81,13 +87,10 @@ public class Plugin : IDalamudPlugin {
             selectOkDialogSuppressionRuntime: new DalamudSelectOkDialogSuppressionRuntime(this.AddonLifecycle, this.ChatGui, this.ToastGui, message => Log.Warning(message))
         );
         this.Framework.Update += this.CharaCardResolver.OnFrameworkUpdate;
-        this.PartyDetailCaptureState = new PartyDetailCaptureState();
-        this.PartyDetailCaptureRuntime = new PartyDetailCaptureRuntime(
-            this.PartyDetailCaptureState,
-            this.GameInteropProvider,
-            message => Log.Warning(message)
-        );
-        this.PartyDetailCollector = new PartyDetailCollector(this);
+        var partyDetailCapture = ComposePartyDetailCapture(this, warningSink: message => Log.Warning(message));
+        this.PartyDetailCaptureState = partyDetailCapture.CaptureState;
+        this.PartyDetailCaptureRuntime = partyDetailCapture.CaptureRuntime;
+        this.PartyDetailCollector = partyDetailCapture.PartyDetailCollector;
         this.DebugPfScanner = new DebugPfScanner(this, this.PartyDetailCollector, this.PartyDetailCaptureRuntime, this.Gatherer);
         this.FFLogsCollector = new FFLogsCollector(this);
         ConfigWindow = new ConfigWindow(this);
@@ -146,6 +149,28 @@ public class Plugin : IDalamudPlugin {
 
     internal void ResetFFLogsRateLimitCooldown() {
         this.FFLogsCollector.ResetRateLimitCooldown();
+    }
+
+    internal static PartyDetailCaptureComposition ComposePartyDetailCapture(
+        Plugin plugin,
+        Func<PartyDetailCaptureState, PartyDetailCaptureRuntime> runtimeFactory = null,
+        Func<PartyDetailCaptureState, PartyDetailCollector> collectorFactory = null,
+        Action<string> warningSink = null
+    ) {
+        var captureState = new PartyDetailCaptureState();
+        var captureRuntime = runtimeFactory?.Invoke(captureState)
+                             ?? new PartyDetailCaptureRuntime(
+                                 captureState,
+                                 plugin.GameInteropProvider,
+                                 warningSink
+                             );
+        var collector = collectorFactory?.Invoke(captureState)
+                        ?? new PartyDetailCollector(
+                            plugin,
+                            captureState
+                        );
+
+        return new PartyDetailCaptureComposition(captureState, captureRuntime, collector);
     }
 
     public void DrawUI() => WindowSystem.Draw();

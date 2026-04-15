@@ -48,6 +48,22 @@ public sealed class PartyDetailCollectorCaptureTests {
     }
 
     [Fact]
+    public void ComposePartyDetailCapture_reuses_single_capture_state_for_runtime_and_collector() {
+        var composition = Plugin.ComposePartyDetailCapture(
+            plugin: null,
+            runtimeFactory: static state => new PartyDetailCaptureRuntime(state),
+            collectorFactory: static state => new PartyDetailCollector(
+                state,
+                tryQueuePayload: static _ => true,
+                pumpPendingUploads: static () => { }
+            )
+        );
+
+        Assert.Same(composition.CaptureState, composition.CaptureRuntime.CaptureState);
+        Assert.Same(composition.CaptureState, composition.PartyDetailCollector.CaptureState);
+    }
+
+    [Fact]
     public void Reopening_same_listing_in_new_request_cycle_enqueues_again_after_new_population_event_even_if_payload_matches() {
         var state = new PartyDetailCaptureState();
         using var runtime = new FakePartyDetailCaptureRuntime(state);

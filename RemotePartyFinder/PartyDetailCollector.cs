@@ -47,10 +47,15 @@ internal sealed class PartyDetailCollector : IDisposable {
     internal DateTime LastTerminalUploadAtUtc => new(Interlocked.Read(ref _lastTerminalUploadAtUtcTicks), DateTimeKind.Utc);
     internal long LastTerminalUploadAckVersion => Interlocked.Read(ref _lastTerminalUploadAckVersion);
     internal int PendingQueueCount => _pendingDetails.Count;
+    internal PartyDetailCaptureState CaptureState => _captureState;
 
-    internal PartyDetailCollector(Plugin plugin) {
+    internal PartyDetailCollector(Plugin plugin)
+        : this(plugin, plugin?.PartyDetailCaptureState ?? throw new ArgumentNullException(nameof(plugin))) {
+    }
+
+    internal PartyDetailCollector(Plugin plugin, PartyDetailCaptureState captureState) {
         _plugin = plugin ?? throw new ArgumentNullException(nameof(plugin));
-        _captureState = plugin.PartyDetailCaptureState;
+        _captureState = captureState ?? throw new ArgumentNullException(nameof(captureState));
         _tryQueuePayload = TryQueuePayloadCore;
         _pumpPendingUploads = PumpUploadQueue;
         _uploadPumpTimer.Start();

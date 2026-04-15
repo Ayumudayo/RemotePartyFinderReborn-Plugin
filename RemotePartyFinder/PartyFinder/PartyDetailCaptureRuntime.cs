@@ -34,6 +34,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     private ActiveScannerIntercept? _activeScannerIntercept;
     private long _postRequestPopulationGeneration;
     private RequestPopulationGate? _requestPopulationGate;
+    internal PartyDetailCaptureState CaptureState => _state;
 
     internal PartyDetailCaptureRuntime(PartyDetailCaptureState state) {
         _state = state ?? throw new ArgumentNullException(nameof(state));
