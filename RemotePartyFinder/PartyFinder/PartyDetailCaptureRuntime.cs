@@ -274,7 +274,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
             return;
         }
 
-        if (!isDetailVisible || snapshot is null) {
+        if (snapshot is null) {
             return;
         }
 
@@ -381,7 +381,11 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
 
     private void ArmFreshnessGate(long requestSerial) {
         lock (_gate) {
-            _requestFreshnessGate = new RequestFreshnessGate(requestSerial, _detailVisibleGeneration);
+            _requestFreshnessGate = new RequestFreshnessGate(
+                requestSerial,
+                _detailVisibleGeneration,
+                _isDetailCurrentlyVisible
+            );
         }
     }
 
@@ -405,6 +409,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         lock (_gate) {
             return _requestFreshnessGate is not { } gate
                    || gate.RequestSerial != requestSerial
+                   || !gate.WasDetailVisibleAtRequestStart
                    || _detailVisibleGeneration > gate.DetailVisibleGenerationAtRequestStart;
         }
     }
@@ -419,7 +424,11 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
 
     private sealed record ScannerAttempt(Guid AttemptId, uint ListingId, ulong ContentId, long? RequestSerial);
     private sealed record ActiveScannerIntercept(Guid AttemptId, uint ListingId, ulong ContentId);
-    private sealed record RequestFreshnessGate(long RequestSerial, long DetailVisibleGenerationAtRequestStart);
+    private sealed record RequestFreshnessGate(
+        long RequestSerial,
+        long DetailVisibleGenerationAtRequestStart,
+        bool WasDetailVisibleAtRequestStart
+    );
 
     private sealed class DalamudPartyDetailCaptureHookFactory : IPartyDetailCaptureHookFactory {
         private readonly IGameInteropProvider _interopProvider;

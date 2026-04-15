@@ -70,7 +70,6 @@ public sealed class PartyDetailCollectorCaptureTests {
 
         runtime.SetDetailVisible(true);
         runtime.Tick(snapshot);
-        runtime.SetDetailVisible(false);
         runtime.BeginManualCycle(9001U, 44UL);
 
         runtime.Tick(snapshot);
@@ -79,7 +78,15 @@ public sealed class PartyDetailCollectorCaptureTests {
         Assert.Empty(harness.CapturedPayloads);
         Assert.Equal(0L, state.LastConsumedGeneration);
 
+        runtime.SetDetailVisible(false);
+        runtime.Tick(snapshot);
+        collector.Update();
+
+        Assert.Empty(harness.CapturedPayloads);
+        Assert.Equal(0L, state.LastConsumedGeneration);
+
         runtime.SetDetailVisible(true);
+        runtime.SetDetailVisible(false);
         runtime.Tick(snapshot);
         collector.Update();
 
@@ -109,6 +116,23 @@ public sealed class PartyDetailCollectorCaptureTests {
 
         Assert.Equal(2, harness.CapturedPayloads.Count);
         Assert.Equal(2L, state.LastConsumedGeneration);
+    }
+
+    [Fact]
+    public void Valid_snapshot_can_record_without_current_detail_visibility_when_request_started_hidden() {
+        var state = new PartyDetailCaptureState();
+        using var runtime = new FakePartyDetailCaptureRuntime(state);
+        var harness = new CollectorHarness(state);
+        var collector = harness.CreateCollector();
+        var snapshot = CreateCompleteSnapshot();
+
+        runtime.SetDetailVisible(false);
+        runtime.BeginManualCycle(9001U, 44UL);
+        runtime.Tick(snapshot);
+        collector.Update();
+
+        Assert.Single(harness.CapturedPayloads);
+        Assert.Equal(1L, state.LastConsumedGeneration);
     }
 
     [Fact]
