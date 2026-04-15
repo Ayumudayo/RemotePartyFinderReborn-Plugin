@@ -396,7 +396,8 @@ public sealed class PartyDetailCaptureStateTests {
     private sealed class ThrowingHookFactory : IPartyDetailCaptureHookFactory {
         public IDisposable CreateHooks(
             Func<nint, ulong, bool> openListingDetour,
-            Func<nint, ulong, bool> openListingByContentIdDetour
+            Func<nint, ulong, bool> openListingByContentIdDetour,
+            Action<nint, nint> populateListingDataDetour
         ) {
             throw new InvalidOperationException("simulated signature drift");
         }

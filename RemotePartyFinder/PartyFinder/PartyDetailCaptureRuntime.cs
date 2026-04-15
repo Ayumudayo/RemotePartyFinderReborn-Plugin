@@ -1,7 +1,5 @@
 using System;
 using System.Collections.Generic;
-using Dalamud.Game.Addon.Lifecycle;
-using Dalamud.Game.Addon.Lifecycle.AddonArgTypes;
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
@@ -19,7 +17,8 @@ internal enum PartyDetailScannerAttemptOutcome {
 internal interface IPartyDetailCaptureHookFactory {
     IDisposable CreateHooks(
         Func<nint, ulong, bool> openListingDetour,
-        Func<nint, ulong, bool> openListingByContentIdDetour
+        Func<nint, ulong, bool> openListingByContentIdDetour,
+        Action<nint, nint> populateListingDataDetour
     );
 }
 
@@ -28,54 +27,38 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         "48 89 5C 24 ?? 57 48 83 EC ?? 48 8B FA 48 8B D9 E8 ?? ?? ?? ?? 48 8B 8B ?? ?? ?? ?? 48 85 C9";
     private const string OpenListingByContentIdSignature =
         "40 53 48 83 EC 20 48 8B D9 E8 ?? ?? ?? ?? 84 C0 74 07 C6 83 ?? ?? ?? ?? ?? 48 83 C4 20 5B C3 CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC 40 53";
-    private const string DetailAddonName = "LookingForGroupDetail";
-    private static readonly AddonEvent[] FreshnessSignalEvents = [
-        AddonEvent.PreRequestedUpdate,
-        AddonEvent.PreRefresh,
-        AddonEvent.PreOpen,
-        AddonEvent.PreShow,
-    ];
-
     private readonly PartyDetailCaptureState _state;
-    private readonly IAddonLifecycle? _addonLifecycle;
     private readonly object _gate = new();
     private IDisposable? _hookScope;
     private ScannerAttempt? _scannerAttempt;
     private ActiveScannerIntercept? _activeScannerIntercept;
-    private long _postRequestSignalGeneration;
-    private RequestFreshnessGate? _requestFreshnessGate;
-    private bool _freshnessListenersRegistered;
+    private long _postRequestPopulationGeneration;
+    private RequestPopulationGate? _requestPopulationGate;
 
     internal PartyDetailCaptureRuntime(PartyDetailCaptureState state) {
         _state = state ?? throw new ArgumentNullException(nameof(state));
-        _addonLifecycle = null;
     }
 
     internal PartyDetailCaptureRuntime(
         PartyDetailCaptureState state,
         IGameInteropProvider interopProvider,
-        IAddonLifecycle? addonLifecycle = null,
         Action<string>? warningSink = null
-    ) : this(state, new DalamudPartyDetailCaptureHookFactory(interopProvider), addonLifecycle, warningSink) {
+    ) : this(state, new DalamudPartyDetailCaptureHookFactory(interopProvider), warningSink) {
     }
 
     private PartyDetailCaptureRuntime(
         PartyDetailCaptureState state,
         IPartyDetailCaptureHookFactory hookFactory,
-        IAddonLifecycle? addonLifecycle = null,
         Action<string>? warningSink = null
     ) : this(state) {
         ArgumentNullException.ThrowIfNull(hookFactory);
-        _addonLifecycle = addonLifecycle;
 
         try {
-            _hookScope = hookFactory.CreateHooks(OpenListingDetour, OpenListingByContentIdDetour);
+            _hookScope = hookFactory.CreateHooks(OpenListingDetour, OpenListingByContentIdDetour, PopulateListingDataDetour);
         } catch (Exception exception) {
             warningSink?.Invoke($"PartyDetailCaptureRuntime: failed to initialize hooks. {exception.Message}");
             _hookScope = null;
         }
-
-        TryRegisterFreshnessListeners(warningSink);
     }
 
     internal static PartyDetailCaptureRuntime CreateForTesting(
@@ -83,7 +66,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         IPartyDetailCaptureHookFactory hookFactory,
         Action<string>? warningSink = null
     ) {
-        return new PartyDetailCaptureRuntime(state, hookFactory, null, warningSink);
+        return new PartyDetailCaptureRuntime(state, hookFactory, warningSink);
     }
 
     internal static IDisposable CreateHookScope<TPrimaryHook, TSecondaryHook>(
@@ -116,14 +99,13 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     }
 
     public void Dispose() {
-        UnregisterFreshnessListeners();
         _hookScope?.Dispose();
         _hookScope = null;
 
         lock (_gate) {
             _scannerAttempt = null;
             _activeScannerIntercept = null;
-            _requestFreshnessGate = null;
+            _requestPopulationGate = null;
         }
     }
 
@@ -189,7 +171,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         lock (_gate) {
             _scannerAttempt = null;
             _activeScannerIntercept = null;
-            _requestFreshnessGate = null;
+            _requestPopulationGate = null;
         }
     }
 
@@ -212,17 +194,13 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         ObserveFrameworkTick(TryBuildSnapshotFromAgent(out var snapshot) ? snapshot : null);
     }
 
-    internal void TestRecordArrivalFromAgentSnapshot(UploadablePartyDetail snapshot) {
+    internal void TestObservePopulatedSnapshot(UploadablePartyDetail snapshot) {
         ArgumentNullException.ThrowIfNull(snapshot);
-        TryRecordArrivalFromAgentSnapshotCore(snapshot, enforceFreshness: false);
+        ObservePostRequestPopulation(snapshot);
     }
 
     internal void TestFrameworkTick(UploadablePartyDetail? snapshot) {
         ObserveFrameworkTick(snapshot);
-    }
-
-    internal void TestRaisePostRequestRefreshSignal() {
-        RaisePostRequestRefreshSignal();
     }
 
     private bool OpenListingDetour(nint agent, ulong listingId) {
@@ -233,6 +211,18 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     private bool OpenListingByContentIdDetour(nint agent, ulong contentId) {
         EnsureRequestCycleForIntercept(0U, contentId);
         return true;
+    }
+
+    private void PopulateListingDataDetour(nint agent, nint listingData) {
+        _ = agent;
+        _ = listingData;
+
+        if (!TryBuildSnapshotFromAgent(out var snapshot)) {
+            ObservePostRequestPopulation(snapshot: null);
+            return;
+        }
+
+        ObservePostRequestPopulation(snapshot);
     }
 
     private void EnsureRequestCycleForIntercept(uint listingId, ulong contentId) {
@@ -247,7 +237,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
                         attempt.ListingId != 0 ? attempt.ListingId : listingId,
                         attempt.ContentId != 0 ? attempt.ContentId : contentId
                     );
-                    ArmFreshnessGate(cycle.RequestSerial);
+                    ArmPopulationGate(cycle.RequestSerial);
 
                     _scannerAttempt = attempt with {
                         ListingId = cycle.ListingId,
@@ -265,7 +255,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
 
     private void BeginManualRequestCycle(uint listingId, ulong contentId) {
         var cycle = _state.BeginRequest(PartyDetailRequestOwner.Manual, listingId, contentId);
-        ArmFreshnessGate(cycle.RequestSerial);
+        ArmPopulationGate(cycle.RequestSerial);
     }
 
     private void ObserveFrameworkTick(UploadablePartyDetail? snapshot) {
@@ -280,12 +270,22 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         TryRecordArrivalFromAgentSnapshotCore(snapshot, enforceFreshness: true);
     }
 
+    private void ObservePostRequestPopulation(UploadablePartyDetail? snapshot) {
+        RaisePostRequestPopulationSignal();
+
+        if (snapshot is null) {
+            return;
+        }
+
+        _ = TryRecordArrivalFromAgentSnapshotCore(snapshot, enforceFreshness: true);
+    }
+
     private bool TryRecordArrivalFromAgentSnapshotCore(UploadablePartyDetail snapshot, bool enforceFreshness) {
         if (!_state.TryGetCurrentRequestCycle(out var cycle)) {
             return false;
         }
 
-        if (enforceFreshness && !HasFreshObservation(cycle.RequestSerial)) {
+        if (enforceFreshness && !HasObservedPostRequestPopulation(cycle.RequestSerial)) {
             return false;
         }
 
@@ -305,7 +305,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
             return false;
         }
 
-        ClearFreshnessGate(cycle.RequestSerial);
+        ClearPopulationGate(cycle.RequestSerial);
         return true;
     }
 
@@ -378,128 +378,114 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         };
     }
 
-    private void ArmFreshnessGate(long requestSerial) {
+    private void ArmPopulationGate(long requestSerial) {
         lock (_gate) {
-            _requestFreshnessGate = new RequestFreshnessGate(requestSerial, _postRequestSignalGeneration);
+            _requestPopulationGate = new RequestPopulationGate(requestSerial, _postRequestPopulationGeneration);
         }
     }
 
-    private bool HasFreshObservation(long requestSerial) {
+    private bool HasObservedPostRequestPopulation(long requestSerial) {
         lock (_gate) {
-            return _requestFreshnessGate is not { } gate
+            return _requestPopulationGate is not { } gate
                    || gate.RequestSerial != requestSerial
-                   || _postRequestSignalGeneration > gate.SignalGenerationAtRequestStart;
+                   || _postRequestPopulationGeneration > gate.SignalGenerationAtRequestStart;
         }
     }
 
-    private void ClearFreshnessGate(long requestSerial) {
+    private void ClearPopulationGate(long requestSerial) {
         lock (_gate) {
-            if (_requestFreshnessGate is { RequestSerial: var gatedRequestSerial } && gatedRequestSerial == requestSerial) {
-                _requestFreshnessGate = null;
+            if (_requestPopulationGate is { RequestSerial: var gatedRequestSerial } && gatedRequestSerial == requestSerial) {
+                _requestPopulationGate = null;
             }
         }
     }
 
-    private void TryRegisterFreshnessListeners(Action<string>? warningSink) {
-        if (_addonLifecycle is null) {
-            return;
-        }
-
-        try {
-            foreach (var addonEvent in FreshnessSignalEvents) {
-                _addonLifecycle.RegisterListener(addonEvent, DetailAddonName, OnDetailLifecycleSignal);
-            }
-
-            _freshnessListenersRegistered = true;
-        } catch (Exception exception) {
-            warningSink?.Invoke($"PartyDetailCaptureRuntime: failed to initialize detail freshness listeners. {exception.Message}");
-            UnregisterFreshnessListeners();
-        }
-    }
-
-    private void UnregisterFreshnessListeners() {
-        if (_addonLifecycle is null || !_freshnessListenersRegistered) {
-            return;
-        }
-
-        foreach (var addonEvent in FreshnessSignalEvents) {
-            _addonLifecycle.UnregisterListener(addonEvent, DetailAddonName, OnDetailLifecycleSignal);
-        }
-
-        _freshnessListenersRegistered = false;
-    }
-
-    private void OnDetailLifecycleSignal(AddonEvent type, AddonArgs args) {
-        _ = type;
-        _ = args;
-        RaisePostRequestRefreshSignal();
-    }
-
-    private void RaisePostRequestRefreshSignal() {
+    private void RaisePostRequestPopulationSignal() {
         lock (_gate) {
-            _postRequestSignalGeneration++;
+            _postRequestPopulationGeneration++;
         }
     }
 
     private sealed record ScannerAttempt(Guid AttemptId, uint ListingId, ulong ContentId, long? RequestSerial);
     private sealed record ActiveScannerIntercept(Guid AttemptId, uint ListingId, ulong ContentId);
-    private sealed record RequestFreshnessGate(long RequestSerial, long SignalGenerationAtRequestStart);
+    private sealed record RequestPopulationGate(long RequestSerial, long SignalGenerationAtRequestStart);
 
     private sealed class DalamudPartyDetailCaptureHookFactory : IPartyDetailCaptureHookFactory {
         private readonly IGameInteropProvider _interopProvider;
 
         private delegate bool OpenListingDelegate(nint agent, ulong listingId);
         private delegate bool OpenListingByContentIdDelegate(nint agent, ulong contentId);
+        private delegate void PopulateListingDataDelegate(nint agent, nint listingData);
 
         internal DalamudPartyDetailCaptureHookFactory(IGameInteropProvider interopProvider) {
             _interopProvider = interopProvider ?? throw new ArgumentNullException(nameof(interopProvider));
         }
 
-        public IDisposable CreateHooks(
+        public unsafe IDisposable CreateHooks(
             Func<nint, ulong, bool> openListingDetour,
-            Func<nint, ulong, bool> openListingByContentIdDetour
+            Func<nint, ulong, bool> openListingByContentIdDetour,
+            Action<nint, nint> populateListingDataDetour
         ) {
             ArgumentNullException.ThrowIfNull(openListingDetour);
             ArgumentNullException.ThrowIfNull(openListingByContentIdDetour);
+            ArgumentNullException.ThrowIfNull(populateListingDataDetour);
 
             Hook<OpenListingDelegate>? openListingHook = null;
             Hook<OpenListingByContentIdDelegate>? openListingByContentIdHook = null;
+            Hook<PopulateListingDataDelegate>? populateListingDataHook = null;
+            IDisposable? openListingHookScope = null;
 
-            return CreateHookScope(
-                createPrimaryHook: () =>
-                    openListingHook = _interopProvider.HookFromSignature<OpenListingDelegate>(
-                        OpenListingSignature,
-                        (agent, listingId) => {
-                            _ = openListingDetour(agent, listingId);
-                            return openListingHook!.Original(agent, listingId);
-                        }
-                    ),
-                createSecondaryHook: () =>
-                    openListingByContentIdHook = _interopProvider.HookFromSignature<OpenListingByContentIdDelegate>(
-                        OpenListingByContentIdSignature,
-                        (agent, contentId) => {
-                            _ = openListingByContentIdDetour(agent, contentId);
-                            return openListingByContentIdHook!.Original(agent, contentId);
-                        }
-                    ),
-                enablePrimaryHook: static hook => hook.Enable(),
-                enableSecondaryHook: static hook => hook.Enable()
-            );
+            try {
+                openListingHookScope = CreateHookScope(
+                    createPrimaryHook: () =>
+                        openListingHook = _interopProvider.HookFromSignature<OpenListingDelegate>(
+                            OpenListingSignature,
+                            (agent, listingId) => {
+                                _ = openListingDetour(agent, listingId);
+                                return openListingHook!.Original(agent, listingId);
+                            }
+                        ),
+                    createSecondaryHook: () =>
+                        openListingByContentIdHook = _interopProvider.HookFromSignature<OpenListingByContentIdDelegate>(
+                            OpenListingByContentIdSignature,
+                            (agent, contentId) => {
+                                _ = openListingByContentIdDetour(agent, contentId);
+                                return openListingByContentIdHook!.Original(agent, contentId);
+                            }
+                        ),
+                    enablePrimaryHook: static hook => hook.Enable(),
+                    enableSecondaryHook: static hook => hook.Enable()
+                );
+
+                populateListingDataHook = _interopProvider.HookFromAddress<PopulateListingDataDelegate>(
+                    (nint)AgentLookingForGroup.MemberFunctionPointers.PopulateListingData,
+                    (agent, listingData) => {
+                        populateListingDataHook!.Original(agent, listingData);
+                        populateListingDataDetour(agent, listingData);
+                    }
+                );
+                populateListingDataHook.Enable();
+                return new HookScope(openListingHookScope, populateListingDataHook);
+            } catch {
+                populateListingDataHook?.Dispose();
+                openListingHookScope?.Dispose();
+                throw;
+            }
         }
     }
 
     private sealed class HookScope : IDisposable {
-        private readonly IDisposable _openListingHook;
-        private readonly IDisposable _openListingByContentIdHook;
+        private readonly IDisposable _openListingHookScope;
+        private readonly IDisposable _populateListingDataHook;
 
-        internal HookScope(IDisposable openListingHook, IDisposable openListingByContentIdHook) {
-            _openListingHook = openListingHook;
-            _openListingByContentIdHook = openListingByContentIdHook;
+        internal HookScope(IDisposable openListingHookScope, IDisposable populateListingDataHook) {
+            _openListingHookScope = openListingHookScope;
+            _populateListingDataHook = populateListingDataHook;
         }
 
         public void Dispose() {
-            _openListingByContentIdHook.Dispose();
-            _openListingHook.Dispose();
+            _populateListingDataHook.Dispose();
+            _openListingHookScope.Dispose();
         }
     }
 }

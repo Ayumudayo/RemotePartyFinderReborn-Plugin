@@ -85,7 +85,6 @@ public class Plugin : IDalamudPlugin {
         this.PartyDetailCaptureRuntime = new PartyDetailCaptureRuntime(
             this.PartyDetailCaptureState,
             this.GameInteropProvider,
-            this.AddonLifecycle,
             message => Log.Warning(message)
         );
         this.PartyDetailCollector = new PartyDetailCollector(this);

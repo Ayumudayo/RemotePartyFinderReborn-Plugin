@@ -48,7 +48,7 @@ public sealed class PartyDetailCollectorCaptureTests {
     }
 
     [Fact]
-    public void Reopening_same_listing_in_new_request_cycle_enqueues_again_even_if_payload_matches() {
+    public void Reopening_same_listing_in_new_request_cycle_enqueues_again_after_new_population_event_even_if_payload_matches() {
         var state = new PartyDetailCaptureState();
         using var runtime = new FakePartyDetailCaptureRuntime(state);
         var harness = new CollectorHarness(state);
@@ -56,11 +56,11 @@ public sealed class PartyDetailCollectorCaptureTests {
         var snapshot = CreateCompleteSnapshot();
 
         runtime.BeginManualCycle(9001U, 44UL);
-        runtime.RecordArrivalFromAgent(snapshot);
+        runtime.ObservePopulatedSnapshot(snapshot);
         collector.Update();
 
         runtime.BeginManualCycle(9001U, 44UL);
-        runtime.RecordArrivalFromAgent(snapshot);
+        runtime.ObservePopulatedSnapshot(snapshot);
         collector.Update();
 
         Assert.Equal(2, harness.CapturedPayloads.Count);
@@ -68,7 +68,7 @@ public sealed class PartyDetailCollectorCaptureTests {
     }
 
     [Fact]
-    public void Reopening_same_listing_does_not_consume_stale_preexisting_snapshot_before_post_request_refresh_signal() {
+    public void Reopening_same_listing_does_not_consume_stale_preexisting_snapshot_before_new_population_event() {
         var state = new PartyDetailCaptureState();
         using var runtime = new FakePartyDetailCaptureRuntime(state);
         var harness = new CollectorHarness(state);
@@ -84,8 +84,7 @@ public sealed class PartyDetailCollectorCaptureTests {
         Assert.Empty(harness.CapturedPayloads);
         Assert.Equal(0L, state.LastConsumedGeneration);
 
-        runtime.RaisePostRequestRefreshSignal();
-        runtime.Tick(snapshot);
+        runtime.ObservePopulatedSnapshot(snapshot);
         collector.Update();
 
         Assert.Single(harness.CapturedPayloads);
@@ -93,7 +92,7 @@ public sealed class PartyDetailCollectorCaptureTests {
     }
 
     [Fact]
-    public void Reopening_same_listing_with_identical_payload_enqueues_again_after_detail_reopens() {
+    public void Valid_snapshot_can_record_without_visibility_state_after_population_event() {
         var state = new PartyDetailCaptureState();
         using var runtime = new FakePartyDetailCaptureRuntime(state);
         var harness = new CollectorHarness(state);
@@ -101,30 +100,7 @@ public sealed class PartyDetailCollectorCaptureTests {
         var snapshot = CreateCompleteSnapshot();
 
         runtime.BeginManualCycle(9001U, 44UL);
-        runtime.RaisePostRequestRefreshSignal();
-        runtime.Tick(snapshot);
-        collector.Update();
-
-        runtime.BeginManualCycle(9001U, 44UL);
-        runtime.RaisePostRequestRefreshSignal();
-        runtime.Tick(snapshot);
-        collector.Update();
-
-        Assert.Equal(2, harness.CapturedPayloads.Count);
-        Assert.Equal(2L, state.LastConsumedGeneration);
-    }
-
-    [Fact]
-    public void Valid_snapshot_can_record_without_visibility_state_after_post_request_refresh_signal() {
-        var state = new PartyDetailCaptureState();
-        using var runtime = new FakePartyDetailCaptureRuntime(state);
-        var harness = new CollectorHarness(state);
-        var collector = harness.CreateCollector();
-        var snapshot = CreateCompleteSnapshot();
-
-        runtime.BeginManualCycle(9001U, 44UL);
-        runtime.RaisePostRequestRefreshSignal();
-        runtime.Tick(snapshot);
+        runtime.ObservePopulatedSnapshot(snapshot);
         collector.Update();
 
         Assert.Single(harness.CapturedPayloads);
@@ -138,14 +114,20 @@ public sealed class PartyDetailCollectorCaptureTests {
         var harness = new CollectorHarness(state);
         var collector = harness.CreateCollector();
         var incompleteSnapshot = CreateIncompleteSnapshot();
+        var completeSnapshot = CreateCompleteSnapshot();
 
         runtime.BeginManualCycle(9001U, 44UL);
-        runtime.RecordArrivalFromAgent(incompleteSnapshot);
-        collector.Update();
+        runtime.ObservePopulatedSnapshot(incompleteSnapshot);
         collector.Update();
 
         Assert.Empty(harness.CapturedPayloads);
         Assert.Equal(0L, state.LastConsumedGeneration);
+
+        runtime.Tick(completeSnapshot);
+        collector.Update();
+
+        Assert.Single(harness.CapturedPayloads);
+        Assert.Equal(1L, state.LastConsumedGeneration);
     }
 
     private static UploadablePartyDetail CreateCompleteSnapshot() {
@@ -226,16 +208,12 @@ public sealed class PartyDetailCollectorCaptureTests {
             _runtime.TestBeginManualRequestCycle(listingId, contentId);
         }
 
-        internal void RecordArrivalFromAgent(UploadablePartyDetail snapshot) {
-            _runtime.TestRecordArrivalFromAgentSnapshot(snapshot);
+        internal void ObservePopulatedSnapshot(UploadablePartyDetail snapshot) {
+            _runtime.TestObservePopulatedSnapshot(snapshot);
         }
 
         internal void Tick(UploadablePartyDetail? snapshot) {
             _runtime.TestFrameworkTick(snapshot);
-        }
-
-        internal void RaisePostRequestRefreshSignal() {
-            _runtime.TestRaisePostRequestRefreshSignal();
         }
 
         public void Dispose() {
