@@ -369,3 +369,6 @@ MigrationBackup/
 FodyWeavers.xsd
 nul
 rustc-ice-*.txt
+
+# Docs
+docs/
