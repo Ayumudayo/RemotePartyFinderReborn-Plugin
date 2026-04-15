@@ -36,6 +36,9 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     private RequestPopulationGate? _requestPopulationGate;
     internal PartyDetailCaptureState CaptureState => _state;
 
+    // Scanner-owned PF detail UI suppression is intentionally deferred until a
+    // sufficiently narrow native PF detail open/show owner is confirmed.
+
     internal PartyDetailCaptureRuntime(PartyDetailCaptureState state) {
         _state = state ?? throw new ArgumentNullException(nameof(state));
     }
