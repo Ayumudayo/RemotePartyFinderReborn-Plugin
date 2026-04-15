@@ -38,4 +38,19 @@ public sealed class PartyDetailEnqueueTests {
         Assert.Null(exception);
         Assert.Equal([111UL, 222UL], captured);
     }
+
+    [Fact]
+    public void SnapshotValidity_requires_nonzero_member_content() {
+        var payload = new UploadablePartyDetail {
+            ListingId = 9001U,
+            LeaderContentId = 111UL,
+            LeaderName = "Leader",
+            HomeWorld = 77,
+            MemberContentIds = [0UL, 0UL],
+            MemberJobs = [19, 24],
+            SlotFlags = ["0x0", "0x0"],
+        };
+
+        Assert.False(PartyDetailCollector.IsSnapshotReadyForEnqueue(payload));
+    }
 }

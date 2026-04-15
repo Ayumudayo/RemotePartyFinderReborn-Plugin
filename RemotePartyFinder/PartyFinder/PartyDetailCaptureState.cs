@@ -37,6 +37,14 @@ internal sealed class PartyDetailCaptureState {
         }
     }
 
+    internal bool HasActiveRequest {
+        get {
+            lock (_gate) {
+                return TryGetCurrentCycle(out _);
+            }
+        }
+    }
+
     internal PartyDetailRequestOwner? CurrentOwner {
         get {
             lock (_gate) {
@@ -117,6 +125,28 @@ internal sealed class PartyDetailCaptureState {
                    && _latestArrival.Snapshot.ListingId == listingId
                    && requestContentMatches
                    && snapshotContentMatches;
+        }
+    }
+
+    internal bool TryGetCurrentRequestCycle(out PartyDetailRequestCycle cycle) {
+        lock (_gate) {
+            return TryGetCurrentCycle(out cycle);
+        }
+    }
+
+    internal bool TryGetNextUnconsumedArrival(out PartyDetailPendingArrival arrival) {
+        lock (_gate) {
+            if (!_hasLatestArrival || _latestArrival.Generation <= _latestConsumedGeneration) {
+                arrival = default;
+                return false;
+            }
+
+            arrival = new PartyDetailPendingArrival(
+                _latestArrival.Generation,
+                _latestArrival.Cycle,
+                CloneSnapshot(_latestArrival.Snapshot)
+            );
+            return true;
         }
     }
 

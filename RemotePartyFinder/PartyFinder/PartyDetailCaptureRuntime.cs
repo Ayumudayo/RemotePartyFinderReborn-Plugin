@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using Dalamud.Hooking;
 using Dalamud.Plugin.Services;
+using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 
 #nullable enable
 
@@ -178,6 +180,23 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         EnsureRequestCycleForIntercept(0U, contentId);
     }
 
+    internal void OnFrameworkUpdate() {
+        if (!_state.HasActiveRequest) {
+            return;
+        }
+
+        if (!TryBuildSnapshotFromAgent(out var snapshot)) {
+            return;
+        }
+
+        TryRecordArrivalFromAgentSnapshotCore(snapshot);
+    }
+
+    internal void TestRecordArrivalFromAgentSnapshot(UploadablePartyDetail snapshot) {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        TryRecordArrivalFromAgentSnapshotCore(snapshot);
+    }
+
     private bool OpenListingDetour(nint agent, ulong listingId) {
         EnsureRequestCycleForIntercept(NormalizeListingId(listingId), 0UL);
         return true;
@@ -213,6 +232,70 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
 
             _state.BeginRequest(PartyDetailRequestOwner.Manual, listingId, contentId);
         }
+    }
+
+    private bool TryRecordArrivalFromAgentSnapshotCore(UploadablePartyDetail snapshot) {
+        if (!_state.TryGetCurrentRequestCycle(out var cycle)) {
+            return false;
+        }
+
+        if (!PartyDetailCollector.IsSnapshotReadyForEnqueue(snapshot)) {
+            return false;
+        }
+
+        if (cycle.ListingId != 0 && snapshot.ListingId != cycle.ListingId) {
+            return false;
+        }
+
+        if (cycle.ContentId != 0 && snapshot.LeaderContentId != cycle.ContentId) {
+            return false;
+        }
+
+        return _state.TryRecordArrival(cycle.RequestSerial, snapshot);
+    }
+
+    private static unsafe bool TryBuildSnapshotFromAgent(out UploadablePartyDetail snapshot) {
+        snapshot = new UploadablePartyDetail();
+
+        var lookingForGroupAgent = AgentLookingForGroup.Instance();
+        if (lookingForGroupAgent == null) {
+            return false;
+        }
+
+        ref var viewedListing = ref lookingForGroupAgent->LastViewedListing;
+        if (viewedListing.ListingId == 0) {
+            return false;
+        }
+
+        var effectiveParties = Math.Max(1, (int)viewedListing.NumberOfParties);
+        var declaredSlots = Math.Max((int)viewedListing.TotalSlots, effectiveParties * 8);
+        var slotCount = Math.Clamp(declaredSlots, 0, 48);
+        if (slotCount <= 0) {
+            return false;
+        }
+
+        var memberContentIds = new List<ulong>(slotCount);
+        var memberJobs = new List<byte>(slotCount);
+        var slotFlags = new List<string>(slotCount);
+
+        for (var slotIndex = 0; slotIndex < slotCount; slotIndex++) {
+            memberContentIds.Add(viewedListing.MemberContentIds[slotIndex]);
+            memberJobs.Add(viewedListing.Jobs[slotIndex]);
+            var rawSlotFlag = Convert.ToUInt64(viewedListing.SlotFlags[slotIndex]);
+            slotFlags.Add($"0x{rawSlotFlag:X16}");
+        }
+
+        snapshot = new UploadablePartyDetail {
+            ListingId = viewedListing.ListingId,
+            LeaderContentId = viewedListing.LeaderContentId,
+            LeaderName = lookingForGroupAgent->LastLeader.ToString(),
+            HomeWorld = viewedListing.HomeWorld,
+            MemberContentIds = memberContentIds,
+            MemberJobs = memberJobs,
+            SlotFlags = slotFlags,
+        };
+
+        return true;
     }
 
     private static uint NormalizeListingId(ulong listingId) {

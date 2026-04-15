@@ -11,3 +11,9 @@ internal readonly record struct PartyDetailRequestCycle(
     uint ListingId,
     ulong ContentId
 );
+
+internal readonly record struct PartyDetailPendingArrival(
+    long Generation,
+    PartyDetailRequestCycle Cycle,
+    UploadablePartyDetail Payload
+);

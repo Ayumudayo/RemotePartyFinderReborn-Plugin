@@ -7,26 +7,25 @@ using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using Dalamud.Plugin.Services;
-using FFXIVClientStructs.FFXIV.Client.UI.Agent;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Serialization;
+
+#nullable enable
 
 namespace RemotePartyFinder;
 
 internal sealed class PartyDetailCollector : IDisposable {
-    private static readonly TimeSpan ScanInterval = TimeSpan.FromMilliseconds(200);
-    private static readonly TimeSpan RequeueSameFingerprintDelay = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan UploadPumpInterval = TimeSpan.FromMilliseconds(150);
 
-    private readonly Plugin _plugin;
+    private readonly Plugin? _plugin;
+    private readonly PartyDetailCaptureState _captureState;
+    private readonly Func<UploadablePartyDetail, bool> _tryQueuePayload;
+    private readonly Action _pumpPendingUploads;
     private readonly HttpClient _httpClient = new();
-    private readonly Stopwatch _scanTimer = new();
     private readonly Stopwatch _uploadPumpTimer = new();
     private readonly ConcurrentDictionary<uint, PendingDetailEntry> _pendingDetails = new();
 
     private uint _lastQueuedListingId;
-    private ulong _lastQueuedFingerprint;
-    private DateTime _lastQueuedAtUtc = DateTime.MinValue;
     private long _lastQueuedAckVersion;
 
     private volatile uint _lastSuccessfulUploadListingId;
@@ -50,102 +49,78 @@ internal sealed class PartyDetailCollector : IDisposable {
     internal int PendingQueueCount => _pendingDetails.Count;
 
     internal PartyDetailCollector(Plugin plugin) {
-        _plugin = plugin;
-        _scanTimer.Start();
+        _plugin = plugin ?? throw new ArgumentNullException(nameof(plugin));
+        _captureState = plugin.PartyDetailCaptureState;
+        _tryQueuePayload = TryQueuePayloadCore;
+        _pumpPendingUploads = PumpUploadQueue;
         _uploadPumpTimer.Start();
         _plugin.Framework.Update += OnUpdate;
     }
 
-    public void Dispose() {
-        _plugin.Framework.Update -= OnUpdate;
+    internal PartyDetailCollector(
+        PartyDetailCaptureState captureState,
+        Func<UploadablePartyDetail, bool> tryQueuePayload,
+        Action pumpPendingUploads
+    ) {
+        _captureState = captureState ?? throw new ArgumentNullException(nameof(captureState));
+        _tryQueuePayload = tryQueuePayload ?? throw new ArgumentNullException(nameof(tryQueuePayload));
+        _pumpPendingUploads = pumpPendingUploads ?? throw new ArgumentNullException(nameof(pumpPendingUploads));
+        _uploadPumpTimer.Start();
     }
 
-    private unsafe void OnUpdate(IFramework framework) {
-        if (_scanTimer.Elapsed < ScanInterval) {
+    public void Dispose() {
+        if (_plugin is null) {
             return;
         }
 
-        _scanTimer.Restart();
-        PumpUploadQueue();
+        DetachFrameworkUpdateHandler(_plugin);
+    }
 
-        var addonPtr = _plugin.GameGui.GetAddonByName("LookingForGroupDetail", 1);
-        if (addonPtr == 0) {
-            _lastQueuedListingId = 0;
-            _lastQueuedFingerprint = 0;
+    private void OnUpdate(IFramework framework) {
+        _plugin?.PartyDetailCaptureRuntime.OnFrameworkUpdate();
+        Update();
+    }
+
+    private void DetachFrameworkUpdateHandler(Plugin plugin) {
+        plugin.Framework.Update -= OnUpdate;
+    }
+
+    internal void Update() {
+        TryCapturePendingGeneration();
+        _pumpPendingUploads();
+    }
+
+    private void TryCapturePendingGeneration() {
+        if (!_captureState.TryGetNextUnconsumedArrival(out var arrival)) {
             return;
         }
 
-        var lookingForGroupAgent = AgentLookingForGroup.Instance();
-        if (lookingForGroupAgent == null) {
+        if (!IsSnapshotReadyForEnqueue(arrival.Payload)) {
             return;
         }
 
-        ref var viewedListing = ref lookingForGroupAgent->LastViewedListing;
-        if (viewedListing.ListingId == 0) {
+        if (!_tryQueuePayload(arrival.Payload)) {
             return;
         }
 
-        var leaderContentId = viewedListing.LeaderContentId;
-        var homeWorld = viewedListing.HomeWorld;
-        if (leaderContentId == 0 || homeWorld == 0 || homeWorld >= 1000) {
-            return;
-        }
+        _captureState.TryMarkConsumed(arrival.Generation);
+    }
 
-        var effectiveParties = Math.Max(1, (int)viewedListing.NumberOfParties);
-        var declaredSlots = Math.Max((int)viewedListing.TotalSlots, effectiveParties * 8);
-        var slotCount = Math.Clamp(declaredSlots, 0, 48);
-        if (slotCount <= 0) {
-            return;
-        }
-
-        var memberContentIds = new List<ulong>(slotCount);
-        var memberJobs = new List<byte>(slotCount);
-        var slotFlags = new List<string>(slotCount);
-        var nonZeroMemberCount = 0;
-
-        for (var slotIndex = 0; slotIndex < slotCount; slotIndex++) {
-            var memberContentId = viewedListing.MemberContentIds[slotIndex];
-            memberContentIds.Add(memberContentId);
-            memberJobs.Add(viewedListing.Jobs[slotIndex]);
-            var rawSlotFlag = Convert.ToUInt64(viewedListing.SlotFlags[slotIndex]);
-            slotFlags.Add($"0x{rawSlotFlag:X16}");
-            if (memberContentId != 0) {
-                nonZeroMemberCount++;
-            }
-        }
-
-        if (nonZeroMemberCount == 0) {
-            return;
-        }
-
-        var payload = new UploadablePartyDetail {
-            ListingId = viewedListing.ListingId,
-            LeaderContentId = leaderContentId,
-            LeaderName = lookingForGroupAgent->LastLeader.ToString(),
-            HomeWorld = homeWorld,
-            MemberContentIds = memberContentIds,
-            MemberJobs = memberJobs,
-            SlotFlags = slotFlags,
-        };
-
-        var fingerprint = ComputeFingerprint(memberContentIds, memberJobs, slotFlags);
-
-        var now = DateTime.UtcNow;
-        if (payload.ListingId == _lastQueuedListingId
-            && fingerprint == _lastQueuedFingerprint
-            && now - _lastQueuedAtUtc < RequeueSameFingerprintDelay) {
-            return;
-        }
+    private bool TryQueuePayloadCore(UploadablePartyDetail payload) {
+        var fingerprint = ComputeFingerprint(payload.MemberContentIds, payload.MemberJobs, payload.SlotFlags);
+        var nowUtc = DateTime.UtcNow;
 
         Plugin.Log.Debug(
-            $"PartyDetailCollector: Uploading detail listing={payload.ListingId} leader={payload.LeaderContentId} world={payload.HomeWorld} members={payload.MemberContentIds.Count} non_zero_members={nonZeroMemberCount} parties={effectiveParties} fingerprint={fingerprint}");
+            $"PartyDetailCollector: Uploading detail listing={payload.ListingId} leader={payload.LeaderContentId} world={payload.HomeWorld} members={payload.MemberContentIds.Count} fingerprint={fingerprint}");
 
-        Enqueue(payload, fingerprint, now);
-        TryEnqueueContentIdsForResolve(payload, _plugin.CharaCardResolver.EnqueueMany, message => Plugin.Log.Warning(message));
+        Enqueue(payload, fingerprint, nowUtc);
+        if (_plugin is not null) {
+            TryEnqueueContentIdsForResolve(payload, _plugin.CharaCardResolver.EnqueueMany, message => Plugin.Log.Warning(message));
+        }
+
         _lastQueuedListingId = payload.ListingId;
-        _lastQueuedFingerprint = fingerprint;
-        _lastQueuedAtUtc = now;
         Interlocked.Increment(ref _lastQueuedAckVersion);
+        return true;
     }
 
     private void Enqueue(UploadablePartyDetail payload, ulong fingerprint, DateTime nowUtc) {
@@ -225,11 +200,12 @@ internal sealed class PartyDetailCollector : IDisposable {
     }
 
     private async Task<DetailUploadResult> TryUploadToAllTargetsAsync(UploadablePartyDetail payload) {
+        var plugin = _plugin ?? throw new InvalidOperationException("Detail uploads require plugin-backed collector initialization.");
         var jsonPayload = JsonConvert.SerializeObject(payload);
         var anyApplied = false;
         var anyMissing = false;
 
-        foreach (var uploadTarget in _plugin.Configuration.UploadUrls.Where(static candidate => candidate.IsEnabled)) {
+        foreach (var uploadTarget in plugin.Configuration.UploadUrls.Where(static candidate => candidate.IsEnabled)) {
             if (IsCircuitOpen(uploadTarget)) {
                 continue;
             }
@@ -310,12 +286,13 @@ internal sealed class PartyDetailCollector : IDisposable {
     }
 
     private bool IsCircuitOpen(UploadUrl uploadTarget) {
-        if (uploadTarget.FailureCount < _plugin.Configuration.CircuitBreakerFailureThreshold) {
+        var plugin = _plugin ?? throw new InvalidOperationException("Circuit breaker evaluation requires plugin-backed collector initialization.");
+        if (uploadTarget.FailureCount < plugin.Configuration.CircuitBreakerFailureThreshold) {
             return false;
         }
 
         var elapsedSinceLastFailure = DateTime.UtcNow - uploadTarget.LastFailureTime;
-        return elapsedSinceLastFailure.TotalMinutes < _plugin.Configuration.CircuitBreakerBreakDurationMinutes;
+        return elapsedSinceLastFailure.TotalMinutes < plugin.Configuration.CircuitBreakerBreakDurationMinutes;
     }
 
     private static bool TryParseDetailResponse(string rawBody, out long matchedCount, out long modifiedCount) {
@@ -354,6 +331,7 @@ internal sealed class PartyDetailCollector : IDisposable {
     }
 
     private void ScheduleRetry(PendingDetailEntry pending) {
+        var plugin = _plugin ?? throw new InvalidOperationException("Retry scheduling requires plugin-backed collector initialization.");
         if (!_pendingDetails.TryGetValue(pending.Detail.ListingId, out var current)) {
             return;
         }
@@ -362,7 +340,7 @@ internal sealed class PartyDetailCollector : IDisposable {
             return;
         }
 
-        var configuredRetryCount = NormalizeRetryCount(_plugin.Configuration.DetailUploadRetryCount);
+        var configuredRetryCount = NormalizeRetryCount(plugin.Configuration.DetailUploadRetryCount);
         if (ShouldDropPendingDetail(current.AttemptCount, configuredRetryCount)) {
             _pendingDetails.TryRemove(pending.Detail.ListingId, out _);
             Plugin.Log.Warning($"PartyDetailCollector: dropping detail payload listing={pending.Detail.ListingId} after {current.AttemptCount} retries");
@@ -393,6 +371,30 @@ internal sealed class PartyDetailCollector : IDisposable {
 
     internal static bool ShouldDropPendingDetail(int currentRetryCount, int configuredRetries) {
         return currentRetryCount >= NormalizeRetryCount(configuredRetries);
+    }
+
+    internal static bool IsSnapshotReadyForEnqueue(UploadablePartyDetail payload) {
+        ArgumentNullException.ThrowIfNull(payload);
+
+        if (payload.ListingId == 0 || payload.LeaderContentId == 0) {
+            return false;
+        }
+
+        if (payload.HomeWorld == 0 || payload.HomeWorld >= 1000) {
+            return false;
+        }
+
+        if (payload.MemberContentIds is null || payload.MemberJobs is null || payload.SlotFlags is null) {
+            return false;
+        }
+
+        if (payload.MemberContentIds.Count == 0
+            || payload.MemberJobs.Count != payload.MemberContentIds.Count
+            || payload.SlotFlags.Count != payload.MemberContentIds.Count) {
+            return false;
+        }
+
+        return payload.MemberContentIds.Any(static memberContentId => memberContentId != 0);
     }
 
     private static ulong ComputeFingerprint(
@@ -448,7 +450,7 @@ internal sealed class PartyDetailCollector : IDisposable {
     internal static bool TryEnqueueContentIdsForResolve(
         UploadablePartyDetail payload,
         Action<IEnumerable<ulong>> enqueueMany,
-        Action<string> warningSink = null
+        Action<string>? warningSink = null
     ) {
         try {
             enqueueMany(BuildContentIdsForResolve(payload));
