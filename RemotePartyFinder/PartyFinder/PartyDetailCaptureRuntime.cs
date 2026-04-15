@@ -28,31 +28,36 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         "40 53 48 83 EC 20 48 8B D9 E8 ?? ?? ?? ?? 84 C0 74 07 C6 83 ?? ?? ?? ?? ?? 48 83 C4 20 5B C3 CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC 40 53";
 
     private readonly PartyDetailCaptureState _state;
+    private readonly Func<bool> _isDetailVisible;
     private readonly object _gate = new();
     private IDisposable? _hookScope;
     private ScannerAttempt? _scannerAttempt;
     private ActiveScannerIntercept? _activeScannerIntercept;
-    private long _latestObservedStateVersion;
-    private ObservedAgentState _latestObservedState = ObservedAgentState.Unavailable;
+    private long _detailVisibleGeneration;
+    private bool _isDetailCurrentlyVisible;
     private RequestFreshnessGate? _requestFreshnessGate;
 
     internal PartyDetailCaptureRuntime(PartyDetailCaptureState state) {
         _state = state ?? throw new ArgumentNullException(nameof(state));
+        _isDetailVisible = static () => false;
     }
 
     internal PartyDetailCaptureRuntime(
         PartyDetailCaptureState state,
         IGameInteropProvider interopProvider,
+        Func<bool>? isDetailVisible = null,
         Action<string>? warningSink = null
-    ) : this(state, new DalamudPartyDetailCaptureHookFactory(interopProvider), warningSink) {
+    ) : this(state, new DalamudPartyDetailCaptureHookFactory(interopProvider), isDetailVisible, warningSink) {
     }
 
     private PartyDetailCaptureRuntime(
         PartyDetailCaptureState state,
         IPartyDetailCaptureHookFactory hookFactory,
+        Func<bool>? isDetailVisible = null,
         Action<string>? warningSink = null
     ) : this(state) {
         ArgumentNullException.ThrowIfNull(hookFactory);
+        _isDetailVisible = isDetailVisible ?? (static () => false);
 
         try {
             _hookScope = hookFactory.CreateHooks(OpenListingDetour, OpenListingByContentIdDetour);
@@ -65,9 +70,18 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     internal static PartyDetailCaptureRuntime CreateForTesting(
         PartyDetailCaptureState state,
         IPartyDetailCaptureHookFactory hookFactory,
+        Func<bool>? isDetailVisible = null,
         Action<string>? warningSink = null
     ) {
-        return new PartyDetailCaptureRuntime(state, hookFactory, warningSink);
+        return new PartyDetailCaptureRuntime(state, hookFactory, isDetailVisible, warningSink);
+    }
+
+    internal static PartyDetailCaptureRuntime CreateForTesting(
+        PartyDetailCaptureState state,
+        IPartyDetailCaptureHookFactory hookFactory,
+        Action<string>? warningSink
+    ) {
+        return new PartyDetailCaptureRuntime(state, hookFactory, null, warningSink);
     }
 
     internal static IDisposable CreateHookScope<TPrimaryHook, TSecondaryHook>(
@@ -192,7 +206,10 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     }
 
     internal void OnFrameworkUpdate() {
-        ObserveAgentSnapshot(TryBuildSnapshotFromAgent(out var snapshot) ? snapshot : null);
+        ObserveFrameworkTick(
+            _isDetailVisible(),
+            TryBuildSnapshotFromAgent(out var snapshot) ? snapshot : null
+        );
     }
 
     internal void TestRecordArrivalFromAgentSnapshot(UploadablePartyDetail snapshot) {
@@ -200,8 +217,12 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         TryRecordArrivalFromAgentSnapshotCore(snapshot, enforceFreshness: false);
     }
 
-    internal void TestObserveAgentSnapshot(UploadablePartyDetail? snapshot) {
-        ObserveAgentSnapshot(snapshot);
+    internal void TestSetDetailVisible(bool isVisible) {
+        UpdateDetailVisibility(isVisible);
+    }
+
+    internal void TestFrameworkTick(UploadablePartyDetail? snapshot) {
+        ObserveFrameworkTick(GetCurrentDetailVisibility(), snapshot);
     }
 
     private bool OpenListingDetour(nint agent, ulong listingId) {
@@ -247,14 +268,13 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         ArmFreshnessGate(cycle.RequestSerial);
     }
 
-    private void ObserveAgentSnapshot(UploadablePartyDetail? snapshot) {
-        AdvanceObservedState(CreateObservedAgentState(snapshot));
-
+    private void ObserveFrameworkTick(bool isDetailVisible, UploadablePartyDetail? snapshot) {
+        UpdateDetailVisibility(isDetailVisible);
         if (!_state.HasActiveRequest) {
             return;
         }
 
-        if (snapshot is null) {
+        if (!isDetailVisible || snapshot is null) {
             return;
         }
 
@@ -361,18 +381,23 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
 
     private void ArmFreshnessGate(long requestSerial) {
         lock (_gate) {
-            _requestFreshnessGate = new RequestFreshnessGate(requestSerial, _latestObservedStateVersion);
+            _requestFreshnessGate = new RequestFreshnessGate(requestSerial, _detailVisibleGeneration);
         }
     }
 
-    private void AdvanceObservedState(ObservedAgentState nextState) {
+    private void UpdateDetailVisibility(bool isVisible) {
         lock (_gate) {
-            if (_latestObservedState == nextState) {
-                return;
+            if (!_isDetailCurrentlyVisible && isVisible) {
+                _detailVisibleGeneration++;
             }
 
-            _latestObservedState = nextState;
-            _latestObservedStateVersion++;
+            _isDetailCurrentlyVisible = isVisible;
+        }
+    }
+
+    private bool GetCurrentDetailVisibility() {
+        lock (_gate) {
+            return _isDetailCurrentlyVisible;
         }
     }
 
@@ -380,7 +405,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         lock (_gate) {
             return _requestFreshnessGate is not { } gate
                    || gate.RequestSerial != requestSerial
-                   || _latestObservedStateVersion > gate.ObservedStateVersionAtRequestStart;
+                   || _detailVisibleGeneration > gate.DetailVisibleGenerationAtRequestStart;
         }
     }
 
@@ -392,63 +417,9 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         }
     }
 
-    private static ObservedAgentState CreateObservedAgentState(UploadablePartyDetail? snapshot) {
-        if (snapshot is null || !PartyDetailCollector.IsSnapshotReadyForEnqueue(snapshot)) {
-            return ObservedAgentState.Unavailable;
-        }
-
-        return new ObservedAgentState(
-            true,
-            snapshot.ListingId,
-            snapshot.LeaderContentId,
-            snapshot.HomeWorld,
-            ComputeObservationFingerprint(snapshot)
-        );
-    }
-
-    private static ulong ComputeObservationFingerprint(UploadablePartyDetail snapshot) {
-        unchecked {
-            var hash = 1469598103934665603UL;
-            hash = MixObservationHash(hash, snapshot.ListingId);
-            hash = MixObservationHash(hash, snapshot.LeaderContentId);
-            hash = MixObservationHash(hash, snapshot.HomeWorld);
-            hash = MixObservationHash(hash, (ulong)snapshot.MemberContentIds.Count);
-
-            for (var i = 0; i < snapshot.MemberContentIds.Count; i++) {
-                hash = MixObservationHash(hash, snapshot.MemberContentIds[i]);
-                hash = MixObservationHash(hash, snapshot.MemberJobs[i]);
-            }
-
-            foreach (var slotFlag in snapshot.SlotFlags) {
-                foreach (var character in slotFlag) {
-                    hash = MixObservationHash(hash, character);
-                }
-            }
-
-            return hash;
-        }
-    }
-
-    private static ulong MixObservationHash(ulong hash, ulong value) {
-        unchecked {
-            hash ^= value;
-            hash *= 1099511628211UL;
-            return hash;
-        }
-    }
-
     private sealed record ScannerAttempt(Guid AttemptId, uint ListingId, ulong ContentId, long? RequestSerial);
     private sealed record ActiveScannerIntercept(Guid AttemptId, uint ListingId, ulong ContentId);
-    private sealed record RequestFreshnessGate(long RequestSerial, long ObservedStateVersionAtRequestStart);
-    private readonly record struct ObservedAgentState(
-        bool IsAvailable,
-        uint ListingId,
-        ulong LeaderContentId,
-        ushort HomeWorld,
-        ulong Fingerprint
-    ) {
-        internal static ObservedAgentState Unavailable { get; } = new(false, 0U, 0UL, 0, 0UL);
-    }
+    private sealed record RequestFreshnessGate(long RequestSerial, long DetailVisibleGenerationAtRequestStart);
 
     private sealed class DalamudPartyDetailCaptureHookFactory : IPartyDetailCaptureHookFactory {
         private readonly IGameInteropProvider _interopProvider;

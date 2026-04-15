@@ -61,28 +61,54 @@ public sealed class PartyDetailCollectorCaptureTests {
     }
 
     [Fact]
-    public void Reopening_same_listing_does_not_consume_stale_preexisting_snapshot_before_fresh_observation() {
+    public void Reopening_same_listing_does_not_consume_stale_preexisting_snapshot_before_detail_reopens() {
         var state = new PartyDetailCaptureState();
         using var runtime = new FakePartyDetailCaptureRuntime(state);
         var harness = new CollectorHarness(state);
         var collector = harness.CreateCollector();
         var snapshot = CreateCompleteSnapshot();
 
-        runtime.ObserveAgentSnapshot(snapshot);
+        runtime.SetDetailVisible(true);
+        runtime.Tick(snapshot);
+        runtime.SetDetailVisible(false);
         runtime.BeginManualCycle(9001U, 44UL);
 
-        runtime.ObserveAgentSnapshot(snapshot);
+        runtime.Tick(snapshot);
         collector.Update();
 
         Assert.Empty(harness.CapturedPayloads);
         Assert.Equal(0L, state.LastConsumedGeneration);
 
-        runtime.ObserveNoAgentSnapshot();
-        runtime.ObserveAgentSnapshot(snapshot);
+        runtime.SetDetailVisible(true);
+        runtime.Tick(snapshot);
         collector.Update();
 
         Assert.Single(harness.CapturedPayloads);
         Assert.Equal(1L, state.LastConsumedGeneration);
+    }
+
+    [Fact]
+    public void Reopening_same_listing_with_identical_payload_enqueues_again_after_detail_reopens() {
+        var state = new PartyDetailCaptureState();
+        using var runtime = new FakePartyDetailCaptureRuntime(state);
+        var harness = new CollectorHarness(state);
+        var collector = harness.CreateCollector();
+        var snapshot = CreateCompleteSnapshot();
+
+        runtime.SetDetailVisible(false);
+        runtime.BeginManualCycle(9001U, 44UL);
+        runtime.SetDetailVisible(true);
+        runtime.Tick(snapshot);
+        collector.Update();
+
+        runtime.SetDetailVisible(false);
+        runtime.BeginManualCycle(9001U, 44UL);
+        runtime.SetDetailVisible(true);
+        runtime.Tick(snapshot);
+        collector.Update();
+
+        Assert.Equal(2, harness.CapturedPayloads.Count);
+        Assert.Equal(2L, state.LastConsumedGeneration);
     }
 
     [Fact]
@@ -184,12 +210,12 @@ public sealed class PartyDetailCollectorCaptureTests {
             _runtime.TestRecordArrivalFromAgentSnapshot(snapshot);
         }
 
-        internal void ObserveAgentSnapshot(UploadablePartyDetail snapshot) {
-            _runtime.TestObserveAgentSnapshot(snapshot);
+        internal void SetDetailVisible(bool isVisible) {
+            _runtime.TestSetDetailVisible(isVisible);
         }
 
-        internal void ObserveNoAgentSnapshot() {
-            _runtime.TestObserveAgentSnapshot(null);
+        internal void Tick(UploadablePartyDetail? snapshot) {
+            _runtime.TestFrameworkTick(snapshot);
         }
 
         public void Dispose() {

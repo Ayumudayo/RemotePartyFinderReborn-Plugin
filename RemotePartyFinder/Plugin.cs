@@ -85,6 +85,7 @@ public class Plugin : IDalamudPlugin {
         this.PartyDetailCaptureRuntime = new PartyDetailCaptureRuntime(
             this.PartyDetailCaptureState,
             this.GameInteropProvider,
+            () => this.GameGui.GetAddonByName("LookingForGroupDetail", 1) != 0,
             message => Log.Warning(message)
         );
         this.PartyDetailCollector = new PartyDetailCollector(this);
