@@ -48,6 +48,61 @@ public sealed class PartyDetailCollectorCaptureTests {
     }
 
     [Fact]
+    public void Manual_request_never_routes_through_scanner_headless_boundary() {
+        using var harness = new ScannerHeadlessBoundaryHarness();
+        var snapshot = CreateCompleteSnapshot();
+
+        harness.BeginManualRequest(9001U, 44UL);
+        harness.ObserveSharedPopulate();
+        harness.Tick(snapshot);
+        harness.UpdateCollector();
+
+        Assert.False(harness.ScannerHeadlessBoundaryTouched);
+        Assert.Single(harness.CapturedPayloads);
+        Assert.Equal(1L, harness.CaptureState.LastConsumedGeneration);
+    }
+
+    [Fact]
+    public void Scanner_headless_scope_is_disabled_by_default() {
+        using var harness = new ScannerHeadlessBoundaryHarness();
+        var snapshot = CreateCompleteSnapshot();
+
+        harness.BeginScannerTarget(9001U, 44UL);
+
+        Assert.False(harness.TryBeginScannerHeadlessScope());
+        Assert.False(harness.TryRecordScannerHeadlessArrival(snapshot));
+        Assert.False(harness.ScannerHeadlessBoundaryTouched);
+    }
+
+    [Fact]
+    public void Scanner_headless_scope_respects_allow_headless_flag() {
+        using var harness = new ScannerHeadlessBoundaryHarness(ScannerHeadlessBackendKind.PopulateCorrelation);
+
+        harness.BeginScannerTarget(9001U, 44UL, allowHeadless: false);
+
+        Assert.False(harness.TryBeginScannerHeadlessScope());
+        Assert.False(harness.ScannerHeadlessBoundaryTouched);
+    }
+
+    [Fact]
+    public void Scanner_headless_arrival_must_reenter_shared_capture_state_and_collector() {
+        using var harness = new ScannerHeadlessBoundaryHarness(ScannerHeadlessBackendKind.PopulateCorrelation);
+        var snapshot = CreateCompleteSnapshot();
+
+        harness.BeginScannerTarget(9001U, 44UL);
+        harness.ObserveSharedPopulate();
+
+        Assert.True(harness.TryBeginScannerHeadlessScope());
+        Assert.True(harness.TryRecordScannerHeadlessArrival(snapshot));
+
+        harness.UpdateCollector();
+
+        Assert.True(harness.ScannerHeadlessBoundaryTouched);
+        Assert.Single(harness.CapturedPayloads);
+        Assert.Equal(1L, harness.CaptureState.LastConsumedGeneration);
+    }
+
+    [Fact]
     public void ComposePartyDetailCapture_reuses_single_capture_state_for_runtime_and_collector() {
         var composition = Plugin.ComposePartyDetailCapture(
             plugin: null,
@@ -262,6 +317,82 @@ public sealed class PartyDetailCollectorCaptureTests {
 
         public void Dispose() {
             _runtime.Dispose();
+        }
+    }
+
+    private sealed class ScannerHeadlessBoundaryHarness : IDisposable {
+        private readonly PartyDetailCaptureRuntime _runtime;
+        private readonly PartyDetailCollector _collector;
+        private readonly Guid _attemptId = Guid.NewGuid();
+
+        internal ScannerHeadlessBoundaryHarness(
+            ScannerHeadlessBackendKind backendKind = ScannerHeadlessBackendKind.Disabled
+        ) {
+            CaptureState = new PartyDetailCaptureState();
+            _runtime = PartyDetailCaptureRuntime.CreateForTesting(CaptureState, backendKind);
+            _collector = new PartyDetailCollector(
+                CaptureState,
+                tryQueuePayload: payload => {
+                    CapturedPayloads.Add(CloneCapturedPayload(payload));
+                    return true;
+                },
+                pumpPendingUploads: static () => { }
+            );
+        }
+
+        internal PartyDetailCaptureState CaptureState { get; }
+        internal List<UploadablePartyDetail> CapturedPayloads { get; } = new();
+        internal bool ScannerHeadlessBoundaryTouched { get; private set; }
+
+        internal void BeginManualRequest(uint listingId, ulong contentId) {
+            _runtime.TestBeginManualRequestCycle(listingId, contentId);
+        }
+
+        internal void BeginScannerTarget(uint listingId, ulong contentId, bool allowHeadless = true) {
+            _runtime.ArmScannerRequest(_attemptId, listingId, contentId, allowHeadless);
+            _runtime.BeginScannerOpenAttempt(_attemptId);
+            _runtime.TestInterceptOpenListing(listingId, contentId);
+            _runtime.EndScannerOpenAttempt(_attemptId);
+        }
+
+        internal void ObserveSharedPopulate() {
+            _runtime.TestObservePopulationEvent();
+        }
+
+        internal void Tick(UploadablePartyDetail snapshot) {
+            _runtime.TestFrameworkTick(snapshot);
+        }
+
+        internal bool TryBeginScannerHeadlessScope() {
+            var began = _runtime.TryBeginScannerHeadlessScope(_attemptId);
+            ScannerHeadlessBoundaryTouched |= began;
+            return began;
+        }
+
+        internal bool TryRecordScannerHeadlessArrival(UploadablePartyDetail snapshot) {
+            var recorded = _runtime.TryRecordScannerHeadlessArrival(_attemptId, snapshot);
+            ScannerHeadlessBoundaryTouched |= recorded;
+            return recorded;
+        }
+
+        internal void UpdateCollector() {
+            _collector.Update();
+        }
+
+        public void Dispose() {
+            _runtime.Dispose();
+        }
+
+        private static UploadablePartyDetail CloneCapturedPayload(UploadablePartyDetail payload) {
+            return new UploadablePartyDetail {
+                ListingId = payload.ListingId,
+                LeaderContentId = payload.LeaderContentId,
+                LeaderName = payload.LeaderName,
+                HomeWorld = payload.HomeWorld,
+                MemberContentIds = [.. payload.MemberContentIds],
+                MemberJobs = [.. payload.MemberJobs],
+                SlotFlags = [.. payload.SlotFlags],
+            };
         }
     }
 

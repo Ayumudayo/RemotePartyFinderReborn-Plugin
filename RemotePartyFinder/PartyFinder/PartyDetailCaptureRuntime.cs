@@ -14,6 +14,12 @@ internal enum PartyDetailScannerAttemptOutcome {
     Succeeded,
 }
 
+internal enum ScannerHeadlessBackendKind {
+    Disabled,
+    NativeSuppression,
+    PopulateCorrelation,
+}
+
 internal interface IPartyDetailCaptureHookFactory {
     IDisposable CreateHooks(
         Func<nint, ulong, bool> openListingDetour,
@@ -29,32 +35,43 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         "40 53 48 83 EC 20 48 8B D9 E8 ?? ?? ?? ?? 84 C0 74 07 C6 83 ?? ?? ?? ?? ?? 48 83 C4 20 5B C3 CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC CC 40 53";
     private readonly PartyDetailCaptureState _state;
     private readonly object _gate = new();
+    private readonly ScannerHeadlessBackendKind _scannerHeadlessBackendKind;
     private IDisposable? _hookScope;
     private ScannerAttempt? _scannerAttempt;
     private ActiveScannerIntercept? _activeScannerIntercept;
+    private ActiveScannerHeadlessScope? _activeScannerHeadlessScope;
     private long _postRequestPopulationGeneration;
     private RequestPopulationGate? _requestPopulationGate;
     internal PartyDetailCaptureState CaptureState => _state;
 
-    // Scanner-owned PF detail UI suppression is intentionally deferred until a
-    // sufficiently narrow native PF detail open/show owner is confirmed.
+    // Scanner-owned PF detail UI suppression remains deferred. The shared
+    // PopulateCorrelation boundary is in place for scanner-owned arrivals, but
+    // the current PF-specific addon opener candidate (sub_14053DE30) is too
+    // broad because it mutates agent/UI state around PopulateListingData in
+    // addition to opening the detail addon.
 
-    internal PartyDetailCaptureRuntime(PartyDetailCaptureState state) {
+    internal PartyDetailCaptureRuntime(
+        PartyDetailCaptureState state,
+        ScannerHeadlessBackendKind scannerHeadlessBackendKind = ScannerHeadlessBackendKind.Disabled
+    ) {
         _state = state ?? throw new ArgumentNullException(nameof(state));
+        _scannerHeadlessBackendKind = scannerHeadlessBackendKind;
     }
 
     internal PartyDetailCaptureRuntime(
         PartyDetailCaptureState state,
         IGameInteropProvider interopProvider,
-        Action<string>? warningSink = null
-    ) : this(state, new DalamudPartyDetailCaptureHookFactory(interopProvider), warningSink) {
+        Action<string>? warningSink = null,
+        ScannerHeadlessBackendKind scannerHeadlessBackendKind = ScannerHeadlessBackendKind.Disabled
+    ) : this(state, new DalamudPartyDetailCaptureHookFactory(interopProvider), warningSink, scannerHeadlessBackendKind) {
     }
 
     private PartyDetailCaptureRuntime(
         PartyDetailCaptureState state,
         IPartyDetailCaptureHookFactory hookFactory,
-        Action<string>? warningSink = null
-    ) : this(state) {
+        Action<string>? warningSink = null,
+        ScannerHeadlessBackendKind scannerHeadlessBackendKind = ScannerHeadlessBackendKind.Disabled
+    ) : this(state, scannerHeadlessBackendKind) {
         ArgumentNullException.ThrowIfNull(hookFactory);
 
         try {
@@ -67,10 +84,18 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
 
     internal static PartyDetailCaptureRuntime CreateForTesting(
         PartyDetailCaptureState state,
-        IPartyDetailCaptureHookFactory hookFactory,
-        Action<string>? warningSink = null
+        ScannerHeadlessBackendKind scannerHeadlessBackendKind
     ) {
-        return new PartyDetailCaptureRuntime(state, hookFactory, warningSink);
+        return new PartyDetailCaptureRuntime(state, scannerHeadlessBackendKind);
+    }
+
+    internal static PartyDetailCaptureRuntime CreateForTesting(
+        PartyDetailCaptureState state,
+        IPartyDetailCaptureHookFactory hookFactory,
+        Action<string>? warningSink = null,
+        ScannerHeadlessBackendKind scannerHeadlessBackendKind = ScannerHeadlessBackendKind.Disabled
+    ) {
+        return new PartyDetailCaptureRuntime(state, hookFactory, warningSink, scannerHeadlessBackendKind);
     }
 
     internal static IDisposable CreateHookScope<TPrimaryHook, TSecondaryHook>(
@@ -109,21 +134,23 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         lock (_gate) {
             _scannerAttempt = null;
             _activeScannerIntercept = null;
+            _activeScannerHeadlessScope = null;
             _requestPopulationGate = null;
         }
     }
 
-    public void ArmScannerRequest(Guid attemptId, uint listingId, ulong contentId) {
+    public void ArmScannerRequest(Guid attemptId, uint listingId, ulong contentId, bool allowHeadless = true) {
         lock (_gate) {
             if (_scannerAttempt is { AttemptId: var existingAttemptId } existing && existingAttemptId == attemptId) {
                 _scannerAttempt = existing with {
                     ListingId = listingId,
                     ContentId = contentId,
+                    AllowHeadless = allowHeadless,
                 };
                 return;
             }
 
-            _scannerAttempt = new ScannerAttempt(attemptId, listingId, contentId, null);
+            _scannerAttempt = new ScannerAttempt(attemptId, listingId, contentId, null, allowHeadless);
         }
     }
 
@@ -162,6 +189,10 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
             if (_activeScannerIntercept is { AttemptId: var activeAttemptId } && activeAttemptId == attemptId) {
                 _activeScannerIntercept = null;
             }
+
+            if (_activeScannerHeadlessScope is { AttemptId: var activeHeadlessAttemptId } && activeHeadlessAttemptId == attemptId) {
+                _activeScannerHeadlessScope = null;
+            }
         }
     }
 
@@ -175,8 +206,96 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         lock (_gate) {
             _scannerAttempt = null;
             _activeScannerIntercept = null;
+            _activeScannerHeadlessScope = null;
             _requestPopulationGate = null;
         }
+    }
+
+    internal bool TryBeginScannerHeadlessScope(Guid attemptId) {
+        if (_scannerHeadlessBackendKind != ScannerHeadlessBackendKind.PopulateCorrelation) {
+            return false;
+        }
+
+        lock (_gate) {
+            if (_activeScannerHeadlessScope is { AttemptId: var activeAttemptId } activeScope && activeAttemptId == attemptId) {
+                return true;
+            }
+
+            if (_scannerAttempt is not { AttemptId: var armedAttemptId, RequestSerial: var requestSerial, AllowHeadless: true } attempt
+                || armedAttemptId != attemptId
+                || !requestSerial.HasValue) {
+                return false;
+            }
+
+            if (!_state.TryGetCurrentRequestCycle(out var cycle)
+                || cycle.RequestSerial != requestSerial.Value
+                || cycle.Owner != PartyDetailRequestOwner.Scanner) {
+                return false;
+            }
+
+            _activeScannerHeadlessScope = new ActiveScannerHeadlessScope(
+                attemptId,
+                cycle.RequestSerial,
+                cycle.ListingId,
+                cycle.ContentId
+            );
+            return true;
+        }
+    }
+
+    internal void EndScannerHeadlessScope(Guid attemptId) {
+        lock (_gate) {
+            if (_activeScannerHeadlessScope is { AttemptId: var activeAttemptId } && activeAttemptId == attemptId) {
+                _activeScannerHeadlessScope = null;
+            }
+        }
+    }
+
+    internal bool TryRecordScannerHeadlessArrival(Guid attemptId, UploadablePartyDetail snapshot) {
+        ArgumentNullException.ThrowIfNull(snapshot);
+
+        if (_scannerHeadlessBackendKind != ScannerHeadlessBackendKind.PopulateCorrelation) {
+            return false;
+        }
+
+        ActiveScannerHeadlessScope? scope;
+        lock (_gate) {
+            if (_activeScannerHeadlessScope is not { AttemptId: var activeAttemptId } activeScope || activeAttemptId != attemptId) {
+                return false;
+            }
+
+            scope = activeScope;
+        }
+
+        if (!_state.TryGetCurrentRequestCycle(out var cycle)
+            || cycle.RequestSerial != scope.RequestSerial
+            || cycle.Owner != PartyDetailRequestOwner.Scanner) {
+            return false;
+        }
+
+        if (!HasObservedPostRequestPopulation(scope.RequestSerial)) {
+            return false;
+        }
+
+        if (!PartyDetailCollector.IsSnapshotReadyForEnqueue(snapshot)) {
+            return false;
+        }
+
+        if (scope.ListingId != 0 && snapshot.ListingId != scope.ListingId) {
+            return false;
+        }
+
+        if (scope.ContentId != 0 && snapshot.LeaderContentId != scope.ContentId) {
+            return false;
+        }
+
+        if (!_state.TryRecordArrival(scope.RequestSerial, snapshot)) {
+            return false;
+        }
+
+        ClearPopulationGate(scope.RequestSerial);
+        EndScannerHeadlessScope(attemptId);
+        return true;
     }
 
     internal void TestInterceptOpenListing(uint listingId, ulong contentId) {
@@ -393,8 +512,9 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         }
     }
 
-    private sealed record ScannerAttempt(Guid AttemptId, uint ListingId, ulong ContentId, long? RequestSerial);
+    private sealed record ScannerAttempt(Guid AttemptId, uint ListingId, ulong ContentId, long? RequestSerial, bool AllowHeadless);
     private sealed record ActiveScannerIntercept(Guid AttemptId, uint ListingId, ulong ContentId);
+    private sealed record ActiveScannerHeadlessScope(Guid AttemptId, long RequestSerial, uint ListingId, ulong ContentId);
     private sealed record RequestPopulationGate(long RequestSerial, long SignalGenerationAtRequestStart);
 
     private sealed class DalamudPartyDetailCaptureHookFactory : IPartyDetailCaptureHookFactory {
