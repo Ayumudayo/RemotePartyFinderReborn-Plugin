@@ -7,15 +7,6 @@ internal readonly record struct DebugPfListingCandidate(uint ListingId, ulong Co
 
 internal readonly record struct DebugPfDetailSnapshot(uint ListingId, ulong LeaderContentId, int NonZeroMembers, int TotalSlots);
 
-internal readonly record struct DebugPfCollectorAckSnapshot(
-    long QueueAckVersion,
-    uint QueuedListingId,
-    long SuccessfulAckVersion,
-    uint SuccessfulListingId,
-    long TerminalAckVersion,
-    uint TerminalListingId
-);
-
 internal enum DebugPfScanState {
     Idle,
     SyncQueue,
@@ -40,9 +31,7 @@ internal sealed class DebugPfScanStateMachine {
     private int _processedCount;
     private DateTime _nextActionAtUtc = DateTime.MinValue;
     private DateTime _stateDeadlineUtc = DateTime.MinValue;
-    private long _waitForQueueAckVersion = -1;
-    private long _waitForAckVersion = -1;
-    private long _waitForTerminalAckVersion = -1;
+    private long? _activeRequestSerial;
     private DebugPfDetailSnapshot _lastReadySnapshot;
     private int _readyStableTicks;
     private string _lastAttemptReason = "none";
@@ -66,6 +55,7 @@ internal sealed class DebugPfScanStateMachine {
     internal PartyDetailScannerAttemptOutcome? LastTerminalOutcome => _lastTerminalOutcome;
     internal bool LastAttemptSuccess => _lastAttemptSuccess;
     internal uint LastAttemptListingId => _lastAttemptListingId;
+    internal long? CurrentRequestSerial => _activeRequestSerial;
 
     internal void Reset() {
         _queue.Reset();
@@ -78,9 +68,7 @@ internal sealed class DebugPfScanStateMachine {
         _processedCount = 0;
         _nextActionAtUtc = DateTime.MinValue;
         _stateDeadlineUtc = DateTime.MinValue;
-        _waitForQueueAckVersion = -1;
-        _waitForAckVersion = -1;
-        _waitForTerminalAckVersion = -1;
+        _activeRequestSerial = null;
         _lastReadySnapshot = default;
         _readyStableTicks = 0;
         _lastAttemptReason = "none";
@@ -148,7 +136,7 @@ internal sealed class DebugPfScanStateMachine {
         int detailReadyTimeoutMs,
         int configuredRetries,
         int postListingCooldownMs,
-        DebugPfCollectorAckSnapshot ackSnapshot
+        long? requestSerial = null
     ) {
         if (!_hasTarget) {
             _state = DebugPfScanState.SyncQueue;
@@ -160,11 +148,9 @@ internal sealed class DebugPfScanStateMachine {
 
         if (opened) {
             _stateDeadlineUtc = nowUtc.AddMilliseconds(GetDetailReadyTimeoutMs(detailReadyTimeoutMs));
+            _activeRequestSerial = requestSerial;
             _readyStableTicks = 0;
             _lastReadySnapshot = default;
-            _waitForQueueAckVersion = ackSnapshot.QueueAckVersion;
-            _waitForAckVersion = ackSnapshot.SuccessfulAckVersion;
-            _waitForTerminalAckVersion = ackSnapshot.TerminalAckVersion;
             _state = DebugPfScanState.WaitDetailReady;
             return;
         }
@@ -176,6 +162,10 @@ internal sealed class DebugPfScanStateMachine {
         }
 
         MarkAttempt(nowUtc, success: false, "open_failed", PartyDetailScannerAttemptOutcome.OpenFailed, postListingCooldownMs);
+    }
+
+    internal void AttachRequestSerial(long? requestSerial) {
+        _activeRequestSerial = requestSerial;
     }
 
     internal void HandleDetailReadyState(
@@ -227,30 +217,14 @@ internal sealed class DebugPfScanStateMachine {
         MarkAttempt(nowUtc, success: false, "detail_timeout", PartyDetailScannerAttemptOutcome.TimedOut, postListingCooldownMs);
     }
 
-    internal void HandleCollectedState(DateTime nowUtc, DebugPfCollectorAckSnapshot ackSnapshot, int postListingCooldownMs) {
+    internal void HandleCollectedState(DateTime nowUtc, bool hasConsumedAck, int postListingCooldownMs) {
         if (!_hasTarget) {
             _state = DebugPfScanState.SyncQueue;
             return;
         }
 
-        var hasQueuedAck = ackSnapshot.QueueAckVersion > _waitForQueueAckVersion
-                           && ackSnapshot.QueuedListingId == _target.ListingId;
-        if (hasQueuedAck) {
+        if (hasConsumedAck) {
             MarkAttempt(nowUtc, success: true, "queued", PartyDetailScannerAttemptOutcome.Succeeded, postListingCooldownMs);
-            return;
-        }
-
-        var hasAppliedAck = ackSnapshot.SuccessfulAckVersion > _waitForAckVersion
-                            && ackSnapshot.SuccessfulListingId == _target.ListingId;
-        if (hasAppliedAck) {
-            MarkAttempt(nowUtc, success: true, "collected", PartyDetailScannerAttemptOutcome.Succeeded, postListingCooldownMs);
-            return;
-        }
-
-        var hasTerminalAck = ackSnapshot.TerminalAckVersion > _waitForTerminalAckVersion
-                             && ackSnapshot.TerminalListingId == _target.ListingId;
-        if (hasTerminalAck) {
-            MarkAttempt(nowUtc, success: true, "listing_missing", PartyDetailScannerAttemptOutcome.Succeeded, postListingCooldownMs);
             return;
         }
 
@@ -280,6 +254,7 @@ internal sealed class DebugPfScanStateMachine {
         _hasTarget = false;
         _retryTargetAfterCooldown = false;
         _openAttemptsForTarget = 0;
+        _activeRequestSerial = null;
     }
 
     internal static bool ShouldRetryTargetAfterFailure(int attemptsMade, int configuredRetries) {
@@ -316,9 +291,7 @@ internal sealed class DebugPfScanStateMachine {
         _hasTarget = false;
         _retryTargetAfterCooldown = false;
         _openAttemptsForTarget = 0;
-        _waitForQueueAckVersion = -1;
-        _waitForAckVersion = -1;
-        _waitForTerminalAckVersion = -1;
+        _activeRequestSerial = null;
         _readyStableTicks = 0;
         _lastReadySnapshot = default;
         _nextActionAtUtc = nowUtc.AddMilliseconds(Math.Clamp(postListingCooldownMs, 50, 3000));

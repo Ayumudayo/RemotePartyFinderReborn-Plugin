@@ -57,8 +57,7 @@ public sealed class RetryConfigurationTests {
             actionIntervalMs: 400,
             detailReadyTimeoutMs: 3500,
             configuredRetries: 1,
-            postListingCooldownMs: 300,
-            ackSnapshot: default
+            postListingCooldownMs: 300
         );
 
         Assert.Equal(DebugPfScanState.Cooldown, stateMachine.State);
@@ -76,8 +75,7 @@ public sealed class RetryConfigurationTests {
             actionIntervalMs: 400,
             detailReadyTimeoutMs: 3500,
             configuredRetries: 1,
-            postListingCooldownMs: 300,
-            ackSnapshot: default
+            postListingCooldownMs: 300
         );
 
         Assert.Equal(DebugPfScanState.Cooldown, stateMachine.State);
@@ -110,7 +108,7 @@ public sealed class RetryConfigurationTests {
     }
 
     [Fact]
-    public void Scanner_completes_once_targets_are_queued_for_collection() {
+    public void Scanner_completes_once_targets_are_collected() {
         var nowUtc = new DateTime(2026, 4, 14, 1, 0, 0, DateTimeKind.Utc);
         var queue = new DebugPfListingQueue();
         var stateMachine = new DebugPfScanStateMachine(queue);
@@ -141,8 +139,7 @@ public sealed class RetryConfigurationTests {
             actionIntervalMs: 400,
             detailReadyTimeoutMs: 3500,
             configuredRetries: 1,
-            postListingCooldownMs: 300,
-            ackSnapshot: default
+            postListingCooldownMs: 300
         );
 
         Assert.Equal(DebugPfScanState.WaitDetailReady, stateMachine.State);
@@ -170,14 +167,7 @@ public sealed class RetryConfigurationTests {
 
         stateMachine.HandleCollectedState(
             nowUtc.AddMilliseconds(30),
-            new DebugPfCollectorAckSnapshot(
-                QueueAckVersion: 1,
-                QueuedListingId: target.ListingId,
-                SuccessfulAckVersion: 0,
-                SuccessfulListingId: 0,
-                TerminalAckVersion: 0,
-                TerminalListingId: 0
-            ),
+            hasConsumedAck: true,
             postListingCooldownMs: 300
         );
 

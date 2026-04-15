@@ -183,7 +183,7 @@ public sealed class PartyDetailCaptureStateTests {
             detailReadyTimeoutMs: 3500,
             configuredRetries: 0,
             postListingCooldownMs: 300,
-            ackSnapshot: default
+            requestSerial: null
         );
 
         Assert.Equal(PartyDetailScannerAttemptOutcome.OpenFailed, stateMachine.LastTerminalOutcome);
@@ -191,7 +191,7 @@ public sealed class PartyDetailCaptureStateTests {
     }
 
     [Fact]
-    public void State_machine_exposes_typed_success_outcome_when_listing_is_queued() {
+    public void State_machine_exposes_typed_success_outcome_when_listing_is_collected() {
         var nowUtc = new DateTime(2026, 4, 15, 1, 0, 0, DateTimeKind.Utc);
         var queue = new DebugPfListingQueue();
         var stateMachine = new DebugPfScanStateMachine(queue);
@@ -213,8 +213,7 @@ public sealed class PartyDetailCaptureStateTests {
             actionIntervalMs: 400,
             detailReadyTimeoutMs: 3500,
             configuredRetries: 0,
-            postListingCooldownMs: 300,
-            ackSnapshot: default
+            postListingCooldownMs: 300
         );
         stateMachine.HandleDetailReadyState(
             nowUtc.AddMilliseconds(10),
@@ -234,14 +233,7 @@ public sealed class PartyDetailCaptureStateTests {
         );
         stateMachine.HandleCollectedState(
             nowUtc.AddMilliseconds(30),
-            new DebugPfCollectorAckSnapshot(
-                QueueAckVersion: 1,
-                QueuedListingId: target.ListingId,
-                SuccessfulAckVersion: 0,
-                SuccessfulListingId: 0,
-                TerminalAckVersion: 0,
-                TerminalListingId: 0
-            ),
+            hasConsumedAck: true,
             postListingCooldownMs: 300
         );
 

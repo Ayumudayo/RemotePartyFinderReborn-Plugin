@@ -128,6 +128,26 @@ internal sealed class PartyDetailCaptureState {
         }
     }
 
+    public bool IsScannerConsumedAckReady(long requestSerial, uint listingId, ulong contentId) {
+        lock (_gate) {
+            if (!_hasLatestArrival || _latestArrival.Generation != _latestConsumedGeneration) {
+                return false;
+            }
+
+            var requestContentMatches = _latestArrival.Cycle.ContentId == 0
+                                        || _latestArrival.Cycle.ContentId == contentId;
+            var snapshotContentMatches = contentId == 0
+                                         || _latestArrival.Snapshot.LeaderContentId == contentId;
+
+            return _latestArrival.Cycle.RequestSerial == requestSerial
+                   && _latestArrival.Cycle.Owner == PartyDetailRequestOwner.Scanner
+                   && _latestArrival.Cycle.ListingId == listingId
+                   && _latestArrival.Snapshot.ListingId == listingId
+                   && requestContentMatches
+                   && snapshotContentMatches;
+        }
+    }
+
     internal bool TryGetCurrentRequestCycle(out PartyDetailRequestCycle cycle) {
         lock (_gate) {
             return TryGetCurrentCycle(out cycle);

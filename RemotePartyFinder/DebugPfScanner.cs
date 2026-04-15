@@ -11,7 +11,6 @@ namespace RemotePartyFinder;
 
 internal sealed class DebugPfScanner : IDisposable {
     private readonly Plugin _plugin;
-    private readonly PartyDetailCollector _detailCollector;
     private readonly PartyDetailCaptureRuntime _detailCaptureRuntime;
 
     private readonly ConcurrentQueue<DebugPfListingCandidate> _incoming = new();
@@ -30,11 +29,11 @@ internal sealed class DebugPfScanner : IDisposable {
         Plugin plugin,
         PartyDetailCollector detailCollector,
         PartyDetailCaptureRuntime detailCaptureRuntime,
-        Gatherer _
+        Gatherer _unusedGatherer
     ) {
         _plugin = plugin;
-        _detailCollector = detailCollector;
         _detailCaptureRuntime = detailCaptureRuntime;
+        _ = detailCollector;
 
         _plugin.PartyFinderGui.ReceiveListing += OnListing;
         _plugin.Framework.Update += OnUpdate;
@@ -257,6 +256,9 @@ internal sealed class DebugPfScanner : IDisposable {
 
         var beforeAttempt = CaptureAttemptLogState();
         var opened = TryOpenTarget(target);
+        var requestSerial = _currentCaptureAttemptId != Guid.Empty
+            ? _detailCaptureRuntime.GetArmedScannerRequestSerial(_currentCaptureAttemptId)
+            : null;
         _stateMachine.HandleOpenAttemptResult(
             nowUtc,
             opened,
@@ -264,7 +266,7 @@ internal sealed class DebugPfScanner : IDisposable {
             _plugin.Configuration.AutoDetailScanDetailTimeoutMs,
             _plugin.Configuration.AutoDetailScanRetryCount,
             _plugin.Configuration.AutoDetailScanPostListingCooldownMs,
-            GetCollectorAckSnapshot()
+            requestSerial
         );
         LogAttemptIfChanged(beforeAttempt);
     }
@@ -303,9 +305,16 @@ internal sealed class DebugPfScanner : IDisposable {
 
     private void WaitCollected() {
         var beforeAttempt = CaptureAttemptLogState();
+        var target = _stateMachine.CurrentTarget;
+        var hasConsumedAck = _stateMachine.CurrentRequestSerial is { } requestSerial
+                             && _plugin.PartyDetailCaptureState.IsScannerConsumedAckReady(
+                                  requestSerial,
+                                  target.ListingId,
+                                  target.ContentId
+                              );
         _stateMachine.HandleCollectedState(
             DateTime.UtcNow,
-            GetCollectorAckSnapshot(),
+            hasConsumedAck,
             _plugin.Configuration.AutoDetailScanPostListingCooldownMs
         );
         LogAttemptIfChanged(beforeAttempt);
@@ -359,17 +368,6 @@ internal sealed class DebugPfScanner : IDisposable {
         lock (_collectionLock) {
             return _collectedRunSnapshot.ToList();
         }
-    }
-
-    private DebugPfCollectorAckSnapshot GetCollectorAckSnapshot() {
-        return new DebugPfCollectorAckSnapshot(
-            _detailCollector.LastQueuedAckVersion,
-            _detailCollector.LastUploadedListingId,
-            _detailCollector.LastSuccessfulUploadAckVersion,
-            _detailCollector.LastSuccessfulUploadListingId,
-            _detailCollector.LastTerminalUploadAckVersion,
-            _detailCollector.LastTerminalUploadListingId
-        );
     }
 
     private void StartRunFromFirstPage() {
