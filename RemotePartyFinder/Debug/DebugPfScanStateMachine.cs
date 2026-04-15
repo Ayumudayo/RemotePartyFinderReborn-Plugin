@@ -46,6 +46,7 @@ internal sealed class DebugPfScanStateMachine {
     private DebugPfDetailSnapshot _lastReadySnapshot;
     private int _readyStableTicks;
     private string _lastAttemptReason = "none";
+    private PartyDetailScannerAttemptOutcome? _lastTerminalOutcome;
     private bool _lastAttemptSuccess;
     private uint _lastAttemptListingId;
 
@@ -62,6 +63,7 @@ internal sealed class DebugPfScanStateMachine {
     internal int ConsecutiveFailures => _consecutiveFailures;
     internal int VisibleListingCount => _queue.VisibleCount;
     internal string LastAttemptReason => _lastAttemptReason;
+    internal PartyDetailScannerAttemptOutcome? LastTerminalOutcome => _lastTerminalOutcome;
     internal bool LastAttemptSuccess => _lastAttemptSuccess;
     internal uint LastAttemptListingId => _lastAttemptListingId;
 
@@ -82,6 +84,7 @@ internal sealed class DebugPfScanStateMachine {
         _lastReadySnapshot = default;
         _readyStableTicks = 0;
         _lastAttemptReason = "none";
+        _lastTerminalOutcome = null;
         _lastAttemptSuccess = false;
         _lastAttemptListingId = 0;
     }
@@ -172,7 +175,7 @@ internal sealed class DebugPfScanStateMachine {
             return;
         }
 
-        MarkAttempt(nowUtc, success: false, "open_failed", postListingCooldownMs);
+        MarkAttempt(nowUtc, success: false, "open_failed", PartyDetailScannerAttemptOutcome.OpenFailed, postListingCooldownMs);
     }
 
     internal void HandleDetailReadyState(
@@ -221,7 +224,7 @@ internal sealed class DebugPfScanStateMachine {
             return;
         }
 
-        MarkAttempt(nowUtc, success: false, "detail_timeout", postListingCooldownMs);
+        MarkAttempt(nowUtc, success: false, "detail_timeout", PartyDetailScannerAttemptOutcome.TimedOut, postListingCooldownMs);
     }
 
     internal void HandleCollectedState(DateTime nowUtc, DebugPfCollectorAckSnapshot ackSnapshot, int postListingCooldownMs) {
@@ -233,21 +236,21 @@ internal sealed class DebugPfScanStateMachine {
         var hasQueuedAck = ackSnapshot.QueueAckVersion > _waitForQueueAckVersion
                            && ackSnapshot.QueuedListingId == _target.ListingId;
         if (hasQueuedAck) {
-            MarkAttempt(nowUtc, success: true, "queued", postListingCooldownMs);
+            MarkAttempt(nowUtc, success: true, "queued", PartyDetailScannerAttemptOutcome.Succeeded, postListingCooldownMs);
             return;
         }
 
         var hasAppliedAck = ackSnapshot.SuccessfulAckVersion > _waitForAckVersion
                             && ackSnapshot.SuccessfulListingId == _target.ListingId;
         if (hasAppliedAck) {
-            MarkAttempt(nowUtc, success: true, "collected", postListingCooldownMs);
+            MarkAttempt(nowUtc, success: true, "collected", PartyDetailScannerAttemptOutcome.Succeeded, postListingCooldownMs);
             return;
         }
 
         var hasTerminalAck = ackSnapshot.TerminalAckVersion > _waitForTerminalAckVersion
                              && ackSnapshot.TerminalListingId == _target.ListingId;
         if (hasTerminalAck) {
-            MarkAttempt(nowUtc, success: true, "listing_missing", postListingCooldownMs);
+            MarkAttempt(nowUtc, success: true, "listing_missing", PartyDetailScannerAttemptOutcome.Succeeded, postListingCooldownMs);
             return;
         }
 
@@ -255,7 +258,7 @@ internal sealed class DebugPfScanStateMachine {
             return;
         }
 
-        MarkAttempt(nowUtc, success: false, "collector_timeout", postListingCooldownMs);
+        MarkAttempt(nowUtc, success: false, "collector_timeout", PartyDetailScannerAttemptOutcome.TimedOut, postListingCooldownMs);
     }
 
     internal void AdvanceCooldown(DateTime nowUtc) {
@@ -287,13 +290,20 @@ internal sealed class DebugPfScanStateMachine {
         return pendingTargets <= 0 && !hasIncomingListings;
     }
 
-    private void MarkAttempt(DateTime nowUtc, bool success, string reason, int postListingCooldownMs) {
+    private void MarkAttempt(
+        DateTime nowUtc,
+        bool success,
+        string reason,
+        PartyDetailScannerAttemptOutcome outcome,
+        int postListingCooldownMs
+    ) {
         if (_hasTarget) {
             _queue.RecordAttempt(_target.ListingId, nowUtc);
             _lastAttemptListingId = _target.ListingId;
         }
 
         _lastAttemptReason = reason;
+        _lastTerminalOutcome = outcome;
         _lastAttemptSuccess = success;
 
         if (success) {

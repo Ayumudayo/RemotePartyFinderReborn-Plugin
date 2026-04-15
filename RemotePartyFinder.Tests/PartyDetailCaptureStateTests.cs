@@ -120,6 +120,129 @@ public sealed class PartyDetailCaptureStateTests {
     }
 
     [Fact]
+    public void Hook_scope_creation_disposes_first_hook_when_second_creation_fails() {
+        var openListingHook = new TrackingHook();
+
+        Assert.Throws<InvalidOperationException>(() =>
+            PartyDetailCaptureRuntime.CreateHookScope<TrackingHook, TrackingHook>(
+                () => openListingHook,
+                () => throw new InvalidOperationException("simulated create failure"),
+                static hook => hook.Enable(),
+                static hook => hook.Enable()
+            ));
+
+        Assert.True(openListingHook.IsDisposed);
+    }
+
+    [Fact]
+    public void Hook_scope_creation_disposes_created_hooks_when_later_enable_fails() {
+        var openListingHook = new TrackingHook();
+        var openListingByContentIdHook = new TrackingHook();
+
+        Assert.Throws<InvalidOperationException>(() =>
+            PartyDetailCaptureRuntime.CreateHookScope<TrackingHook, TrackingHook>(
+                () => openListingHook,
+                () => openListingByContentIdHook,
+                static hook => hook.Enable(),
+                static hook => throw new InvalidOperationException("simulated enable failure")
+            ));
+
+        Assert.Equal(1, openListingHook.EnableCallCount);
+        Assert.True(openListingHook.IsDisposed);
+        Assert.True(openListingByContentIdHook.IsDisposed);
+    }
+
+    [Fact]
+    public void State_machine_exposes_typed_open_failed_outcome() {
+        var nowUtc = new DateTime(2026, 4, 15, 0, 0, 0, DateTimeKind.Utc);
+        var queue = new DebugPfListingQueue();
+        var stateMachine = new DebugPfScanStateMachine(queue);
+        var target = new DebugPfListingCandidate(9001U, 44UL, nowUtc, 1);
+        stateMachine.UpsertVisibleCandidate(target);
+
+        _ = stateMachine.SyncQueue(
+            nowUtc,
+            [],
+            hasIncomingListings: false,
+            maxPerRun: 0,
+            dedupTtlSeconds: 600,
+            runFromCollectedListings: false
+        );
+
+        stateMachine.HandleOpenAttemptResult(
+            nowUtc,
+            opened: false,
+            actionIntervalMs: 400,
+            detailReadyTimeoutMs: 3500,
+            configuredRetries: 0,
+            postListingCooldownMs: 300,
+            ackSnapshot: default
+        );
+
+        Assert.Equal(PartyDetailScannerAttemptOutcome.OpenFailed, stateMachine.LastTerminalOutcome);
+        Assert.Equal("open_failed", stateMachine.LastAttemptReason);
+    }
+
+    [Fact]
+    public void State_machine_exposes_typed_success_outcome_when_listing_is_queued() {
+        var nowUtc = new DateTime(2026, 4, 15, 1, 0, 0, DateTimeKind.Utc);
+        var queue = new DebugPfListingQueue();
+        var stateMachine = new DebugPfScanStateMachine(queue);
+        var target = new DebugPfListingCandidate(9101U, 55UL, nowUtc, 1);
+        stateMachine.UpsertVisibleCandidate(target);
+
+        _ = stateMachine.SyncQueue(
+            nowUtc,
+            [],
+            hasIncomingListings: false,
+            maxPerRun: 0,
+            dedupTtlSeconds: 600,
+            runFromCollectedListings: false
+        );
+
+        stateMachine.HandleOpenAttemptResult(
+            nowUtc,
+            opened: true,
+            actionIntervalMs: 400,
+            detailReadyTimeoutMs: 3500,
+            configuredRetries: 0,
+            postListingCooldownMs: 300,
+            ackSnapshot: default
+        );
+        stateMachine.HandleDetailReadyState(
+            nowUtc.AddMilliseconds(10),
+            new DebugPfDetailSnapshot(target.ListingId, target.ContentId, NonZeroMembers: 4, TotalSlots: 8),
+            minDwellMs: 800,
+            detailReadyTimeoutMs: 3500,
+            configuredRetries: 0,
+            postListingCooldownMs: 300
+        );
+        stateMachine.HandleDetailReadyState(
+            nowUtc.AddMilliseconds(20),
+            new DebugPfDetailSnapshot(target.ListingId, target.ContentId, NonZeroMembers: 4, TotalSlots: 8),
+            minDwellMs: 800,
+            detailReadyTimeoutMs: 3500,
+            configuredRetries: 0,
+            postListingCooldownMs: 300
+        );
+        stateMachine.HandleCollectedState(
+            nowUtc.AddMilliseconds(30),
+            new DebugPfCollectorAckSnapshot(
+                QueueAckVersion: 1,
+                QueuedListingId: target.ListingId,
+                SuccessfulAckVersion: 0,
+                SuccessfulListingId: 0,
+                TerminalAckVersion: 0,
+                TerminalListingId: 0
+            ),
+            postListingCooldownMs: 300
+        );
+
+        Assert.Equal(PartyDetailScannerAttemptOutcome.Succeeded, stateMachine.LastTerminalOutcome);
+        Assert.Equal("queued", stateMachine.LastAttemptReason);
+    }
+
+    [Fact]
     public void BeginScannerRequest_issues_new_request_serial_and_owner() {
         var state = new PartyDetailCaptureState();
 
@@ -269,6 +392,19 @@ public sealed class PartyDetailCaptureStateTests {
             Func<nint, ulong, bool> openListingByContentIdDetour
         ) {
             throw new InvalidOperationException("simulated signature drift");
+        }
+    }
+
+    private sealed class TrackingHook : IDisposable {
+        internal int EnableCallCount { get; private set; }
+        internal bool IsDisposed { get; private set; }
+
+        internal void Enable() {
+            EnableCallCount++;
+        }
+
+        public void Dispose() {
+            IsDisposed = true;
         }
     }
 }

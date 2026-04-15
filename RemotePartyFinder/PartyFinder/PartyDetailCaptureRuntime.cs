@@ -65,6 +65,35 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         return new PartyDetailCaptureRuntime(state, hookFactory, warningSink);
     }
 
+    internal static IDisposable CreateHookScope<TPrimaryHook, TSecondaryHook>(
+        Func<TPrimaryHook> createPrimaryHook,
+        Func<TSecondaryHook> createSecondaryHook,
+        Action<TPrimaryHook> enablePrimaryHook,
+        Action<TSecondaryHook> enableSecondaryHook
+    )
+        where TPrimaryHook : class, IDisposable
+        where TSecondaryHook : class, IDisposable {
+        ArgumentNullException.ThrowIfNull(createPrimaryHook);
+        ArgumentNullException.ThrowIfNull(createSecondaryHook);
+        ArgumentNullException.ThrowIfNull(enablePrimaryHook);
+        ArgumentNullException.ThrowIfNull(enableSecondaryHook);
+
+        TPrimaryHook? primaryHook = null;
+        TSecondaryHook? secondaryHook = null;
+
+        try {
+            primaryHook = createPrimaryHook();
+            secondaryHook = createSecondaryHook();
+            enablePrimaryHook(primaryHook);
+            enableSecondaryHook(secondaryHook);
+            return new HookScope(primaryHook, secondaryHook);
+        } catch {
+            secondaryHook?.Dispose();
+            primaryHook?.Dispose();
+            throw;
+        }
+    }
+
     public void Dispose() {
         _hookScope?.Dispose();
         _hookScope = null;
@@ -234,24 +263,26 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
             Hook<OpenListingDelegate>? openListingHook = null;
             Hook<OpenListingByContentIdDelegate>? openListingByContentIdHook = null;
 
-            openListingHook = _interopProvider.HookFromSignature<OpenListingDelegate>(
-                OpenListingSignature,
-                (agent, listingId) => {
-                    _ = openListingDetour(agent, listingId);
-                    return openListingHook!.Original(agent, listingId);
-                }
+            return CreateHookScope(
+                createPrimaryHook: () =>
+                    openListingHook = _interopProvider.HookFromSignature<OpenListingDelegate>(
+                        OpenListingSignature,
+                        (agent, listingId) => {
+                            _ = openListingDetour(agent, listingId);
+                            return openListingHook!.Original(agent, listingId);
+                        }
+                    ),
+                createSecondaryHook: () =>
+                    openListingByContentIdHook = _interopProvider.HookFromSignature<OpenListingByContentIdDelegate>(
+                        OpenListingByContentIdSignature,
+                        (agent, contentId) => {
+                            _ = openListingByContentIdDetour(agent, contentId);
+                            return openListingByContentIdHook!.Original(agent, contentId);
+                        }
+                    ),
+                enablePrimaryHook: static hook => hook.Enable(),
+                enableSecondaryHook: static hook => hook.Enable()
             );
-            openListingByContentIdHook = _interopProvider.HookFromSignature<OpenListingByContentIdDelegate>(
-                OpenListingByContentIdSignature,
-                (agent, contentId) => {
-                    _ = openListingByContentIdDetour(agent, contentId);
-                    return openListingByContentIdHook!.Original(agent, contentId);
-                }
-            );
-
-            openListingHook.Enable();
-            openListingByContentIdHook.Enable();
-            return new HookScope(openListingHook, openListingByContentIdHook);
         }
     }
 

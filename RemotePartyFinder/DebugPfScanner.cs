@@ -475,7 +475,12 @@ internal sealed class DebugPfScanner : IDisposable {
     }
 
     private AttemptLogState CaptureAttemptLogState() {
-        return new AttemptLogState(_stateMachine.LastAttemptListingId, _stateMachine.LastAttemptSuccess, _stateMachine.LastAttemptReason);
+        return new AttemptLogState(
+            _stateMachine.LastAttemptListingId,
+            _stateMachine.LastAttemptSuccess,
+            _stateMachine.LastAttemptReason,
+            _stateMachine.LastTerminalOutcome
+        );
     }
 
     private void LogAttemptIfChanged(AttemptLogState before) {
@@ -485,7 +490,7 @@ internal sealed class DebugPfScanner : IDisposable {
         }
 
         if (_currentCaptureAttemptId != Guid.Empty && _currentCaptureAttemptListingId == after.ListingId) {
-            if (TryMapScannerAttemptOutcome(after, out var outcome)) {
+            if (after.TerminalOutcome is { } outcome) {
                 _detailCaptureRuntime.CompleteScannerRequest(_currentCaptureAttemptId, outcome);
             }
 
@@ -518,19 +523,10 @@ internal sealed class DebugPfScanner : IDisposable {
         _currentCaptureAttemptListingId = 0;
     }
 
-    private static bool TryMapScannerAttemptOutcome(AttemptLogState attempt, out PartyDetailScannerAttemptOutcome outcome) {
-        outcome = attempt.Reason switch {
-            "queued" => PartyDetailScannerAttemptOutcome.Succeeded,
-            "collected" => PartyDetailScannerAttemptOutcome.Succeeded,
-            "listing_missing" => PartyDetailScannerAttemptOutcome.Succeeded,
-            "detail_timeout" => PartyDetailScannerAttemptOutcome.TimedOut,
-            "collector_timeout" => PartyDetailScannerAttemptOutcome.TimedOut,
-            "open_failed" => PartyDetailScannerAttemptOutcome.OpenFailed,
-            _ => default,
-        };
-
-        return attempt.Reason is "queued" or "collected" or "listing_missing" or "detail_timeout" or "collector_timeout" or "open_failed";
-    }
-
-    private readonly record struct AttemptLogState(uint ListingId, bool Success, string Reason);
+    private readonly record struct AttemptLogState(
+        uint ListingId,
+        bool Success,
+        string Reason,
+        PartyDetailScannerAttemptOutcome? TerminalOutcome
+    );
 }
