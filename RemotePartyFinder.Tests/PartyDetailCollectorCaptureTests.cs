@@ -57,10 +57,12 @@ public sealed class PartyDetailCollectorCaptureTests {
 
         runtime.BeginManualCycle(9001U, 44UL);
         runtime.ObservePopulatedSnapshot(snapshot);
+        runtime.Tick(snapshot);
         collector.Update();
 
         runtime.BeginManualCycle(9001U, 44UL);
         runtime.ObservePopulatedSnapshot(snapshot);
+        runtime.Tick(snapshot);
         collector.Update();
 
         Assert.Equal(2, harness.CapturedPayloads.Count);
@@ -87,6 +89,12 @@ public sealed class PartyDetailCollectorCaptureTests {
         runtime.ObservePopulatedSnapshot(snapshot);
         collector.Update();
 
+        Assert.Empty(harness.CapturedPayloads);
+        Assert.Equal(0L, state.LastConsumedGeneration);
+
+        runtime.Tick(snapshot);
+        collector.Update();
+
         Assert.Single(harness.CapturedPayloads);
         Assert.Equal(1L, state.LastConsumedGeneration);
     }
@@ -101,6 +109,12 @@ public sealed class PartyDetailCollectorCaptureTests {
 
         runtime.BeginManualCycle(9001U, 44UL);
         runtime.ObservePopulatedSnapshot(snapshot);
+        collector.Update();
+
+        Assert.Empty(harness.CapturedPayloads);
+        Assert.Equal(0L, state.LastConsumedGeneration);
+
+        runtime.Tick(snapshot);
         collector.Update();
 
         Assert.Single(harness.CapturedPayloads);
@@ -118,6 +132,7 @@ public sealed class PartyDetailCollectorCaptureTests {
 
         runtime.BeginManualCycle(9001U, 44UL);
         runtime.ObservePopulatedSnapshot(incompleteSnapshot);
+        runtime.Tick(incompleteSnapshot);
         collector.Update();
 
         Assert.Empty(harness.CapturedPayloads);

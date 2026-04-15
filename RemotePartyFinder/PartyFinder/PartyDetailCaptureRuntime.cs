@@ -196,7 +196,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
 
     internal void TestObservePopulatedSnapshot(UploadablePartyDetail snapshot) {
         ArgumentNullException.ThrowIfNull(snapshot);
-        ObservePostRequestPopulation(snapshot);
+        RaisePostRequestPopulationSignal();
     }
 
     internal void TestFrameworkTick(UploadablePartyDetail? snapshot) {
@@ -216,13 +216,7 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
     private void PopulateListingDataDetour(nint agent, nint listingData) {
         _ = agent;
         _ = listingData;
-
-        if (!TryBuildSnapshotFromAgent(out var snapshot)) {
-            ObservePostRequestPopulation(snapshot: null);
-            return;
-        }
-
-        ObservePostRequestPopulation(snapshot);
+        RaisePostRequestPopulationSignal();
     }
 
     private void EnsureRequestCycleForIntercept(uint listingId, ulong contentId) {
@@ -268,16 +262,6 @@ internal sealed class PartyDetailCaptureRuntime : IDisposable {
         }
 
         TryRecordArrivalFromAgentSnapshotCore(snapshot, enforceFreshness: true);
-    }
-
-    private void ObservePostRequestPopulation(UploadablePartyDetail? snapshot) {
-        RaisePostRequestPopulationSignal();
-
-        if (snapshot is null) {
-            return;
-        }
-
-        _ = TryRecordArrivalFromAgentSnapshotCore(snapshot, enforceFreshness: true);
     }
 
     private bool TryRecordArrivalFromAgentSnapshotCore(UploadablePartyDetail snapshot, bool enforceFreshness) {
